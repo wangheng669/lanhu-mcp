@@ -16,6 +16,11 @@
 ## 运行方式
 
 ```bash
+cd /Users/wangheng/Desktop/feature/lanhu-mcp
+# 先启动 lanhu-mcp HTTP 服务
+MCP_TRANSPORT=http python3 lanhu_mcp_server.py
+
+# 再启动 viewer
 cd /Users/wangheng/Desktop/feature/lanhu-mcp/apps/lanhu-viewer
 npm install
 npm start
@@ -25,6 +30,18 @@ npm start
 
 ```text
 http://localhost:3000
+```
+
+默认会把 `lanhu-viewer` 的以下能力转发给 `lanhu-mcp` HTTP 服务：
+
+- 设计图列表
+- 图层/代码生成数据
+- 标注图预览
+
+如果 `lanhu-mcp` 不在默认地址，可设置：
+
+```bash
+export LANHU_MCP_BASE_URL="http://127.0.0.1:8000"
 ```
 
 ## 目录说明

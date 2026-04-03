@@ -4,7 +4,7 @@ class LanhuViewer {
   constructor() {
     // 使用固定的共享 session-id，让所有用户共享同一个蓝湖登录状态
     this.sessionId = 'shared_lanhu_session';
-    this.appVersion = '2026-03-12-cache-refresh-v2';
+    this.appVersion = '2026-04-03-mcp-layer-annotation-v1';
     this.migrateCacheVersion();
     this.isLoggedIn = false;
     this.logs = [];
@@ -40,9 +40,12 @@ class LanhuViewer {
     this.activeNoteId = null;
     this.generatedHtmlCode = '';
     this.generatedHtmlDesignId = null;
+    this.isAnnotationPreview = false;
+    this.annotationObjectUrl = '';
 
     this.initElements();
     this.initEvents();
+    this.updateAnnotationPreviewButton();
     this.renderHistory();
     this.notifyParentReady();
     this.checkSession(); // 异步检查，完成后会调用 restorePageState
@@ -520,6 +523,7 @@ class LanhuViewer {
     this.hotspotModeBtn = document.getElementById('hotspotModeBtn');
     this.noteModeBtn = document.getElementById('noteModeBtn');
     this.layerModeBtn = document.getElementById('layerModeBtn');
+    this.annotatePreviewBtn = document.getElementById('annotatePreviewBtn');
     this.generateHtmlBtn = document.getElementById('generateHtmlBtn');
     this.previewBody = document.getElementById('previewBody');
     this.htmlPreviewPanel = document.getElementById('htmlPreviewPanel');
@@ -698,6 +702,9 @@ class LanhuViewer {
     }
     if (this.layerModeBtn) {
       this.layerModeBtn.addEventListener('click', () => this.toggleLayerMode());
+    }
+    if (this.annotatePreviewBtn) {
+      this.annotatePreviewBtn.addEventListener('click', () => this.toggleAnnotationPreview());
     }
     if (this.generateHtmlBtn) {
       this.generateHtmlBtn.addEventListener('click', () => this.generateHtmlPreview());
@@ -1687,6 +1694,7 @@ class LanhuViewer {
   // 渲染结果
   renderResult(data) {
     this.hideHtmlPreview(true);
+    this.restoreOriginalPreviewImage();
     this.hideLoading();
     this.errorBox.style.display = 'none';
 
@@ -1789,6 +1797,7 @@ class LanhuViewer {
       this.saveCurrentDesignState();
       this.exitMarkModes();
       this.hideHtmlPreview(true);
+      this.restoreOriginalPreviewImage();
       // 切换设计图时清空当前图层显示（但保留缓存）
       this.layers = [];
       this.canvasInfo = null;
@@ -1807,6 +1816,13 @@ class LanhuViewer {
     this.selectedDesignId = designId;
     this.currentProjectData = projectData;
     this.closeNoteModal();
+    if (!isDesignSwitched) {
+      if (this.isAnnotationPreview) {
+        this.restoreOriginalPreviewImage();
+      } else {
+        this.updateAnnotationPreviewButton();
+      }
+    }
     if (!isDesignSwitched) {
       this.clearDrawingDrafts();
       this.syncMarkModeButtons();
@@ -2305,6 +2321,97 @@ class LanhuViewer {
     newTab.document.write(this.generatedHtmlCode);
     newTab.document.close();
     this.showToast('已在新标签页打开', 'success');
+  }
+
+  updateAnnotationPreviewButton() {
+    if (!this.annotatePreviewBtn) return;
+    this.annotatePreviewBtn.classList.toggle('active', this.isAnnotationPreview);
+    this.annotatePreviewBtn.textContent = this.isAnnotationPreview ? '查看原图' : '标注图';
+  }
+
+  revokeAnnotationObjectUrl() {
+    if (!this.annotationObjectUrl) return;
+    URL.revokeObjectURL(this.annotationObjectUrl);
+    this.annotationObjectUrl = '';
+  }
+
+  restoreOriginalPreviewImage() {
+    const design = this.designs?.find(d => d.id === this.selectedDesignId);
+    this.revokeAnnotationObjectUrl();
+    this.isAnnotationPreview = false;
+    this.updateAnnotationPreviewButton();
+
+    if (design?.url) {
+      this.previewImage.src = this.getProxiedImageUrl(design.url);
+      this.previewImage.alt = design.name || '';
+    }
+  }
+
+  async toggleAnnotationPreview() {
+    if (!this.selectedDesignId || !this.currentTeamId || !this.currentProjectId) {
+      this.showToast('请先选择设计图', 'error');
+      return;
+    }
+
+    if (this.isAnnotationPreview) {
+      this.restoreOriginalPreviewImage();
+      this.showToast('已切换回原图');
+      return;
+    }
+
+    const design = this.designs?.find(d => d.id === this.selectedDesignId);
+    if (!design) {
+      this.showToast('未找到当前设计图数据', 'error');
+      return;
+    }
+
+    if (this.isLayerMode) {
+      this.isLayerMode = false;
+      if (this.layerModeBtn) {
+        this.layerModeBtn.classList.remove('active');
+        this.layerModeBtn.textContent = '图层解析';
+      }
+      this.hideLayerAnnotations();
+    }
+
+    this.log('正在从 lanhu-mcp 生成标注图...', 'info');
+    this.showToast('正在生成标注图...');
+
+    try {
+      const query = new URLSearchParams({
+        sessionId: this.sessionId,
+        teamId: this.currentTeamId,
+        projectId: this.currentProjectId,
+        imageId: this.selectedDesignId,
+        designName: design.name || 'annotated_design',
+        t: String(Date.now())
+      });
+      const response = await fetch(`/api/annotate-image?${query.toString()}`);
+
+      if (!response.ok) {
+        let message = '生成标注图失败';
+        try {
+          const data = await response.json();
+          message = data.message || message;
+        } catch (e) {}
+        throw new Error(message);
+      }
+
+      const blob = await response.blob();
+      this.revokeAnnotationObjectUrl();
+      this.annotationObjectUrl = URL.createObjectURL(blob);
+      this.previewImage.src = this.annotationObjectUrl;
+      this.previewImage.alt = `${design.name || '设计图'} 标注图`;
+      this.isAnnotationPreview = true;
+      this.updateAnnotationPreviewButton();
+      this.log('标注图已加载', 'success');
+      this.showToast('标注图已生成', 'success');
+    } catch (e) {
+      this.isAnnotationPreview = false;
+      this.updateAnnotationPreviewButton();
+      this.log('生成标注图失败: ' + e.message, 'error');
+      this.showToast('生成标注图失败: ' + e.message, 'error');
+    }
   }
 
   buildStaticHtmlFromLayers(design) {

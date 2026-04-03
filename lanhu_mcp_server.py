@@ -12,6 +12,7 @@ import hashlib
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Annotated, Optional, Union, List, Any
+from urllib.parse import urlparse
 
 # 加载 .env 文件中的环境变量（必须在其他导入之前）
 # 注意：在 Docker 容器中，环境变量通常已由 docker-compose 通过 env_file 设置
@@ -32,7 +33,6 @@ except ImportError:
 
 # 东八区时区（北京时间）
 CHINA_TZ = timezone(timedelta(hours=8))
-from urllib.parse import urlparse
 
 # 元数据缓存配置（基于版本号的永久缓存）
 _metadata_cache = {}  # {cache_key: {'data': {...}, 'version_id': str}}
@@ -43,6 +43,8 @@ from bs4 import BeautifulSoup
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
 from playwright.async_api import async_playwright
+from starlette.requests import Request
+from starlette.responses import FileResponse, JSONResponse
 
 # PIL for image annotation
 try:
@@ -2092,24 +2094,64 @@ class MessageStore:
 
 
 
+def _get_current_http_request():
+    """获取当前 HTTP 请求；stdio 传输下返回 None。"""
+    try:
+        from fastmcp.server.dependencies import get_http_request
+        return get_http_request()
+    except Exception:
+        return None
+
+
+def get_request_lanhu_cookie(req: Any = None) -> Optional[str]:
+    """优先从当前 HTTP 请求头读取蓝湖 Cookie。"""
+    request = req or _get_current_http_request()
+    if not request:
+        return None
+
+    headers = getattr(request, "headers", None)
+    if not headers:
+        return None
+
+    cookie = headers.get("x-lanhu-cookie") or headers.get("X-Lanhu-Cookie")
+    if not cookie:
+        return None
+
+    cookie = cookie.strip()
+    return cookie or None
+
+
+def get_request_user_info_from_request(req: Any = None) -> tuple:
+    """从 query/header 中提取用户信息，供 HTTP 路由和 MCP 工具复用。"""
+    request = req or _get_current_http_request()
+    if not request:
+        return '匿名', '未知'
+
+    query_params = getattr(request, "query_params", None) or {}
+    headers = getattr(request, "headers", None) or {}
+
+    name = (
+        query_params.get('name')
+        or headers.get('x-lanhu-user-name')
+        or headers.get('X-Lanhu-User-Name')
+        or '匿名'
+    )
+    role = (
+        query_params.get('role')
+        or headers.get('x-lanhu-user-role')
+        or headers.get('X-Lanhu-User-Role')
+        or '未知'
+    )
+    return name, role
+
+
 def get_user_info(ctx: Context) -> tuple:
     """
     从URL query参数获取用户信息
     
     MCP连接URL格式：http://xxx:port/mcp?role=后端&name=张三
     """
-    try:
-        # 使用 FastMCP 提供的 get_http_request 获取当前请求
-        from fastmcp.server.dependencies import get_http_request
-        req = get_http_request()
-        
-        # 从 query 参数获取
-        name = req.query_params.get('name', '匿名')
-        role = req.query_params.get('role', '未知')
-        return name, role
-    except Exception:
-        pass
-    return '匿名', '未知'
+    return get_request_user_info_from_request()
 
 
 def _clean_message_dict(msg: dict, current_user_name: str = None) -> dict:
@@ -2143,9 +2185,23 @@ def get_project_id_from_url(url: str) -> str:
     """从URL中提取project_id"""
     if not url or url.lower() == 'all':
         return None
-    extractor = LanhuExtractor()
-    params = extractor.parse_url(url)
-    return params.get('project_id', '')
+
+    if url.startswith('http'):
+        parsed = urlparse(url)
+        fragment = parsed.fragment or ''
+        url = fragment.split('?', 1)[1] if '?' in fragment else fragment
+
+    if url.startswith('?'):
+        url = url[1:]
+
+    for part in url.split('&'):
+        if '=' not in part:
+            continue
+        key, value = part.split('=', 1)
+        if key == 'pid':
+            return value
+
+    return ''
 
 
 async def _fetch_metadata_from_url(url: str) -> dict:
@@ -2261,17 +2317,20 @@ class LanhuExtractor:
     CACHE_META_FILE = ".lanhu_cache.json"  # 缓存元数据文件名
 
     def __init__(self):
+        request_cookie = get_request_lanhu_cookie()
+        effective_cookie = request_cookie or COOKIE
         headers = {
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
             "Referer": "https://lanhuapp.com/web/",
             "Accept": "application/json, text/plain, */*",
-            "Cookie": COOKIE,
+            "Cookie": effective_cookie,
             "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
             "request-from": "web",
             "real-path": "/item/project/product"
         }
+        self.effective_cookie = effective_cookie
         self.client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=headers, follow_redirects=True)
 
     def parse_url(self, url: str) -> dict:
@@ -6217,6 +6276,9 @@ async def _get_design_code_data_internal(extractor: LanhuExtractor, image_id: st
         }
 
     return {
+        'design_id': result.get('id') or image_id,
+        'design_name': result.get('name', 'Untitled'),
+        'preview_url': result.get('preview_url') or result.get('cover') or result.get('url'),
         'canvas': canvas_info,
         'layout': layout_tree,
     }
@@ -6783,6 +6845,270 @@ async def lanhu_annotate_design_layers(
         await extractor.close()
 
 
+def _coerce_viewer_number(value: Any) -> Optional[float]:
+    """将样式数值转换为数字，兼容 '16px' 之类字符串。"""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        matched = re.findall(r'-?\d+(?:\.\d+)?', value)
+        if matched:
+            try:
+                return float(matched[0])
+            except ValueError:
+                return None
+    return None
+
+
+def _build_viewer_layer_styles(node_styles: dict) -> dict:
+    """将代码生成样式映射成 viewer 当前使用的图层样式结构。"""
+    styles = {}
+    if not isinstance(node_styles, dict):
+        return styles
+
+    background = node_styles.get('background') or node_styles.get('backgroundColor')
+    if background:
+        styles['background'] = background
+
+    border = node_styles.get('border')
+    if isinstance(border, str):
+        matched = re.match(r'\s*(\d+(?:\.\d+)?)px\s+solid\s+(.+)\s*$', border)
+        if matched:
+            styles['borderWidth'] = float(matched.group(1))
+            styles['borderColor'] = matched.group(2).strip()
+
+    border_radius = node_styles.get('borderRadius')
+    border_radius_value = _coerce_viewer_number(border_radius)
+    if border_radius_value is not None:
+        styles['borderRadius'] = border_radius_value
+
+    text_styles = node_styles.get('text')
+    if isinstance(text_styles, dict):
+        for source_key, target_key in (
+            ('fontSize', 'fontSize'),
+            ('lineHeight', 'lineHeight'),
+            ('letterSpacing', 'letterSpacing'),
+            ('color', 'color'),
+            ('fontFamily', 'fontFamily'),
+            ('fontWeight', 'fontWeight'),
+            ('textAlign', 'textAlign'),
+        ):
+            value = text_styles.get(source_key)
+            if value is None:
+                continue
+            if source_key in {'fontSize', 'lineHeight', 'letterSpacing'}:
+                numeric_value = _coerce_viewer_number(value)
+                if numeric_value is not None:
+                    styles[target_key] = numeric_value
+            else:
+                styles[target_key] = value
+
+    return styles
+
+
+def _collect_viewer_layers(node: dict, layers_list: list, depth: int = 0, parent_path: str = ""):
+    """将代码生成布局树扁平化为 lanhu-viewer 当前使用的图层结构。"""
+    if not node or not isinstance(node, dict):
+        return
+
+    name = node.get('name', 'unnamed')
+    current_path = f"{parent_path}/{name}" if parent_path else name
+    layout = node.get('layout') or {}
+    layer_info = {
+        'name': name,
+        'path': current_path,
+        'depth': depth,
+        'type': node.get('type', 'unknown'),
+        'visible': node.get('visible', True),
+        'x': int(layout.get('x', 0) or 0),
+        'y': int(layout.get('y', 0) or 0),
+        'width': int(layout.get('width', 0) or 0),
+        'height': int(layout.get('height', 0) or 0),
+        'styles': _build_viewer_layer_styles(node.get('styles') or {}),
+        'text': node.get('text') or '',
+    }
+
+    text_preview = str(layer_info['text']).strip()
+    if text_preview:
+        layer_info['textPreview'] = text_preview[:120]
+
+    if node.get('image'):
+        layer_info['has_image'] = True
+        layer_info['image'] = node.get('image')
+
+    layers_list.append(layer_info)
+
+    for child in node.get('children') or []:
+        _collect_viewer_layers(child, layers_list, depth + 1, current_path)
+
+
+def _parse_bool_param(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
+def _parse_int_param(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+@mcp.custom_route("/viewer/designs", methods=["POST"])
+async def viewer_get_designs(request: Request):
+    """给 lanhu-viewer 用的轻量 HTTP 接口：获取设计图列表。"""
+    extractor = LanhuExtractor()
+    try:
+        payload = await request.json()
+        url = (payload.get('url') or '').strip()
+        if not url:
+            return JSONResponse({'status': 'error', 'message': 'Missing required field: url'}, status_code=400)
+
+        user_name, user_role = get_request_user_info_from_request(request)
+        project_id = get_project_id_from_url(url)
+        if project_id:
+            store = MessageStore(project_id)
+            store.record_collaborator(user_name, user_role)
+
+        result = await _get_designs_internal(extractor, url)
+        return JSONResponse(result, status_code=200 if result.get('status') == 'success' else 400)
+    except Exception as e:
+        return JSONResponse({'status': 'error', 'message': str(e)}, status_code=500)
+    finally:
+        await extractor.close()
+
+
+@mcp.custom_route("/viewer/layers", methods=["POST"])
+async def viewer_get_layers(request: Request):
+    """给 lanhu-viewer 用的轻量 HTTP 接口：获取代码生成数据和扁平图层。"""
+    extractor = LanhuExtractor()
+    try:
+        payload = await request.json()
+        team_id = payload.get('teamId') or payload.get('team_id')
+        project_id = payload.get('projectId') or payload.get('project_id')
+        image_id = payload.get('imageId') or payload.get('image_id')
+
+        if not team_id or not project_id or not image_id:
+            return JSONResponse(
+                {'success': False, 'message': 'Missing required params: teamId, projectId, imageId'},
+                status_code=400,
+            )
+
+        code_data = await _get_design_code_data_internal(
+            extractor=extractor,
+            image_id=str(image_id),
+            team_id=str(team_id),
+            project_id=str(project_id),
+        )
+
+        layers = []
+        if code_data.get('layout'):
+            _collect_viewer_layers(code_data['layout'], layers)
+
+        return JSONResponse({
+            'success': True,
+            'source': 'lanhu-mcp',
+            'design': {
+                'id': code_data.get('design_id'),
+                'name': code_data.get('design_name'),
+                'preview_url': code_data.get('preview_url'),
+            },
+            'canvas': code_data.get('canvas') or {},
+            'layout': code_data.get('layout'),
+            'layers': layers,
+        })
+    except Exception as e:
+        return JSONResponse({'success': False, 'message': str(e)}, status_code=500)
+    finally:
+        await extractor.close()
+
+
+@mcp.custom_route("/viewer/annotate-image", methods=["GET"])
+async def viewer_annotate_image(request: Request):
+    """给 lanhu-viewer 用的轻量 HTTP 接口：直接返回标注后的 PNG。"""
+    if not PIL_AVAILABLE:
+        return JSONResponse(
+            {'success': False, 'message': 'Pillow is required for annotation output'},
+            status_code=500,
+        )
+
+    extractor = LanhuExtractor()
+    try:
+        team_id = request.query_params.get('team_id') or request.query_params.get('teamId')
+        project_id = request.query_params.get('project_id') or request.query_params.get('projectId')
+        image_id = request.query_params.get('image_id') or request.query_params.get('imageId')
+        design_name = (
+            request.query_params.get('design_name')
+            or request.query_params.get('designName')
+            or 'annotated_design'
+        )
+        max_depth = _parse_int_param(request.query_params.get('max_depth') or request.query_params.get('maxDepth'), 3)
+        min_size = _parse_int_param(request.query_params.get('min_size') or request.query_params.get('minSize'), 10)
+        show_hidden = _parse_bool_param(
+            request.query_params.get('show_hidden') or request.query_params.get('showHidden'),
+            False,
+        )
+
+        if not team_id or not project_id or not image_id:
+            return JSONResponse(
+                {'success': False, 'message': 'Missing required params: team_id, project_id, image_id'},
+                status_code=400,
+            )
+
+        code_data = await _get_design_code_data_internal(
+            extractor=extractor,
+            image_id=str(image_id),
+            team_id=str(team_id),
+            project_id=str(project_id),
+        )
+
+        layers = []
+        if code_data.get('layout'):
+            _collect_all_layers(code_data['layout'], layers)
+
+        if not layers:
+            return JSONResponse({'success': False, 'message': 'No layers found in design'}, status_code=404)
+
+        preview_url = code_data.get('preview_url')
+        if not preview_url:
+            return JSONResponse({'success': False, 'message': 'No preview image available for this design'}, status_code=404)
+
+        output_dir = DATA_DIR / 'annotated'
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        safe_name = re.sub(r'[^\w\-]', '_', design_name) or f"design_{image_id}"
+        cache_key = f"{image_id}_d{max_depth}_s{min_size}_h{int(show_hidden)}"
+        original_path = str(output_dir / f"{safe_name}_{cache_key}_original.png")
+        annotated_path = str(output_dir / f"{safe_name}_{cache_key}_annotated.png")
+
+        download_success = await _download_image_for_annotation(preview_url, original_path)
+        if not download_success:
+            return JSONResponse({'success': False, 'message': 'Failed to download design preview image'}, status_code=502)
+
+        annotation_result = _annotate_design_image(
+            image_path=original_path,
+            layers=layers,
+            output_path=annotated_path,
+            max_depth=max_depth,
+            min_size=min_size,
+            show_hidden=show_hidden,
+        )
+        if annotation_result.get('status') != 'success':
+            return JSONResponse({'success': False, 'message': annotation_result.get('message', 'Annotation failed')}, status_code=500)
+
+        return FileResponse(
+            annotated_path,
+            media_type='image/png',
+            filename=f"{safe_name}_annotated.png",
+        )
+    except Exception as e:
+        return JSONResponse({'success': False, 'message': str(e)}, status_code=500)
+    finally:
+        await extractor.close()
+
+
 if __name__ == "__main__":
     # 运行MCP服务器
     # 支持通过 MCP_TRANSPORT 环境变量选择传输方式：http（默认）或 stdio
@@ -6794,4 +7120,3 @@ if __name__ == "__main__":
         SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
         SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
         mcp.run(transport="http", path="/mcp", host=SERVER_HOST, port=SERVER_PORT)
-

@@ -767,6 +767,16 @@ body {
   color: #fff;
 }
 
+.annotate-preview-btn {
+  white-space: nowrap;
+}
+
+.annotate-preview-btn.active {
+  background: #fa8c16;
+  border-color: #fa8c16;
+  color: #fff;
+}
+
 .html-generate-btn {
   white-space: nowrap;
 }

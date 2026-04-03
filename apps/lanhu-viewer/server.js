@@ -6,6 +6,9 @@ const LanhuService = require('./services/lanhu');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const LANHU_MCP_BASE_URL = process.env.LANHU_MCP_BASE_URL || 'http://127.0.0.1:8000';
+const LANHU_MCP_USER_NAME = process.env.LANHU_MCP_USER_NAME || 'lanhu-viewer';
+const LANHU_MCP_USER_ROLE = process.env.LANHU_MCP_USER_ROLE || '前端';
 
 // 中间件
 app.use(express.json());
@@ -62,6 +65,88 @@ function getLanhuService(sessionId) {
     lanhuServices.set(sessionId, new LanhuService());
   }
   return lanhuServices.get(sessionId);
+}
+
+function buildLanhuCookieHeader(session) {
+  const cookies = Array.isArray(session?.cookies) ? session.cookies : [];
+  return cookies
+    .filter(cookie => cookie && cookie.name && cookie.value)
+    .map(cookie => `${cookie.name}=${cookie.value}`)
+    .join('; ');
+}
+
+function buildLanhuMcpUrl(routePath, query = {}) {
+  const url = new URL(routePath, LANHU_MCP_BASE_URL.endsWith('/') ? LANHU_MCP_BASE_URL : `${LANHU_MCP_BASE_URL}/`);
+  Object.entries(query).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') {
+      url.searchParams.set(key, String(value));
+    }
+  });
+  return url;
+}
+
+function buildLanhuMcpHeaders(session, extraHeaders = {}) {
+  const headers = { ...extraHeaders };
+  const cookieHeader = buildLanhuCookieHeader(session);
+
+  if (cookieHeader) {
+    headers['X-Lanhu-Cookie'] = cookieHeader;
+  }
+
+  headers['X-Lanhu-User-Name'] = session?.userInfo?.name || LANHU_MCP_USER_NAME;
+  headers['X-Lanhu-User-Role'] = LANHU_MCP_USER_ROLE;
+  return headers;
+}
+
+async function callLanhuMcpJson(routePath, { method = 'POST', session, body, query } = {}) {
+  const url = buildLanhuMcpUrl(routePath, query);
+  const headers = buildLanhuMcpHeaders(session, {});
+
+  if (body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  const response = await fetch(url, {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined
+  });
+
+  const contentType = response.headers.get('content-type') || '';
+  const data = contentType.includes('application/json')
+    ? await response.json()
+    : { message: await response.text() };
+
+  if (!response.ok) {
+    throw new Error(data.message || `lanhu-mcp request failed (${response.status})`);
+  }
+
+  return data;
+}
+
+async function callLanhuMcpBinary(routePath, { method = 'GET', session, query } = {}) {
+  const url = buildLanhuMcpUrl(routePath, query);
+  const headers = buildLanhuMcpHeaders(session, {});
+  const response = await fetch(url, { method, headers });
+
+  if (!response.ok) {
+    const contentType = response.headers.get('content-type') || '';
+    let message = `lanhu-mcp request failed (${response.status})`;
+    if (contentType.includes('application/json')) {
+      const data = await response.json();
+      message = data.message || message;
+    } else {
+      const text = await response.text();
+      if (text) message = text;
+    }
+    throw new Error(message);
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  return {
+    buffer: Buffer.from(arrayBuffer),
+    contentType: response.headers.get('content-type') || 'application/octet-stream'
+  };
 }
 
 // ==================== API 路由 ====================
@@ -206,6 +291,31 @@ app.post('/api/parse', async (req, res) => {
     service.setCookies(session.cookies);
 
     const result = await service.parseUrl(url);
+    const shouldUseMcpDesigns = result?.success && ['design', 'project'].includes(result.type);
+
+    if (shouldUseMcpDesigns) {
+      try {
+        const mcpResult = await callLanhuMcpJson('/viewer/designs', {
+          session,
+          body: { url }
+        });
+        if (mcpResult.status === 'success' && Array.isArray(mcpResult.designs)) {
+          result.designs = mcpResult.designs;
+          if (!result.project) {
+            result.project = {};
+          }
+          if (!result.project.name && mcpResult.project_name) {
+            result.project.name = mcpResult.project_name;
+          }
+          service.log('设计图列表来自 lanhu-mcp', 'success');
+          result.logs = service.getLogs();
+        }
+      } catch (mcpError) {
+        service.log(`lanhu-mcp 设计图列表回退本地解析: ${mcpError.message}`, 'warn');
+        result.logs = service.getLogs();
+      }
+    }
+
     res.json(result);
   } catch (error) {
     console.error('Parse error:', error);
@@ -230,6 +340,20 @@ app.post('/api/designs', async (req, res) => {
     }
 
     const session = sessions.get(sessionId);
+    const { url } = req.body;
+
+    if (url) {
+      try {
+        const designs = await callLanhuMcpJson('/viewer/designs', {
+          session,
+          body: { url }
+        });
+        return res.json(designs);
+      } catch (mcpError) {
+        console.warn('lanhu-mcp designs fallback:', mcpError.message);
+      }
+    }
+
     const service = new LanhuService();
     service.setCookies(session.cookies);
 
@@ -296,6 +420,16 @@ app.post('/api/layers', async (req, res) => {
     }
 
     const session = sessions.get(sessionId);
+    try {
+      const result = await callLanhuMcpJson('/viewer/layers', {
+        session,
+        body: { teamId, projectId, imageId }
+      });
+      return res.json(result);
+    } catch (mcpError) {
+      console.warn('lanhu-mcp layers fallback:', mcpError.message);
+    }
+
     const service = new LanhuService();
     service.setCookies(session.cookies);
 
@@ -303,6 +437,49 @@ app.post('/api/layers', async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('Get layers error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+});
+
+// 获取设计图图层标注预览
+app.get('/api/annotate-image', async (req, res) => {
+  try {
+    const sessionId = req.headers['x-session-id'] || req.query.sessionId;
+    const { teamId, projectId, imageId, designName } = req.query;
+
+    if (!sessionId || !sessions.has(sessionId)) {
+      return res.status(401).json({
+        success: false,
+        message: '请先登录'
+      });
+    }
+
+    if (!teamId || !projectId || !imageId) {
+      return res.status(400).json({
+        success: false,
+        message: '缺少必要参数'
+      });
+    }
+
+    const session = sessions.get(sessionId);
+    const { buffer, contentType } = await callLanhuMcpBinary('/viewer/annotate-image', {
+      session,
+      query: {
+        team_id: teamId,
+        project_id: projectId,
+        image_id: imageId,
+        design_name: designName || 'annotated_design'
+      }
+    });
+
+    res.set('Content-Type', contentType || 'image/png');
+    res.set('Cache-Control', 'no-store');
+    res.send(buffer);
+  } catch (error) {
+    console.error('Annotate image error:', error);
     res.status(500).json({
       success: false,
       message: error.message
@@ -492,6 +669,7 @@ app.listen(PORT, () => {
 ║   🎨 蓝湖链接解析器已启动                      ║
 ║                                              ║
 ║   访问地址: http://localhost:${PORT}            ║
+║   MCP后端: ${LANHU_MCP_BASE_URL.padEnd(32).slice(0, 32)}║
 ║                                              ║
 ╚══════════════════════════════════════════════╝
   `);
