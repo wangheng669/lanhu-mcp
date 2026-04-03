@@ -1,0 +1,25 @@
+{
+  "name": "lanhu-viewer",
+  "version": "1.0.0",
+  "description": "蓝湖链接解析器 - 粘贴链接即可查看项目信息",
+  "main": "server.js",
+  "scripts": {
+    "autostart:install": "bash ./scripts/macos/install-autostart.sh",
+    "autostart:status": "bash ./scripts/macos/status-autostart.sh",
+    "autostart:uninstall": "bash ./scripts/macos/uninstall-autostart.sh",
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "express": "^4.18.2",
+    "playwright": "^1.40.0",
+    "uuid": "^9.0.0"
+  },
+  "keywords": [
+    "lanhu",
+    "design",
+    "viewer"
+  ],
+  "license": "MIT"
+}

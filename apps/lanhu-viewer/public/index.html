@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>蓝湖链接解析器</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <!-- 头部 -->
+    <header class="header">
+      <div class="logo">
+        <span class="logo-icon">🎨</span>
+        <span class="logo-text">蓝湖链接解析器</span>
+      </div>
+      <div class="user-info" id="userInfo">
+        <button class="btn btn-primary" id="loginBtn">登录蓝湖</button>
+      </div>
+    </header>
+
+    <!-- 登录弹窗 -->
+    <div class="modal" id="loginModal">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3>登录蓝湖</h3>
+        </div>
+        <div class="modal-body">
+          <div class="login-status" id="loginStatus">
+            <div class="spinner"></div>
+            <p>正在打开浏览器...</p>
+            <p class="hint">请在打开的浏览器窗口中完成登录</p>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="cancelLoginBtn">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 备注弹窗 -->
+    <div class="modal" id="noteModal">
+      <div class="modal-content note-modal-content">
+        <div class="modal-header">
+          <h3 id="noteModalTitle">备注详情</h3>
+        </div>
+        <div class="modal-body">
+          <textarea
+            id="noteModalContent"
+            class="note-modal-textarea"
+            maxlength="500"
+            placeholder="请输入备注内容"
+          ></textarea>
+          <div class="note-modal-meta">
+            <span>最多 500 字</span>
+            <span id="noteModalCounter">0 / 500</span>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="cancelNoteModalBtn">取消</button>
+          <button class="btn btn-primary" id="saveNoteBtn">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 主内容区 - 三栏布局 -->
+    <main class="main">
+      <!-- 左侧栏 -->
+      <aside class="sidebar-left">
+        <!-- 输入区 -->
+        <div class="input-section">
+          <div class="input-wrapper">
+            <input
+              type="text"
+              id="urlInput"
+              class="url-input"
+              placeholder="粘贴蓝湖链接..."
+              autocomplete="off"
+            >
+            <button class="btn btn-primary" id="parseBtn" disabled title="解析">
+              <span class="btn-icon">🔍</span>
+            </button>
+            <button class="btn btn-secondary" id="refreshBtn" style="display:none;" title="强制刷新">
+              <span class="btn-icon">🔄</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- 项目信息 -->
+        <div class="project-info" id="projectInfo" style="display: none;">
+          <h2 class="project-name" id="projectName"></h2>
+          <div class="project-meta" id="projectMeta"></div>
+        </div>
+
+        <!-- 设计图列表 -->
+        <div class="designs-section" id="designsSection" style="display: none;">
+          <div class="section-header">
+            <h3>设计图</h3>
+            <span class="count" id="designCount"></span>
+          </div>
+          <div class="design-list" id="designGrid"></div>
+        </div>
+
+        <!-- 历史记录 -->
+        <div class="history-section" id="historySection">
+          <div class="section-header">
+            <h3>历史记录</h3>
+            <div class="section-actions">
+              <button class="btn btn-small btn-secondary" id="clearCacheBtn" title="清空缓存">🗑️</button>
+              <button class="btn btn-small btn-secondary" id="clearHistoryBtn">清空</button>
+            </div>
+          </div>
+          <div class="history-list" id="historyList"></div>
+        </div>
+
+        <!-- 空状态 -->
+        <div class="empty-state" id="emptyState">
+          <div class="empty-icon">📋</div>
+          <p>粘贴蓝湖链接查看项目信息</p>
+        </div>
+      </aside>
+
+      <!-- 中间预览区 -->
+      <section class="preview-area">
+        <!-- 加载中 -->
+        <div class="loading" id="loading" style="display: none;">
+          <div class="spinner"></div>
+          <p>正在解析...</p>
+        </div>
+
+        <!-- 错误提示 -->
+        <div class="error" id="errorBox" style="display: none;">
+          <span class="error-icon">⚠️</span>
+          <span class="error-text" id="errorText"></span>
+        </div>
+
+        <!-- 图片预览区 -->
+        <div class="preview-section" id="previewSection" style="display: none;">
+          <div class="preview-toolbar">
+            <span class="preview-name" id="previewName"></span>
+            <button class="btn btn-small btn-secondary" id="refreshDesignBtn" title="更新设计图数据" style="display: none;">
+              <span class="btn-icon">🔄</span>
+            </button>
+            <div class="zoom-controls">
+              <button class="btn btn-small btn-secondary hotspot-mode-btn" id="hotspotModeBtn" title="标记热点区域">
+                标记热点
+              </button>
+              <button class="btn btn-small btn-secondary note-mode-btn" id="noteModeBtn" title="标记备注区域">
+                标记备注
+              </button>
+              <button class="btn btn-small btn-secondary layer-mode-btn" id="layerModeBtn" title="显示/隐藏图层标注">
+                图层解析
+              </button>
+              <button class="btn btn-small btn-secondary html-generate-btn" id="generateHtmlBtn" title="根据设计图生成静态 HTML">
+                生成 HTML
+              </button>
+              <button class="zoom-btn" id="zoomOutBtn" title="缩小">−</button>
+              <span class="zoom-level" id="zoomLevel">100%</span>
+              <button class="zoom-btn" id="zoomInBtn" title="放大">+</button>
+              <button class="zoom-btn" id="zoomResetBtn" title="重置">⟲</button>
+            </div>
+            <span class="preview-size" id="previewSize"></span>
+          </div>
+          <div class="preview-body" id="previewBody">
+            <div class="preview-container" id="previewContainer">
+              <img class="preview-image-large" id="previewImage" src="" alt="" draggable="false">
+            </div>
+            <aside class="html-preview-panel" id="htmlPreviewPanel" style="display: none;">
+              <div class="html-preview-header">
+                <span class="html-preview-title">HTML 预览</span>
+                <div class="html-preview-actions">
+                  <button class="btn btn-small btn-secondary" id="openHtmlInNewTabBtn">新标签打开</button>
+                  <button class="btn btn-small btn-secondary" id="copyHtmlBtn">复制代码</button>
+                  <button class="btn btn-small btn-secondary" id="closeHtmlPreviewBtn">关闭</button>
+                </div>
+              </div>
+              <iframe class="html-preview-frame" id="htmlPreviewFrame" title="生成的 HTML 预览"></iframe>
+              <textarea
+                class="html-code-output"
+                id="htmlCodeOutput"
+                readonly
+                placeholder="点击“生成 HTML”后，这里会显示代码"
+              ></textarea>
+            </aside>
+          </div>
+        </div>
+
+        <!-- 空状态 -->
+        <div class="content-empty" id="contentEmpty">
+          <div class="empty-icon">🖼️</div>
+          <p>选择设计图查看详情</p>
+        </div>
+      </section>
+
+      <!-- 右侧栏 - 切图列表 -->
+      <aside class="sidebar-right" id="sidebarRight" style="display: none;">
+        <div class="sidebar-right-header">
+          <h3>切图</h3>
+          <span class="count" id="sliceCount">0 张</span>
+        </div>
+
+        <!-- 切图设置 -->
+        <div class="slice-settings" id="sliceSettings" style="display: none;">
+          <div class="setting-group">
+            <label>平台</label>
+            <div class="setting-options" id="platformOptions">
+              <button class="setting-btn active" data-platform="ios">iOS</button>
+              <button class="setting-btn" data-platform="android">Android</button>
+              <button class="setting-btn" data-platform="web">Web</button>
+            </div>
+          </div>
+          <div class="setting-group">
+            <label>格式</label>
+            <div class="setting-options" id="formatOptions">
+              <button class="setting-btn active" data-format="png">PNG</button>
+              <button class="setting-btn" data-format="svg">SVG</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="slice-list" id="sliceList">
+          <div class="slice-empty">选择设计图查看切图</div>
+        </div>
+        <div class="sidebar-right-footer" id="sliceFooter" style="display: none;">
+          <button class="btn btn-primary btn-block" id="downloadAllBtn">下载全部切图</button>
+        </div>
+      </aside>
+    </main>
+
+    <!-- 底部日志面板 -->
+    <div class="log-panel collapsed" id="logPanel">
+      <div class="log-panel-header" id="logPanelHeader">
+        <div class="log-panel-title">
+          <span class="log-toggle-icon">▶</span>
+          <span>解析日志</span>
+          <span class="log-count" id="logCount">0</span>
+        </div>
+        <div class="log-panel-actions">
+          <button class="btn btn-small btn-secondary" id="clearLogBtn">清空</button>
+        </div>
+      </div>
+      <div class="log-panel-content" id="logContent"></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
