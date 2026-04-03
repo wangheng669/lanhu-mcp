@@ -58,6 +58,14 @@ Dockerfile.*
 
 # Playwright browsers cache (will be installed in container)
 .ms-playwright/
+.playwright-cli/
+
+# Companion web viewer
+apps/lanhu-viewer/node_modules/
+apps/lanhu-viewer/logs/
+apps/lanhu-viewer/output/
+apps/lanhu-viewer/sessions/
+apps/lanhu-viewer/.codex-before.png
 
 # Test files
 test_*
@@ -68,4 +76,3 @@ tests/
 screenshots/
 test_output/
 test_results/
-

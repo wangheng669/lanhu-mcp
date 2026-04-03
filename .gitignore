@@ -16,6 +16,7 @@ htmlcov/
 # Runtime data
 logs/
 data/
+output/
 
 # Editors
 .DS_Store

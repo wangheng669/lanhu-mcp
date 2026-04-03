@@ -44,6 +44,13 @@ from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
 from playwright.async_api import async_playwright
 
+# PIL for image annotation
+try:
+    from PIL import Image as PILImage, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
 # 创建FastMCP服务器
 mcp = FastMCP("Lanhu Axure Extractor")
 
@@ -6028,11 +6035,763 @@ async def lanhu_get_members(
     }
 
 
+# ==================== 设计图代码生成功能 ====================
+
+async def _get_design_code_data_internal(extractor: LanhuExtractor, image_id: str, team_id: str, project_id: str) -> dict:
+    """
+    获取设计图的代码生成数据（内部函数）
+
+    返回简化后的布局和样式信息，供 AI 生成 HTML/CSS 代码
+    """
+    # 1. 获取设计图详情
+    url = f"{BASE_URL}/api/project/image"
+    params = {
+        "dds_status": 1,
+        "image_id": image_id,
+        "team_id": team_id,
+        "project_id": project_id
+    }
+    response = await extractor.client.get(url, params=params)
+    data = response.json()
+
+    if data['code'] != '00000':
+        raise Exception(f"Failed to get design: {data['msg']}")
+
+    result = data['result']
+    latest_version = result['versions'][0]
+    json_url = latest_version['json_url']
+
+    # 2. 下载并解析设计 JSON
+    json_response = await extractor.client.get(json_url)
+    design_data = json_response.json()
+
+    # 3. 提取画布信息
+    canvas_info = {
+        'name': result.get('name', 'Untitled'),
+        'width': result.get('width'),
+        'height': result.get('height'),
+    }
+
+    # 4. 递归提取布局结构（简化版，只保留代码生成所需的信息）
+    def extract_layout_tree(obj, depth=0, max_depth=20):
+        """递归提取布局树结构"""
+        if not obj or not isinstance(obj, dict) or depth > max_depth:
+            return None
+
+        node = {
+            'name': obj.get('name', 'unnamed'),
+            'type': obj.get('type') or obj.get('layerType') or 'unknown',
+        }
+
+        # 提取位置和尺寸
+        frame = obj.get('frame') or obj.get('bounds') or {}
+        if frame:
+            x = frame.get('x') or frame.get('left', 0)
+            y = frame.get('y') or frame.get('top', 0)
+            width = frame.get('width', 0)
+            height = frame.get('height', 0)
+
+            if width and height:
+                node['layout'] = {
+                    'x': int(x) if x else 0,
+                    'y': int(y) if y else 0,
+                    'width': int(width),
+                    'height': int(height),
+                }
+
+        # 提取样式信息
+        styles = {}
+
+        # 背景色
+        if obj.get('fills'):
+            fills = obj['fills']
+            if isinstance(fills, list) and fills:
+                fill = fills[0]
+                color = fill.get('color')
+                if color:
+                    styles['backgroundColor'] = _convert_color(color)
+
+        # 边框
+        if obj.get('borders') or obj.get('strokes'):
+            borders = obj.get('borders') or obj.get('strokes')
+            if isinstance(borders, list) and borders:
+                border = borders[0]
+                color = border.get('color')
+                width = border.get('thickness') or border.get('width', 1)
+                if color:
+                    styles['border'] = f"{width}px solid {_convert_color(color)}"
+
+        # 圆角
+        radius = obj.get('radius') or obj.get('cornerRadius')
+        if radius:
+            if isinstance(radius, list):
+                styles['borderRadius'] = ' '.join(f"{r}px" for r in radius)
+            else:
+                styles['borderRadius'] = f"{radius}px"
+
+        # 透明度
+        if 'opacity' in obj and obj['opacity'] < 1:
+            styles['opacity'] = obj['opacity']
+
+        # 阴影
+        if obj.get('shadows'):
+            shadows = obj['shadows']
+            if isinstance(shadows, list) and shadows:
+                shadow = shadows[0]
+                offset = shadow.get('offset', {})
+                blur = shadow.get('blurRadius', 0)
+                color = shadow.get('color')
+                if color:
+                    x = offset.get('x', 0)
+                    y = offset.get('y', 0)
+                    styles['boxShadow'] = f"{x}px {y}px {blur}px {_convert_color(color)}"
+
+        # 文本样式
+        if obj.get('textStyle') or obj.get('attributedString'):
+            text_info = obj.get('textStyle') or {}
+            attr_string = obj.get('attributedString', {})
+
+            if attr_string.get('string'):
+                node['text'] = attr_string['string']
+
+            text_styles = {}
+
+            # 字体
+            font = text_info.get('font') or attr_string.get('font')
+            if font:
+                if font.get('family'):
+                    text_styles['fontFamily'] = font['family']
+                if font.get('size'):
+                    text_styles['fontSize'] = f"{font['size']}px"
+                if font.get('weight'):
+                    text_styles['fontWeight'] = str(font['weight'])
+
+            # 文本颜色
+            text_color = text_info.get('color') or attr_string.get('color')
+            if text_color:
+                text_styles['color'] = _convert_color(text_color)
+
+            # 行高
+            line_height = text_info.get('lineHeight') or attr_string.get('lineHeight')
+            if line_height:
+                text_styles['lineHeight'] = f"{line_height}px"
+
+            # 对齐
+            align = text_info.get('alignment') or attr_string.get('alignment')
+            if align:
+                text_styles['textAlign'] = align
+
+            if text_styles:
+                styles['text'] = text_styles
+
+        if styles:
+            node['styles'] = styles
+
+        # 图片资源
+        if obj.get('image') and obj['image'].get('imageUrl'):
+            node['image'] = obj['image']['imageUrl'].split('?')[0]  # 去掉 OSS 参数
+
+        # 递归处理子图层
+        children = []
+        if obj.get('layers'):
+            for layer in obj['layers']:
+                child = extract_layout_tree(layer, depth + 1, max_depth)
+                if child:
+                    children.append(child)
+
+        if children:
+            node['children'] = children
+
+        return node
+
+    # 5. 从 artboard 开始提取
+    layout_tree = None
+    if design_data.get('artboard'):
+        layout_tree = extract_layout_tree(design_data['artboard'])
+    elif design_data.get('info'):
+        # 兼容旧版结构
+        layout_tree = {
+            'name': canvas_info['name'],
+            'type': 'container',
+            'children': [extract_layout_tree(item) for item in design_data['info'] if extract_layout_tree(item)]
+        }
+
+    return {
+        'canvas': canvas_info,
+        'layout': layout_tree,
+    }
+
+
+def _convert_color(color_obj) -> str:
+    """将蓝湖颜色对象转换为 CSS 颜色值"""
+    if not color_obj:
+        return 'transparent'
+
+    if isinstance(color_obj, str):
+        return color_obj
+
+    # 处理 RGB/RGBA 格式
+    if isinstance(color_obj, dict):
+        r = color_obj.get('red', 0)
+        g = color_obj.get('green', 0)
+        b = color_obj.get('blue', 0)
+        a = color_obj.get('alpha', 1)
+
+        # 转换为 0-255 范围
+        if r <= 1: r = int(r * 255)
+        if g <= 1: g = int(g * 255)
+        if b <= 1: b = int(b * 255)
+
+        if a < 1:
+            return f"rgba({r}, {g}, {b}, {a})"
+        return f"rgb({r}, {g}, {b})"
+
+    return str(color_obj)
+
+
+@mcp.tool()
+async def lanhu_get_design_code_data(
+        url: Annotated[str, "Lanhu URL WITHOUT docId (indicates UI design project). Example: https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx"],
+        design_name: Annotated[str, "Exact design name. Example: '首页设计', '登录页'. Get exact names from lanhu_get_designs first!"],
+        ctx: Context = None
+) -> dict:
+    """
+    [Code Generation] Get design layout and style data for code generation
+
+    USE THIS WHEN user says: 生成代码, 导出HTML, 转成代码, 设计转代码, code, 代码生成, 导出代码, 生成HTML, 生成Vue, 生成React
+
+    Purpose: Get simplified layout and style data from Lanhu design for AI to generate HTML/Vue/React code
+
+    WORKFLOW:
+    1. First call lanhu_get_designs to get design list
+    2. Then call this to get code generation data
+    3. AI will generate code based on the returned layout tree and styles
+
+    Returns:
+        Design canvas info and layout tree with styles, ready for code generation
+    """
+    extractor = LanhuExtractor()
+    try:
+        # 记录协作者
+        user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
+        project_id_url = get_project_id_from_url(url)
+        if project_id_url:
+            store = MessageStore(project_id_url)
+            store.record_collaborator(user_name, user_role)
+
+        # 1. 获取设计图列表
+        designs_data = await _get_designs_internal(extractor, url)
+
+        if designs_data['status'] != 'success':
+            return {
+                'status': 'error',
+                'message': designs_data.get('message', 'Failed to get designs')
+            }
+
+        # 2. 查找指定的设计图
+        target_design = None
+        for design in designs_data['designs']:
+            if design['name'] == design_name:
+                target_design = design
+                break
+
+        if not target_design:
+            available_names = [d['name'] for d in designs_data['designs']]
+            return {
+                'status': 'error',
+                'message': f"Design '{design_name}' does not exist",
+                'available_designs': available_names
+            }
+
+        # 3. 解析URL获取参数
+        params = extractor.parse_url(url)
+
+        # 4. 获取代码生成数据
+        code_data = await _get_design_code_data_internal(
+            image_id=target_design['id'],
+            team_id=params['team_id'],
+            project_id=params['project_id']
+        )
+
+        # 5. 添加 AI 代码生成指南
+        ai_guide = {
+            "instructions": "🤖 AI Code Generation Guide",
+            "language_requirement": "⚠️ IMPORTANT: Always respond to user in Chinese (中文回复)",
+            "supported_frameworks": ["HTML + CSS", "Vue 3", "React", "微信小程序", "uni-app"],
+            "generation_tips": [
+                "Use flexbox for layout (position: absolute should be avoided when possible)",
+                "Extract common colors as CSS variables",
+                "Use semantic HTML tags (header, main, section, etc.)",
+                "Add appropriate class names based on element function",
+                "Consider responsive design if needed",
+                "Handle image paths appropriately (download images or use placeholders)",
+            ],
+            "workflow": [
+                "1. Analyze the layout tree structure",
+                "2. Identify container and leaf elements",
+                "3. Generate HTML structure with semantic tags",
+                "4. Apply styles from the 'styles' field",
+                "5. Handle text content from 'text' field",
+                "6. Process image URLs from 'image' field",
+            ]
+        }
+
+        return {
+            'status': 'success',
+            'design_name': target_design['name'],
+            'design_id': target_design['id'],
+            'canvas': code_data['canvas'],
+            'layout': code_data['layout'],
+            'ai_guide': ai_guide
+        }
+
+    except Exception as e:
+        return {
+            'status': 'error',
+            'message': str(e)
+        }
+    finally:
+        await extractor.close()
+
+
+# ============================================================================
+# 设计图层标注工具
+# ============================================================================
+
+async def _download_image_for_annotation(url: str, save_path: str) -> bool:
+    """下载图片用于标注"""
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            response = await client.get(url, follow_redirects=True)
+            if response.status_code == 200:
+                with open(save_path, 'wb') as f:
+                    f.write(response.content)
+                return True
+    except Exception as e:
+        print(f"下载图片失败: {e}")
+    return False
+
+
+def _collect_all_layers(node: dict, layers_list: list, depth: int = 0, parent_path: str = ""):
+    """递归收集所有图层信息"""
+    if not node:
+        return
+
+    # 构建当前图层路径
+    current_path = f"{parent_path}/{node.get('name', 'unnamed')}" if parent_path else node.get('name', 'unnamed')
+
+    layer_info = {
+        'name': node.get('name', 'unnamed'),
+        'path': current_path,
+        'depth': depth,
+        'type': node.get('type', 'unknown'),
+        'visible': node.get('visible', True),
+    }
+
+    # 位置信息
+    if 'rect' in node:
+        rect = node['rect']
+        layer_info['x'] = rect.get('x', 0)
+        layer_info['y'] = rect.get('y', 0)
+        layer_info['width'] = rect.get('width', 0)
+        layer_info['height'] = rect.get('height', 0)
+    elif 'bounds' in node:
+        bounds = node['bounds']
+        layer_info['x'] = bounds.get('x', 0)
+        layer_info['y'] = bounds.get('y', 0)
+        layer_info['width'] = bounds.get('width', 0)
+        layer_info['height'] = bounds.get('height', 0)
+
+    # 样式信息摘要
+    styles = node.get('styles', {})
+    if styles:
+        style_summary = []
+        if 'background' in styles:
+            bg = styles['background']
+            if isinstance(bg, dict) and bg.get('color'):
+                style_summary.append(f"bg:{bg['color']}")
+        if 'border' in styles:
+            border = styles['border']
+            if isinstance(border, dict):
+                style_summary.append(f"border:{border.get('width', 0)}px")
+        if 'text' in styles:
+            text = styles['text']
+            if isinstance(text, dict):
+                if text.get('fontSize'):
+                    style_summary.append(f"font:{text['fontSize']}")
+                if text.get('color'):
+                    style_summary.append(f"color:{text['color']}")
+        layer_info['style_summary'] = ' | '.join(style_summary) if style_summary else None
+
+    # 文本内容
+    if node.get('text'):
+        text_content = node['text']
+        if len(text_content) > 30:
+            text_content = text_content[:30] + '...'
+        layer_info['text'] = text_content
+
+    # 图片
+    if node.get('image'):
+        layer_info['has_image'] = True
+
+    layers_list.append(layer_info)
+
+    # 递归处理子图层
+    if 'children' in node:
+        for child in node['children']:
+            _collect_all_layers(child, layers_list, depth + 1, current_path)
+
+
+def _get_layer_color(depth: int, layer_type: str) -> tuple:
+    """根据深度和类型获取标注颜色"""
+    # 颜色调色板
+    colors = [
+        (255, 0, 0, 200),      # 红色 - 深度0
+        (0, 128, 255, 200),    # 蓝色 - 深度1
+        (0, 200, 100, 200),    # 绿色 - 深度2
+        (255, 165, 0, 200),    # 橙色 - 深度3
+        (128, 0, 255, 200),    # 紫色 - 深度4
+        (255, 105, 180, 200),  # 粉色 - 深度5
+        (0, 206, 209, 200),    # 青色 - 深度6
+        (255, 215, 0, 200),    # 金色 - 深度7+
+    ]
+
+    color_index = min(depth, len(colors) - 1)
+    return colors[color_index]
+
+
+def _draw_layer_annotation(draw: 'ImageDraw', layer: dict, scale: float, font: 'ImageFont', color: tuple):
+    """绘制单个图层的标注"""
+    if 'x' not in layer or 'y' not in layer:
+        return
+
+    x = int(layer['x'] * scale)
+    y = int(layer['y'] * scale)
+    w = int(layer['width'] * scale)
+    h = int(layer['height'] * scale)
+
+    # 跳过太小或不可见图层
+    if w < 5 or h < 5 or not layer.get('visible', True):
+        return
+
+    # 绘制边框
+    draw.rectangle([x, y, x + w, y + h], outline=color, width=2)
+
+    # 准备标签文字
+    label_parts = [layer['name'][:20]]  # 图层名（截断）
+    label_parts.append(f"{layer['width']}×{layer['height']}")  # 尺寸
+    label_parts.append(f"({layer['x']}, {layer['y']})")  # 位置
+
+    # 添加样式摘要
+    if layer.get('style_summary'):
+        label_parts.append(layer['style_summary'])
+
+    # 添加文本预览
+    if layer.get('text'):
+        label_parts.append(f'"{layer["text"]}"')
+
+    # 绘制标签背景和文字
+    label_text = '\n'.join(label_parts)
+    bbox = draw.textbbox((x, y), label_text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+
+    # 标签位置（在框上方，如果空间不够则下方）
+    label_x = x
+    label_y = y - text_h - 8 if y > text_h + 10 else y + h + 4
+
+    # 绘制标签背景
+    bg_color = (color[0], color[1], color[2], 230)
+    draw.rectangle(
+        [label_x - 4, label_y - 2, label_x + text_w + 8, label_y + text_h + 4],
+        fill=bg_color
+    )
+
+    # 绘制文字
+    draw.text((label_x, label_y), label_text, fill=(255, 255, 255, 255), font=font)
+
+
+def _annotate_design_image(
+    image_path: str,
+    layers: list,
+    output_path: str,
+    max_depth: int = 3,
+    min_size: int = 10,
+    show_hidden: bool = False
+) -> dict:
+    """在设计图上标注图层信息"""
+    if not PIL_AVAILABLE:
+        return {
+            'status': 'error',
+            'message': 'PIL/Pillow not installed. Please install with: pip install Pillow'
+        }
+
+    try:
+        # 打开原始图片
+        img = PILImage.open(image_path)
+        if img.mode != 'RGBA':
+            img = img.convert('RGBA')
+
+        original_width, original_height = img.size
+
+        # 创建绘图层
+        overlay = PILImage.new('RGBA', img.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        # 尝试加载字体
+        try:
+            # macOS 系统字体
+            font = ImageFont.truetype("/System/Library/Fonts/PingFang.ttc", 14)
+            font_small = ImageFont.truetype("/System/Library/Fonts/PingFang.ttc", 11)
+        except:
+            try:
+                # Linux 系统字体
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+                font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 11)
+            except:
+                # 默认字体
+                font = ImageFont.load_default()
+                font_small = ImageFont.load_default()
+
+        # 计算缩放比例（假设设计稿宽度为750）
+        design_width = 750
+        scale = original_width / design_width
+
+        # 统计信息
+        stats = {
+            'total_layers': len(layers),
+            'annotated_layers': 0,
+            'skipped_hidden': 0,
+            'skipped_small': 0,
+            'skipped_depth': 0,
+        }
+
+        # 绘制图层标注
+        for layer in layers:
+            # 过滤条件
+            if layer['depth'] > max_depth:
+                stats['skipped_depth'] += 1
+                continue
+
+            if not layer.get('visible', True) and not show_hidden:
+                stats['skipped_hidden'] += 1
+                continue
+
+            if 'width' not in layer or 'height' not in layer:
+                continue
+
+            if layer['width'] < min_size or layer['height'] < min_size:
+                stats['skipped_small'] += 1
+                continue
+
+            # 获取颜色
+            color = _get_layer_color(layer['depth'], layer.get('type', 'unknown'))
+
+            # 绘制标注
+            _draw_layer_annotation(draw, layer, scale, font, color)
+            stats['annotated_layers'] += 1
+
+        # 合并图层
+        result = PILImage.alpha_composite(img, overlay)
+
+        # 保存结果
+        result_rgb = result.convert('RGB')
+        result_rgb.save(output_path, 'PNG', quality=95)
+
+        return {
+            'status': 'success',
+            'output_path': output_path,
+            'original_size': {'width': original_width, 'height': original_height},
+            'stats': stats
+        }
+
+    except Exception as e:
+        return {
+            'status': 'error',
+            'message': str(e)
+        }
+
+
+@mcp.tool()
+async def lanhu_annotate_design_layers(
+    url: Annotated[str, "Lanhu URL WITHOUT docId (indicates UI design project). Example: https://lanhuapp.com/web/#/item/project/stage?tid=xxx&pid=xxx"],
+    design_name: Annotated[str, "Exact design name. Example: '首页设计', '登录页'"],
+    max_depth: Annotated[int, "Maximum layer depth to annotate (0=root only, default=3)"] = 3,
+    min_size: Annotated[int, "Minimum layer size to annotate in pixels (default=10)"] = 10,
+    show_hidden: Annotated[bool, "Whether to show hidden layers (default=false)"] = False,
+    ctx: Context = None
+) -> dict:
+    """
+    [Layer Annotation] Annotate layer positions, sizes, and styles on design image
+
+    USE THIS WHEN user says: 标注图层, 图层位置, 设计标注, 标注设计图, annotate layers, layer positions
+
+    Purpose: Generate an annotated image showing all layer boundaries, names, positions, sizes, and style information
+
+    WORKFLOW:
+    1. First call lanhu_get_designs to get design list
+    2. Then call this to generate annotated design image
+    3. The annotated image will be saved and path returned
+
+    Parameters:
+    - max_depth: Control annotation depth (0=only root, 3=show 4 levels, etc.)
+    - min_size: Skip layers smaller than this (useful to reduce clutter)
+    - show_hidden: Set true to include hidden layers
+
+    Returns:
+    - Annotated image path and layer statistics
+    """
+    if not PIL_AVAILABLE:
+        return {
+            'status': 'error',
+            'message': 'PIL/Pillow not installed. Please install with: pip install Pillow'
+        }
+
+    extractor = LanhuExtractor()
+    try:
+        # 记录协作者
+        user_name, user_role = get_user_info(ctx) if ctx else ('匿名', '未知')
+        project_id_url = get_project_id_from_url(url)
+        if project_id_url:
+            store = MessageStore(project_id_url)
+            store.record_collaborator(user_name, user_role)
+
+        # 1. 获取设计图列表
+        designs_data = await _get_designs_internal(extractor, url)
+
+        if designs_data['status'] != 'success':
+            return {
+                'status': 'error',
+                'message': designs_data.get('message', 'Failed to get designs')
+            }
+
+        # 2. 查找指定的设计图
+        target_design = None
+        for design in designs_data['designs']:
+            if design['name'] == design_name:
+                target_design = design
+                break
+
+        if not target_design:
+            available_names = [d['name'] for d in designs_data['designs']]
+            return {
+                'status': 'error',
+                'message': f"Design '{design_name}' does not exist",
+                'available_designs': available_names
+            }
+
+        # 3. 解析URL获取参数
+        params = extractor.parse_url(url)
+
+        # 4. 获取代码生成数据
+        code_data = await _get_design_code_data_internal(
+            image_id=target_design['id'],
+            team_id=params['team_id'],
+            project_id=params['project_id']
+        )
+
+        # 5. 收集所有图层
+        layers = []
+        if code_data.get('layout'):
+            _collect_all_layers(code_data['layout'], layers)
+
+        if not layers:
+            return {
+                'status': 'error',
+                'message': 'No layers found in design'
+            }
+
+        # 6. 下载设计预览图
+        output_dir = DATA_DIR / 'annotated'
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 获取预览图URL
+        preview_url = target_design.get('preview_url') or target_design.get('cover')
+        if not preview_url:
+            return {
+                'status': 'error',
+                'message': 'No preview image available for this design'
+            }
+
+        # 下载图片
+        import time
+        timestamp = int(time.time())
+        safe_name = re.sub(r'[^\w\-]', '_', design_name)
+        original_path = str(output_dir / f"{safe_name}_{timestamp}_original.png")
+        annotated_path = str(output_dir / f"{safe_name}_{timestamp}_annotated.png")
+
+        await ctx.info(f"📥 正在下载设计预览图...") if ctx else None
+        download_success = await _download_image_for_annotation(preview_url, original_path)
+
+        if not download_success:
+            return {
+                'status': 'error',
+                'message': 'Failed to download design preview image'
+            }
+
+        # 7. 生成标注图
+        await ctx.info(f"🎨 正在标注 {len(layers)} 个图层...") if ctx else None
+        annotation_result = _annotate_design_image(
+            image_path=original_path,
+            layers=layers,
+            output_path=annotated_path,
+            max_depth=max_depth,
+            min_size=min_size,
+            show_hidden=show_hidden
+        )
+
+        if annotation_result['status'] != 'success':
+            return annotation_result
+
+        # 8. 生成图例说明
+        legend = [
+            "📊 图层深度颜色说明:",
+            "  🔴 红色 = 深度0 (根容器)",
+            "  🔵 蓝色 = 深度1",
+            "  🟢 绿色 = 深度2",
+            "  🟠 橙色 = 深度3",
+            "  🟣 紫色 = 深度4",
+            "  🩷 粉色 = 深度5+",
+            "",
+            "📏 标注信息包含:",
+            "  • 图层名称",
+            "  • 尺寸 (宽×高)",
+            "  • 位置坐标 (x, y)",
+            "  • 样式摘要 (背景色、边框、字体等)",
+            "  • 文本内容预览",
+        ]
+
+        return {
+            'status': 'success',
+            'design_name': design_name,
+            'annotated_image': annotated_path,
+            'original_image': original_path,
+            'stats': annotation_result['stats'],
+            'total_layers_found': len(layers),
+            'legend': legend,
+            'usage_tip': f"Use max_depth={max_depth} to control annotation depth. Increase to see more nested layers."
+        }
+
+    except Exception as e:
+        import traceback
+        return {
+            'status': 'error',
+            'message': str(e),
+            'traceback': traceback.format_exc()
+        }
+    finally:
+        await extractor.close()
+
+
 if __name__ == "__main__":
     # 运行MCP服务器
-    # 使用HTTP传输方式，支持环境变量配置
-    SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
-    SERVER_PORT = int(os.getenv("SERVER_PORT", "8100"))
-    mcp.run(transport="http", path="/mcp", host=SERVER_HOST, port=SERVER_PORT)
-
+    # 支持通过 MCP_TRANSPORT 环境变量选择传输方式：http（默认）或 stdio
+    # 默认使用 http，与 docker-compose 和现有部署文档保持一致。
+    transport = os.getenv("MCP_TRANSPORT", "http").lower()
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
+        SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
+        mcp.run(transport="http", path="/mcp", host=SERVER_HOST, port=SERVER_PORT)
 
