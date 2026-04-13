@@ -1,15 +1,41 @@
 // 蓝湖链接解析器 - 前端逻辑
 
+const GENERATED_FRAMEWORK_OPTIONS = [
+  { value: 'html', label: 'HTML' },
+  { value: 'vue', label: 'Vue' },
+  { value: 'react', label: 'React' },
+  { value: 'wxmp', label: '微信小程序' },
+  { value: 'uni-app', label: 'uni-app' }
+];
+
+const GENERATED_FRAMEWORK_LABELS = GENERATED_FRAMEWORK_OPTIONS.reduce((acc, option) => {
+  acc[option.value] = option.label;
+  return acc;
+}, {});
+
+const GENERATED_FRAMEWORK_ALIASES = {
+  h5: 'html',
+  vue2: 'vue',
+  weapp: 'wxmp',
+  mini_program: 'wxmp',
+  miniprogram: 'wxmp',
+  miniapp: 'wxmp',
+  uniapp: 'uni-app'
+};
+
 class LanhuViewer {
   constructor() {
-    // 使用固定的共享 session-id，让所有用户共享同一个蓝湖登录状态
-    this.sessionId = 'shared_lanhu_session';
-    this.appVersion = '2026-04-03-mcp-layer-annotation-v1';
+    this.defaultSessionId = 'shared_lanhu_session';
+    // 刷新后优先复用本地保存的 session-id，避免丢失已登录状态
+    this.sessionId = this.loadSessionId();
+    this.appVersion = '2026-04-09-generated-code-progress-v4';
     this.migrateCacheVersion();
     this.isLoggedIn = false;
     this.logs = [];
     this.history = this.loadHistory();
     this.cache = this.loadCache();
+    this.generatedCodeCache = this.loadGeneratedCodeCache();
+    this.generatedCodeJobCache = this.loadGeneratedCodeJobCache();
     this.currentPageState = this.loadPageState();
     this.hotspots = [];
     this.notes = [];
@@ -40,15 +66,381 @@ class LanhuViewer {
     this.activeNoteId = null;
     this.generatedHtmlCode = '';
     this.generatedHtmlDesignId = null;
+    this.generatedPreviewHtml = '';
+    this.generatedCodeFiles = [];
+    this.generatedCodeFileName = '';
+    this.generatedCodeFramework = '';
+    this.selectedGeneratedFramework = this.loadGeneratedFrameworkPreference();
+    this.isCodePanelVisible = false;
+    this.isGeneratingHtmlPreview = false;
+    this.generatedCodeJobId = '';
+    this.generatedCodePollTimer = null;
+    this.generatedCodePollResolve = null;
+    this.generatedCodePollToken = 0;
+    this.generatedCodeTask = this.createInitialGeneratedCodeTaskState();
     this.isAnnotationPreview = false;
     this.annotationObjectUrl = '';
+    this.panzoom = null;
+    this.isPanzoomBound = false;
+    this.isPanzoomInteracting = false;
+    this.previewRefreshTimer = null;
+    this.currentPreviewOriginalUrl = '';
+    this.currentPreviewSourceUrl = '';
+    this.currentPreviewRequestWidth = 0;
+    this.generatedPreviewFrameStage = null;
+    this.generatedPreviewFrameWrap = null;
+    this.generatedPreviewFitTimer = null;
+    this.generatedPreviewFitRaf = 0;
+    this.generatedPreviewLoadTimers = [];
+    this.generatedPreviewDiagnostics = this.createInitialGeneratedPreviewDiagnostics();
+    this.generatedPreviewRepairState = this.createInitialGeneratedPreviewRepairState();
 
     this.initElements();
+    window.__lanhuViewerReceiveGeneratedPreviewDiagnostics = (payload) => this.handleGeneratedPreviewDiagnostics(payload);
+    this.initPanzoom();
     this.initEvents();
     this.updateAnnotationPreviewButton();
+    this.updateGenerateHtmlButtonState();
+    this.renderGeneratedCodeTask();
+    this.updateGeneratedCodeMeta();
+    this.renderGeneratedPreviewDiagnostics();
     this.renderHistory();
     this.notifyParentReady();
     this.checkSession(); // 异步检查，完成后会调用 restorePageState
+  }
+
+  createInitialGeneratedCodeTaskState() {
+    return {
+      id: '',
+      status: 'idle',
+      stepKey: 'idle',
+      stepLabel: '等待开始',
+      currentStep: 0,
+      totalSteps: 6,
+      progressPercent: 0,
+      currentAction: '点击下方按钮开始生成。',
+      logs: [],
+      errorMessage: '',
+      createdAt: 0,
+      updatedAt: 0
+    };
+  }
+
+  createInitialGeneratedPreviewDiagnostics() {
+    return {
+      token: '',
+      status: 'idle',
+      updatedAt: 0,
+      trigger: '',
+      report: null
+    };
+  }
+
+  createInitialGeneratedPreviewRepairState() {
+    return {
+      mode: 'dds',
+      reason: '',
+      missingModules: [],
+      overlayModules: [],
+      updatedAt: 0
+    };
+  }
+
+  getGeneratedPreviewRepairMode() {
+    const mode = String(this.generatedPreviewRepairState?.mode || '').trim();
+    return ['module', 'layer'].includes(mode) ? mode : 'dds';
+  }
+
+  getGeneratedPreviewSourceDesign() {
+    const preferredDesignId = String(this.generatedHtmlDesignId || this.selectedDesignId || '').trim();
+    if (!preferredDesignId || !Array.isArray(this.designs)) {
+      return this.getSelectedDesign();
+    }
+    return this.designs.find((item) => item.id === preferredDesignId) || this.getSelectedDesign();
+  }
+
+  getGeneratedPreviewLayerContext(design = this.getGeneratedPreviewSourceDesign()) {
+    if (!design?.id) return null;
+
+    let layers = [];
+    let canvasInfo = null;
+
+    if (this.currentLayerDesignId === design.id && Array.isArray(this.layers) && this.layers.length > 0) {
+      layers = this.layers;
+      canvasInfo = this.canvasInfo;
+    } else {
+      const cachedData = this.layerCache.get(design.id);
+      if (cachedData && Array.isArray(cachedData.layers) && cachedData.layers.length > 0) {
+        layers = cachedData.layers;
+        canvasInfo = cachedData.canvasInfo || null;
+      }
+    }
+
+    if (!layers.length) return null;
+
+    let slices = [];
+    if (this.selectedDesignId === design.id && Array.isArray(this.currentSlices) && this.currentSlices.length > 0) {
+      slices = this.currentSlices;
+    } else {
+      const cachedSlices = this.getSliceCache(design.id);
+      if (cachedSlices && Array.isArray(cachedSlices.slices) && cachedSlices.slices.length > 0) {
+        slices = cachedSlices.slices;
+      }
+    }
+
+    return {
+      design,
+      layers,
+      canvasInfo,
+      slices
+    };
+  }
+
+  getGeneratedPreviewFrameMetrics() {
+    const doc = this.htmlPreviewFrame?.contentDocument;
+    const frameWindow = doc?.defaultView;
+    const root = doc?.querySelector('.page') || doc?.body?.firstElementChild || doc?.body;
+    if (!frameWindow || !(root instanceof frameWindow.HTMLElement)) {
+      return null;
+    }
+
+    const rootRect = root.getBoundingClientRect();
+    return {
+      doc,
+      frameWindow,
+      root,
+      rootRect,
+      width: Math.max(
+        1,
+        Math.round(rootRect.width || root.offsetWidth || root.clientWidth || root.scrollWidth || 1)
+      ),
+      height: Math.max(
+        1,
+        Math.round(rootRect.height || root.offsetHeight || root.clientHeight || root.scrollHeight || 1)
+      )
+    };
+  }
+
+  isGenericLayerGroupName(value = '') {
+    return /^(group|frame|rectangle|union|component|image)\b/i.test(String(value || '').trim()) ||
+      /^编组\b/i.test(String(value || '').trim());
+  }
+
+  getLayerModulePrefix(path = '') {
+    const parts = String(path || '').trim().split('/').filter(Boolean);
+    if (parts.length <= 2) {
+      return parts.join('/');
+    }
+
+    const secondPart = parts[1] || '';
+    const prefixDepth = this.isGenericLayerGroupName(secondPart) ? Math.min(parts.length, 3) : 2;
+    return parts.slice(0, prefixDepth).join('/');
+  }
+
+  rectsOverlap(a, b) {
+    if (!a || !b) return false;
+    const left = Math.max(Number(a.left) || 0, Number(b.left) || 0);
+    const top = Math.max(Number(a.top) || 0, Number(b.top) || 0);
+    const right = Math.min(
+      (Number(a.left) || 0) + (Number(a.width) || 0),
+      (Number(b.left) || 0) + (Number(b.width) || 0)
+    );
+    const bottom = Math.min(
+      (Number(a.top) || 0) + (Number(a.height) || 0),
+      (Number(b.top) || 0) + (Number(b.height) || 0)
+    );
+    return right > left && bottom > top;
+  }
+
+  extractModuleFromLayers(layers, matcher = {}) {
+    if (!Array.isArray(layers) || layers.length === 0) {
+      return { layers: [], bounds: null };
+    }
+
+    const pathPrefix = String(matcher.pathPrefix || '').trim();
+    const boundsRect = matcher.boundsRect && typeof matcher.boundsRect === 'object'
+      ? matcher.boundsRect
+      : null;
+
+    const matchedLayers = layers.filter((layer) => {
+      if (!layer || layer.visible === false) return false;
+      const width = Number(layer.width) || 0;
+      const height = Number(layer.height) || 0;
+      if (width <= 1 || height <= 1) return false;
+
+      const matchesPath = pathPrefix
+        ? (() => {
+            const layerPath = String(layer.path || '').trim();
+            return layerPath === pathPrefix || layerPath.startsWith(`${pathPrefix}/`);
+          })()
+        : true;
+
+      const matchesBounds = boundsRect
+        ? this.rectsOverlap(
+            {
+              left: Number(layer.x) || 0,
+              top: Number(layer.y) || 0,
+              width,
+              height
+            },
+            boundsRect
+          )
+        : true;
+
+      return matchesPath && matchesBounds;
+    });
+
+    if (!matchedLayers.length) {
+      return { layers: [], bounds: null };
+    }
+
+    const minX = Math.min(...matchedLayers.map((layer) => Number(layer.x) || 0));
+    const minY = Math.min(...matchedLayers.map((layer) => Number(layer.y) || 0));
+    const maxRight = Math.max(...matchedLayers.map((layer) => (Number(layer.x) || 0) + (Number(layer.width) || 0)));
+    const maxBottom = Math.max(...matchedLayers.map((layer) => (Number(layer.y) || 0) + (Number(layer.height) || 0)));
+
+    return {
+      layers: matchedLayers,
+      bounds: {
+        left: minX,
+        top: minY,
+        width: Math.max(1, maxRight - minX),
+        height: Math.max(1, maxBottom - minY)
+      }
+    };
+  }
+
+  buildRenderableModuleLayers(
+    moduleLayers,
+    {
+      slices = [],
+      targetWidth = 0,
+      targetHeight = 0,
+      useDirectLayerImages = false
+    } = {}
+  ) {
+    const renderableLayers = this.getRenderableLayersForHtml(
+      Array.isArray(moduleLayers) ? moduleLayers : [],
+      Array.isArray(slices) ? slices : [],
+      { useDirectLayerImages }
+    );
+
+    return this.normalizeLayersForCanvas(
+      renderableLayers,
+      Math.max(0, Number(targetWidth) || 0),
+      Math.max(0, Number(targetHeight) || 0)
+    );
+  }
+
+  getGeneratedCodePrimaryLine(message = '') {
+    return String(message || '')
+      .split(/\r?\n/)
+      .map((line) => String(line || '').trim())
+      .find(Boolean) || '';
+  }
+
+  sanitizeGeneratedCodeStatusMessage(message = '', { trimPrefix = false } = {}) {
+    const primaryLine = this.getGeneratedCodePrimaryLine(message);
+    if (!primaryLine) {
+      return '';
+    }
+
+    let normalized = primaryLine
+      .replace(/^Uncaught\s*\(in promise\)\s*/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (trimPrefix) {
+      normalized = normalized
+        .replace(/^蓝湖代码生成失败[:：]\s*/i, '')
+        .replace(/^读取蓝湖代码失败[:：]\s*/i, '')
+        .replace(/^获取蓝湖代码生成进度失败[:：]\s*/i, '')
+        .trim();
+    }
+
+    return normalized.length > 180 ? `${normalized.slice(0, 177)}...` : normalized;
+  }
+
+  isGenericGeneratedCodeErrorMessage(message) {
+    const normalized = this.sanitizeGeneratedCodeStatusMessage(message, { trimPrefix: true });
+    if (!normalized) return true;
+
+    return [
+      '读取蓝湖代码失败',
+      '获取蓝湖代码生成进度失败',
+      '未获取到蓝湖代码生成状态',
+      'Failed to fetch'
+    ].includes(normalized);
+  }
+
+  buildGeneratedCodeHttpErrorMessage(endpoint, response, payload, rawText, fallbackMessage) {
+    const payloadMessage = payload?.message || payload?.error || payload?.job?.errorMessage || '';
+    if (payloadMessage) {
+      return this.sanitizeGeneratedCodeStatusMessage(payloadMessage, { trimPrefix: true }) || payloadMessage;
+    }
+
+    const text = String(rawText || '').trim();
+    if (text) {
+      if (/^\s*</.test(text)) {
+        if (response?.status === 404) {
+          return `${fallbackMessage}：接口 ${endpoint} 不存在，服务端可能还没重启`;
+        }
+        return `${fallbackMessage}：服务端返回了非 JSON 响应 (HTTP ${response?.status || '未知'})`;
+      }
+      return `${fallbackMessage}：${text.slice(0, 180)}`;
+    }
+
+    if (response?.status === 404) {
+      return `${fallbackMessage}：接口 ${endpoint} 不存在，服务端可能还没重启`;
+    }
+
+    const status = response?.status ? `HTTP ${response.status}` : '未知状态';
+    const statusText = response?.statusText ? ` ${response.statusText}` : '';
+    return `${fallbackMessage}：${status}${statusText}`;
+  }
+
+  async readGeneratedCodeApiResponse(response, endpoint, fallbackMessage) {
+    const rawText = await response.text().catch(() => '');
+    let payload = {};
+
+    if (rawText) {
+      try {
+        payload = JSON.parse(rawText);
+      } catch (e) {
+        payload = {};
+      }
+    }
+
+    return {
+      payload,
+      rawText,
+      errorMessage: this.buildGeneratedCodeHttpErrorMessage(
+        endpoint,
+        response,
+        payload,
+        rawText,
+        fallbackMessage
+      )
+    };
+  }
+
+  getGeneratedCodeDisplayErrorMessage(error, task = this.generatedCodeTask) {
+    const directMessage = this.sanitizeGeneratedCodeStatusMessage(error?.message || '', { trimPrefix: true });
+    if (!this.isGenericGeneratedCodeErrorMessage(directMessage)) {
+      return directMessage;
+    }
+
+    const taskLogs = Array.isArray(task?.logs) ? task.logs : [];
+    const lastUsefulLog = [...taskLogs]
+      .reverse()
+      .find((log) => log?.message && !this.isGenericGeneratedCodeErrorMessage(log.message) && !/^蓝湖代码生成失败[:：]?\s*$/.test(log.message));
+
+    if (lastUsefulLog?.message) {
+      const lastLogMessage = this.sanitizeGeneratedCodeStatusMessage(lastUsefulLog.message);
+      return `${directMessage || '读取蓝湖代码失败'}，最后日志：${lastLogMessage}`;
+    }
+
+    return directMessage || '读取蓝湖代码失败';
   }
 
   migrateCacheVersion() {
@@ -58,6 +450,8 @@ class LanhuViewer {
       if (currentVersion === this.appVersion) return;
 
       localStorage.removeItem('lanhuCache');
+      localStorage.removeItem('lanhuGeneratedCodeCache');
+      localStorage.removeItem('lanhuGeneratedCodeJobCache');
       localStorage.removeItem('lanhuLayerCache');
       localStorage.setItem(versionKey, this.appVersion);
     } catch (e) {}
@@ -74,6 +468,181 @@ class LanhuViewer {
 
   isEmbedded() {
     return window.parent && window.parent !== window;
+  }
+
+  shouldHideInputSection() {
+    try {
+      const urlParams = new URLSearchParams(window.location.search);
+      return Boolean(urlParams.get('url'));
+    } catch (e) {
+      return false;
+    }
+  }
+
+  syncInputSectionVisibility() {
+    if (!this.inputSection) return;
+    this.inputSection.hidden = this.shouldHideInputSection();
+  }
+
+  getCurrentLanhuUrl() {
+    const inputUrl = this.urlInput?.value?.trim();
+    if (inputUrl) return inputUrl;
+
+    try {
+      const urlParams = new URLSearchParams(window.location.search);
+      const urlFromParams = urlParams.get('url');
+      if (urlFromParams) return urlFromParams.trim();
+    } catch (e) {}
+
+    return this.currentPageState?.url || '';
+  }
+
+  getDesignLink(design) {
+    const designId = String(design?.id || '').trim();
+    const teamId = String(this.currentTeamId || '').trim();
+    const projectId = String(this.currentProjectId || '').trim();
+
+    if (!designId || !teamId || !projectId) return '';
+
+    const params = new URLSearchParams({
+      pid: projectId,
+      tid: teamId,
+      see: 'all',
+      project_id: projectId,
+      image_id: designId,
+      fromEditor: 'true',
+      type: 'image',
+    });
+
+    return `https://lanhuapp.com/web/#/item/project/detailDetach?${params.toString()}`;
+  }
+
+  updateCopyLinkButtonState() {
+    const hasUrl = Boolean(this.getCurrentLanhuUrl());
+    if (this.reparseDesignBtn) {
+      this.reparseDesignBtn.disabled = !hasUrl;
+    }
+    if (this.copyLinkBtn) {
+      this.copyLinkBtn.disabled = !hasUrl;
+    }
+  }
+
+  getSelectedDesignLink() {
+    if (!this.selectedDesignId || !Array.isArray(this.designs)) return '';
+    const design = this.designs.find((item) => item.id === this.selectedDesignId);
+    return this.getDesignLink(design);
+  }
+
+  updateSelectedDesignCopyButtonState() {
+    if (!this.copyDesignLinkBtn) return;
+    this.copyDesignLinkBtn.disabled = !this.getSelectedDesignLink();
+  }
+
+  handleGeneratedFrameworkChange() {
+    const nextFramework = this.getSelectedGeneratedFramework();
+    const previousFramework = this.normalizeGeneratedFrameworkValue(this.selectedGeneratedFramework || 'html');
+    this.selectedGeneratedFramework = nextFramework;
+    this.saveGeneratedFrameworkPreference();
+    this.syncGeneratedFrameworkSelect();
+
+    const design = this.getSelectedDesign();
+    const frameworkChanged = previousFramework !== nextFramework;
+    if (!frameworkChanged) {
+      this.updateGenerateHtmlButtonState();
+      this.updateGeneratedCodeMeta();
+      return;
+    }
+
+    const activeFramework = this.normalizeGeneratedFrameworkValue(this.generatedCodeFramework || previousFramework);
+    const shouldResetCurrentWorkspace = activeFramework !== nextFramework && (
+      Boolean(this.generatedCodeJobId) ||
+      this.isGeneratingHtmlPreview ||
+      Boolean(this.generatedHtmlDesignId) ||
+      (Array.isArray(this.generatedCodeFiles) && this.generatedCodeFiles.length > 0) ||
+      String(this.generatedCodeTask?.status || 'idle').trim() !== 'idle'
+    );
+
+    if (shouldResetCurrentWorkspace) {
+      this.resetGeneratedCodeWorkspace(nextFramework);
+    }
+
+    if (design) {
+      const restoredGeneratedCode = this.restoreGeneratedCodeCache(design, {
+        autoShow: false,
+        framework: nextFramework
+      });
+      if (!restoredGeneratedCode) {
+        this.restoreGeneratedCodeJob(design, {
+          autoShow: false,
+          silent: true,
+          framework: nextFramework
+        });
+      }
+    }
+
+    this.updateGenerateHtmlButtonState();
+    this.updateGeneratedCodeMeta();
+  }
+
+  updateGenerateHtmlButtonState() {
+    if (!this.generateHtmlBtn) return;
+
+    const design = this.getSelectedDesign();
+    const codeStatus = this.getDesignCodeStatus(design);
+    const targetFramework = this.getSelectedGeneratedFramework();
+    const frameworkLabel = this.getGeneratedFrameworkLabel(targetFramework);
+    const resumableJob = design ? this.getGeneratedCodeJobCache(design, targetFramework) : null;
+    const hasCachedCode = Boolean(design) && (
+      this.hasGeneratedCodeForCurrentDesign() ||
+      Boolean(this.getGeneratedCodeCache(design, targetFramework))
+    );
+    const hasPendingJob = Boolean(
+      resumableJob &&
+      resumableJob.task?.status !== 'error' &&
+      !hasCachedCode
+    );
+    const hasFailedJob = Boolean(
+      resumableJob &&
+      resumableJob.task?.status === 'error' &&
+      !hasCachedCode
+    );
+
+    this.generateHtmlBtn.disabled = this.isGeneratingHtmlPreview || !design;
+    this.generateHtmlBtn.classList.toggle('suspect-unavailable', Boolean(design) && codeStatus.code === 'unavailable');
+
+    if (!design) {
+      this.generateHtmlBtn.title = `读取蓝湖 ${frameworkLabel} 代码`;
+      return;
+    }
+
+    if (hasCachedCode) {
+      this.generateHtmlBtn.title = `当前设计图已有 ${frameworkLabel} 缓存代码，点击直接展开`;
+      return;
+    }
+
+    if (hasPendingJob) {
+      this.generateHtmlBtn.title = this.isGeneratingHtmlPreview
+        ? `当前设计图 ${frameworkLabel} 代码生成中，正在同步最新进度`
+        : `当前设计图有进行中的 ${frameworkLabel} 代码任务，切回后会自动恢复进度`;
+      return;
+    }
+
+    if (hasFailedJob) {
+      this.generateHtmlBtn.title = `当前设计图保留了上次 ${frameworkLabel} 失败信息，可重新读取`;
+      return;
+    }
+
+    if (codeStatus.code === 'available') {
+      this.generateHtmlBtn.title = `读取蓝湖 ${frameworkLabel} 代码（当前设计图已有代码数据）`;
+      return;
+    }
+
+    if (codeStatus.code === 'unavailable') {
+      this.generateHtmlBtn.title = `当前设计图标记为无代码，点击后会对 ${frameworkLabel} 做一次最终校验`;
+      return;
+    }
+
+    this.generateHtmlBtn.title = `${frameworkLabel} 代码状态待校验，点击后开始读取`;
   }
 
   postMessageToParent(type, payload = {}) {
@@ -156,6 +725,207 @@ class LanhuViewer {
     } catch (e) {}
   }
 
+  loadGeneratedFrameworkPreference() {
+    try {
+      const storedValue = localStorage.getItem('lanhuGeneratedFramework');
+      return this.normalizeGeneratedFrameworkValue(storedValue);
+    } catch (e) {
+      return 'html';
+    }
+  }
+
+  saveGeneratedFrameworkPreference() {
+    try {
+      localStorage.setItem('lanhuGeneratedFramework', this.getSelectedGeneratedFramework());
+    } catch (e) {}
+  }
+
+  getSelectedGeneratedFramework() {
+    return this.normalizeGeneratedFrameworkValue(
+      this.generatedFrameworkSelect?.value ||
+      this.selectedGeneratedFramework ||
+      'html'
+    );
+  }
+
+  getGeneratedFrameworkLabel(framework = this.getSelectedGeneratedFramework()) {
+    const normalizedValue = this.normalizeGeneratedFrameworkValue(framework);
+    return GENERATED_FRAMEWORK_LABELS[normalizedValue] || GENERATED_FRAMEWORK_LABELS.html;
+  }
+
+  normalizeGeneratedFrameworkValue(framework = 'html') {
+    const rawValue = String(framework || 'html').trim();
+    const lowerCasedValue = rawValue.toLowerCase();
+    const aliasValue = GENERATED_FRAMEWORK_ALIASES[rawValue] || GENERATED_FRAMEWORK_ALIASES[lowerCasedValue];
+    const normalizedValue = aliasValue || lowerCasedValue || 'html';
+    return GENERATED_FRAMEWORK_LABELS[normalizedValue] ? normalizedValue : 'html';
+  }
+
+  syncGeneratedFrameworkSelect() {
+    if (!this.generatedFrameworkSelect) return;
+    const framework = this.getSelectedGeneratedFramework();
+    if (this.generatedFrameworkSelect.value !== framework) {
+      this.generatedFrameworkSelect.value = framework;
+    }
+    this.generatedFrameworkSelect.title = `当前代码框架: ${this.getGeneratedFrameworkLabel(framework)}`;
+  }
+
+  loadGeneratedCodeCache() {
+    try {
+      const data = localStorage.getItem('lanhuGeneratedCodeCache');
+      if (!data) return {};
+
+      const parsed = JSON.parse(data);
+      const cache = parsed && typeof parsed === 'object' ? parsed : {};
+      const { cache: nextCache, changed } = this.pruneGeneratedCodeCacheEntries(cache);
+
+      if (changed) {
+        localStorage.setItem('lanhuGeneratedCodeCache', JSON.stringify(nextCache));
+      }
+
+      return nextCache;
+    } catch (e) {
+      return {};
+    }
+  }
+
+  loadGeneratedCodeJobCache() {
+    try {
+      const data = localStorage.getItem('lanhuGeneratedCodeJobCache');
+      if (!data) return {};
+
+      const parsed = JSON.parse(data);
+      const cache = parsed && typeof parsed === 'object' ? parsed : {};
+      const { cache: nextCache, changed } = this.pruneGeneratedCodeJobEntries(cache);
+
+      if (changed) {
+        localStorage.setItem('lanhuGeneratedCodeJobCache', JSON.stringify(nextCache));
+      }
+
+      return nextCache;
+    } catch (e) {
+      return {};
+    }
+  }
+
+  pruneGeneratedCodeCacheEntries(cache = this.generatedCodeCache) {
+    const nextCache = cache && typeof cache === 'object' ? { ...cache } : {};
+    const now = Date.now();
+    let changed = false;
+
+    Object.keys(nextCache).forEach((key) => {
+      const item = nextCache[key];
+      const payload = item?.data;
+      const files = Array.isArray(payload?.files) ? payload.files : [];
+
+      if (
+        !item ||
+        item.expire < now ||
+        !payload ||
+        typeof payload.previewHtml !== 'string' ||
+        !files.length
+      ) {
+        delete nextCache[key];
+        changed = true;
+      }
+    });
+
+    const maxEntries = 12;
+    const keysByRecency = Object.keys(nextCache).sort(
+      (a, b) => Number(nextCache[b]?.updatedAt || 0) - Number(nextCache[a]?.updatedAt || 0)
+    );
+
+    keysByRecency.slice(maxEntries).forEach((key) => {
+      delete nextCache[key];
+      changed = true;
+    });
+
+    return { cache: nextCache, changed };
+  }
+
+  pruneGeneratedCodeJobEntries(cache = this.generatedCodeJobCache) {
+    const nextCache = cache && typeof cache === 'object' ? { ...cache } : {};
+    const now = Date.now();
+    let changed = false;
+
+    Object.keys(nextCache).forEach((key) => {
+      const item = nextCache[key];
+      const task = item?.task;
+      const logs = Array.isArray(task?.logs) ? task.logs : [];
+
+      if (
+        !item ||
+        item.expire < now ||
+        !item.jobId ||
+        !task ||
+        typeof task !== 'object' ||
+        !String(task.status || '').trim() ||
+        !Array.isArray(logs)
+      ) {
+        delete nextCache[key];
+        changed = true;
+      }
+    });
+
+    const maxEntries = 18;
+    const keysByRecency = Object.keys(nextCache).sort(
+      (a, b) => Number(nextCache[b]?.updatedAt || 0) - Number(nextCache[a]?.updatedAt || 0)
+    );
+
+    keysByRecency.slice(maxEntries).forEach((key) => {
+      delete nextCache[key];
+      changed = true;
+    });
+
+    return { cache: nextCache, changed };
+  }
+
+  saveGeneratedCodeCache() {
+    try {
+      const { cache } = this.pruneGeneratedCodeCacheEntries(this.generatedCodeCache);
+      this.generatedCodeCache = cache;
+      localStorage.setItem('lanhuGeneratedCodeCache', JSON.stringify(this.generatedCodeCache));
+      return true;
+    } catch (e) {
+      const keysByAge = Object.keys(this.generatedCodeCache).sort(
+        (a, b) => Number(this.generatedCodeCache[a]?.updatedAt || 0) - Number(this.generatedCodeCache[b]?.updatedAt || 0)
+      );
+
+      while (keysByAge.length > 0) {
+        delete this.generatedCodeCache[keysByAge.shift()];
+        try {
+          localStorage.setItem('lanhuGeneratedCodeCache', JSON.stringify(this.generatedCodeCache));
+          return true;
+        } catch (saveError) {}
+      }
+
+      return false;
+    }
+  }
+
+  saveGeneratedCodeJobCache() {
+    try {
+      const { cache } = this.pruneGeneratedCodeJobEntries(this.generatedCodeJobCache);
+      this.generatedCodeJobCache = cache;
+      localStorage.setItem('lanhuGeneratedCodeJobCache', JSON.stringify(this.generatedCodeJobCache));
+      return true;
+    } catch (e) {
+      const keysByAge = Object.keys(this.generatedCodeJobCache).sort(
+        (a, b) => Number(this.generatedCodeJobCache[a]?.updatedAt || 0) - Number(this.generatedCodeJobCache[b]?.updatedAt || 0)
+      );
+
+      while (keysByAge.length > 0) {
+        delete this.generatedCodeJobCache[keysByAge.shift()];
+        try {
+          localStorage.setItem('lanhuGeneratedCodeJobCache', JSON.stringify(this.generatedCodeJobCache));
+          return true;
+        } catch (saveError) {}
+      }
+
+      return false;
+    }
+  }
+
   // 获取缓存
   getCache(url) {
     const item = this.cache[url];
@@ -189,17 +959,310 @@ class LanhuViewer {
     this.setCache(key, data);
   }
 
+  resolveDesignEntity(designOrId = null) {
+    if (designOrId && typeof designOrId === 'object') {
+      return designOrId;
+    }
+
+    const designId = String(designOrId || this.selectedDesignId || '').trim();
+    if (!designId || !Array.isArray(this.designs)) return null;
+
+    return this.designs.find((item) => item.id === designId) || null;
+  }
+
+  getGeneratedCodeCacheVersion(design = null) {
+    const resolvedDesign = this.resolveDesignEntity(design);
+    return String(resolvedDesign?.latestVersion || resolvedDesign?.updateTime || '').trim() || 'noversion';
+  }
+
+  getGeneratedCodeCacheKey(design = null, framework = 'html') {
+    const resolvedDesign = this.resolveDesignEntity(design);
+    const designId = String(resolvedDesign?.id || '').trim();
+    const teamId = String(this.currentTeamId || '').trim();
+    const projectId = String(this.currentProjectId || '').trim();
+    const targetFramework = this.normalizeGeneratedFrameworkValue(framework);
+    const latestVersion = this.getGeneratedCodeCacheVersion(resolvedDesign);
+
+    if (!designId || !teamId || !projectId) return '';
+
+    return [teamId, projectId, designId, latestVersion, targetFramework].join(':');
+  }
+
+  getGeneratedCodeCache(design = null, framework = 'html') {
+    const cacheKey = this.getGeneratedCodeCacheKey(design, framework);
+    if (!cacheKey) return null;
+
+    const item = this.generatedCodeCache[cacheKey];
+    if (!item) return null;
+
+    if (item.expire < Date.now()) {
+      delete this.generatedCodeCache[cacheKey];
+      this.saveGeneratedCodeCache();
+      return null;
+    }
+
+    const payload = item.data;
+    if (
+      !payload ||
+      typeof payload.previewHtml !== 'string' ||
+      !Array.isArray(payload.files) ||
+      payload.files.length === 0
+    ) {
+      delete this.generatedCodeCache[cacheKey];
+      this.saveGeneratedCodeCache();
+      return null;
+    }
+
+    return payload;
+  }
+
+  normalizeGeneratedCodeTaskState(task = null) {
+    const baseTask = this.createInitialGeneratedCodeTaskState();
+    const logs = Array.isArray(task?.logs)
+      ? task.logs
+        .filter((log) => log && log.message)
+        .slice(-12)
+        .map((log) => ({
+          time: String(log.time || '').trim() || new Date().toLocaleTimeString(),
+          message: this.sanitizeGeneratedCodeStatusMessage(log.message || ''),
+          type: String(log.type || 'info').trim() || 'info'
+        }))
+      : [];
+
+    return {
+      ...baseTask,
+      ...task,
+      id: String(task?.id || baseTask.id || '').trim(),
+      status: String(task?.status || baseTask.status || 'idle').trim() || 'idle',
+      stepKey: String(task?.stepKey || baseTask.stepKey || 'idle').trim() || 'idle',
+      stepLabel: String(task?.stepLabel || baseTask.stepLabel || '等待开始').trim() || '等待开始',
+      currentStep: Math.max(0, Number(task?.currentStep) || 0),
+      totalSteps: Math.max(1, Number(task?.totalSteps) || baseTask.totalSteps || 6),
+      progressPercent: Math.max(0, Math.min(100, Number(task?.progressPercent) || 0)),
+      currentAction: this.sanitizeGeneratedCodeStatusMessage(task?.currentAction || '') || baseTask.currentAction,
+      errorMessage: this.sanitizeGeneratedCodeStatusMessage(task?.errorMessage || '', { trimPrefix: true }),
+      createdAt: Number(task?.createdAt) || Date.now(),
+      updatedAt: Number(task?.updatedAt) || Date.now(),
+      logs
+    };
+  }
+
+  createGeneratedCodeTaskLog(message, type = 'info') {
+    return {
+      time: new Date().toLocaleTimeString(),
+      message: this.sanitizeGeneratedCodeStatusMessage(message || ''),
+      type: String(type || 'info').trim() || 'info'
+    };
+  }
+
+  appendGeneratedCodeTaskLog(task = null, message = '', type = 'info') {
+    const entry = this.createGeneratedCodeTaskLog(message, type);
+    if (!entry.message) {
+      return this.normalizeGeneratedCodeTaskState(task);
+    }
+
+    const currentTask = this.normalizeGeneratedCodeTaskState(task);
+    return this.normalizeGeneratedCodeTaskState({
+      ...currentTask,
+      updatedAt: Date.now(),
+      logs: [...currentTask.logs, entry].slice(-12)
+    });
+  }
+
+  createGeneratedCodeJobCacheEntry(job = null, design = null, framework = 'html') {
+    const resolvedDesign = this.resolveDesignEntity(design);
+    const normalizedTask = this.normalizeGeneratedCodeTaskState(job);
+    const status = normalizedTask.status || 'queued';
+    const now = Date.now();
+    const ttlMs = status === 'error'
+      ? 6 * 60 * 60 * 1000
+      : 45 * 60 * 1000;
+
+    return {
+      jobId: String(job?.id || normalizedTask.id || '').trim(),
+      designId: String(resolvedDesign?.id || this.selectedDesignId || '').trim(),
+      latestVersion: this.getGeneratedCodeCacheVersion(resolvedDesign),
+      framework: this.normalizeGeneratedFrameworkValue(framework || job?.framework || 'html'),
+      status,
+      task: normalizedTask,
+      expire: now + ttlMs,
+      updatedAt: Number(normalizedTask.updatedAt) || now
+    };
+  }
+
+  getGeneratedCodeJobCache(design = null, framework = 'html') {
+    const cacheKey = this.getGeneratedCodeCacheKey(design, framework);
+    if (!cacheKey) return null;
+
+    const item = this.generatedCodeJobCache[cacheKey];
+    if (!item) return null;
+
+    if (item.expire < Date.now()) {
+      delete this.generatedCodeJobCache[cacheKey];
+      this.saveGeneratedCodeJobCache();
+      return null;
+    }
+
+    if (!item.jobId || !item.task) {
+      delete this.generatedCodeJobCache[cacheKey];
+      this.saveGeneratedCodeJobCache();
+      return null;
+    }
+
+    return {
+      ...item,
+      task: this.normalizeGeneratedCodeTaskState(item.task)
+    };
+  }
+
+  setGeneratedCodeJobCache(job = null, design = null, framework = 'html') {
+    const resolvedDesign = this.resolveDesignEntity(design);
+    const cacheKey = this.getGeneratedCodeCacheKey(resolvedDesign, framework);
+    const entry = this.createGeneratedCodeJobCacheEntry(job, resolvedDesign, framework);
+
+    if (!cacheKey || !entry.jobId || !entry.designId) {
+      return false;
+    }
+
+    this.generatedCodeJobCache[cacheKey] = entry;
+    return this.saveGeneratedCodeJobCache();
+  }
+
+  clearGeneratedCodeJobCacheEntry(design = null, framework = 'html') {
+    const cacheKey = this.getGeneratedCodeCacheKey(design, framework);
+    if (!cacheKey || !this.generatedCodeJobCache[cacheKey]) {
+      return false;
+    }
+
+    delete this.generatedCodeJobCache[cacheKey];
+    return this.saveGeneratedCodeJobCache();
+  }
+
+  prepareGeneratedCodeTaskWorkspace(task = null, { showCodePanel = true, autoShow = true } = {}) {
+    this.generatedHtmlCode = '';
+    this.generatedHtmlDesignId = null;
+    this.generatedPreviewHtml = '';
+    this.generatedCodeFiles = [];
+    this.generatedCodeFileName = '';
+    this.generatedCodeTask = this.normalizeGeneratedCodeTaskState(task);
+    this.generatedPreviewDiagnostics = this.createInitialGeneratedPreviewDiagnostics();
+    this.generatedPreviewRepairState = this.createInitialGeneratedPreviewRepairState();
+
+    if (autoShow) {
+      this.showGeneratedCodePanel({ showCodePanel });
+    }
+
+    if (this.generatedPreviewSite) {
+      this.generatedPreviewSite.hidden = true;
+    }
+    if (this.htmlPreviewFrame) {
+      this.htmlPreviewFrame.srcdoc = '';
+    }
+
+    this.renderGeneratedCodeTask();
+    this.refreshGeneratedCodeOutput();
+    this.updateGenerateHtmlButtonState();
+  }
+
+  resetGeneratedCodeWorkspace(framework = this.getSelectedGeneratedFramework()) {
+    this.cancelGeneratedCodeTracking(false);
+    this.generatedCodeFramework = this.normalizeGeneratedFrameworkValue(framework);
+    this.prepareGeneratedCodeTaskWorkspace(this.createInitialGeneratedCodeTaskState(), {
+      showCodePanel: false,
+      autoShow: false
+    });
+    this.hideHtmlPreview(false);
+  }
+
+  buildGeneratedCodeCachePayload(design = null) {
+    const resolvedDesign = this.resolveDesignEntity(design);
+    const files = Array.isArray(this.generatedCodeFiles)
+      ? this.generatedCodeFiles
+        .filter((file) => file && file.name && typeof file.content === 'string')
+        .map((file) => ({
+          name: file.name,
+          content: file.content,
+          isPrimary: Boolean(file.isPrimary)
+        }))
+      : [];
+
+    return {
+      designId: String(resolvedDesign?.id || this.selectedDesignId || '').trim(),
+      latestVersion: this.getGeneratedCodeCacheVersion(resolvedDesign),
+      framework: this.normalizeGeneratedFrameworkValue(this.generatedCodeFramework || 'html'),
+      previewHtml: String(this.generatedPreviewHtml || ''),
+      files,
+      selectedFileName: String(this.generatedCodeFileName || '').trim(),
+      cachedAt: Date.now()
+    };
+  }
+
+  setGeneratedCodeCache(design = null) {
+    const resolvedDesign = this.resolveDesignEntity(design);
+    const cacheKey = this.getGeneratedCodeCacheKey(resolvedDesign, this.generatedCodeFramework || 'html');
+    const payload = this.buildGeneratedCodeCachePayload(resolvedDesign);
+
+    if (!cacheKey || !payload.designId || !payload.files.length) {
+      return false;
+    }
+
+    this.generatedCodeCache[cacheKey] = {
+      data: payload,
+      expire: Date.now() + 2 * 24 * 60 * 60 * 1000,
+      updatedAt: payload.cachedAt
+    };
+
+    return this.saveGeneratedCodeCache();
+  }
+
+  createGeneratedCodeCachedTaskState(cachePayload = {}) {
+    const cachedAt = Number(cachePayload.cachedAt) || Date.now();
+    const timeText = new Date(cachedAt).toLocaleTimeString();
+    const versionText = String(cachePayload.latestVersion || '').trim();
+    const frameworkLabel = this.getGeneratedFrameworkLabel(cachePayload.framework);
+    const logs = [
+      {
+        time: timeText,
+        message: versionText ? `设计图版本: ${versionText}` : '已命中本地缓存',
+        type: 'success'
+      },
+      {
+        time: timeText,
+        message: `已从本地缓存恢复 ${frameworkLabel} 代码`,
+        type: 'info'
+      }
+    ];
+
+    return {
+      ...this.createInitialGeneratedCodeTaskState(),
+      status: 'success',
+      stepKey: 'cached',
+      stepLabel: '本地缓存',
+      currentStep: 6,
+      totalSteps: 6,
+      progressPercent: 100,
+      currentAction: `已从本地缓存恢复 ${frameworkLabel} 代码`,
+      logs,
+      createdAt: cachedAt,
+      updatedAt: Date.now()
+    };
+  }
+
   // 清空缓存
   clearCache() {
     const currentUrl = this.urlInput?.value?.trim() || '';
     const currentDesignId = this.selectedDesignId || this.pendingDesignId || null;
 
     this.cache = {};
+    this.generatedCodeCache = {};
+    this.generatedCodeJobCache = {};
     this.layerCache = new Map();
     this.layers = [];
     this.canvasInfo = null;
     this.currentLayerDesignId = null;
     this.saveCache();
+    this.saveGeneratedCodeCache();
+    this.saveGeneratedCodeJobCache();
     this.saveLayerCache();
 
     if (this.isLayerMode) {
@@ -243,7 +1306,9 @@ class LanhuViewer {
         selectedDesignId: this.selectedDesignId || null,
         timestamp: Date.now()
       };
+      this.currentPageState = state;
       localStorage.setItem('lanhuPageState', JSON.stringify(state));
+      this.updateCopyLinkButtonState();
     } catch (e) {}
   }
 
@@ -293,6 +1358,8 @@ class LanhuViewer {
   // 清除页面状态
   clearPageState() {
     localStorage.removeItem('lanhuPageState');
+    this.currentPageState = null;
+    this.updateCopyLinkButtonState();
   }
 
   // 恢复页面状态
@@ -368,22 +1435,48 @@ class LanhuViewer {
     }
   }
 
+  reparseCurrentProject() {
+    const url = this.getCurrentLanhuUrl();
+    if (!url) {
+      this.showToast('当前没有可重新解析的蓝湖链接', 'error');
+      this.updateCopyLinkButtonState();
+      return;
+    }
+
+    this.urlInput.value = url;
+    this.parseBtn.disabled = false;
+    this.updateCopyLinkButtonState();
+    this.forceRefresh();
+  }
+
   // 渲染历史记录
   renderHistory() {
     const historyList = document.getElementById('historyList');
     if (!historyList) return;
 
     if (this.history.length === 0) {
-      historyList.innerHTML = '<div class="history-empty">暂无记录</div>';
+      historyList.innerHTML = '<div class="history-empty">暂无最近访问，粘贴蓝湖链接开始浏览</div>';
       return;
     }
 
-    historyList.innerHTML = this.history.map(item => `
-      <div class="history-item" data-url="${item.url}" title="${item.url}">
-        <span class="history-name">${item.projectName}</span>
-        <span class="history-time">${this.formatHistoryTime(item.time)}</span>
-      </div>
-    `).join('');
+    historyList.innerHTML = this.history.map(item => {
+      const projectName = this.decodeHtmlEntities(item.projectName || '未命名项目');
+      const safeProjectName = this.escapeHtml(projectName);
+      const safeUrl = this.escapeAttr(item.url || '');
+      const safeUrlText = this.escapeHtml(this.formatHistoryUrl(item.url || ''));
+      const safeTime = this.escapeHtml(this.formatHistoryTime(item.time));
+      const safeTitle = this.escapeAttr(`${projectName}\n${item.url || ''}`);
+
+      return `
+        <div class="history-item" data-url="${safeUrl}" title="${safeTitle}">
+          <div class="history-main">
+            <span class="history-name">${safeProjectName}</span>
+            <span class="history-url">${safeUrlText}</span>
+          </div>
+          <span class="history-time">${safeTime}</span>
+        </div>
+      `;
+    }).join('');
 
     // 绑定点击事件
     historyList.querySelectorAll('.history-item').forEach(el => {
@@ -407,6 +1500,103 @@ class LanhuViewer {
     return date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
   }
 
+  formatHistoryUrl(rawUrl) {
+    if (!rawUrl) return '未记录链接';
+
+    try {
+      const parsed = new URL(rawUrl);
+      const path = parsed.pathname.replace(/\/+$/, '') || '/';
+      const shortPath = path.length > 24 ? `...${path.slice(-24)}` : path;
+      const key =
+        parsed.searchParams.get('fid') ||
+        parsed.searchParams.get('pid') ||
+        parsed.searchParams.get('id') ||
+        '';
+      return key
+        ? `${parsed.hostname}${shortPath} · ${String(key).slice(0, 8)}`
+        : `${parsed.hostname}${shortPath}`;
+    } catch (e) {
+      return rawUrl.replace(/^https?:\/\//, '').slice(0, 42);
+    }
+  }
+
+  getDesignViewportTag(design = {}) {
+    const width = Number(design.width) || 0;
+    const height = Number(design.height) || 0;
+
+    if (!width || !height) return '画布';
+    if (Math.max(width, height) >= 1920) return '超宽屏';
+    if (Math.max(width, height) >= 1440) return '桌面端';
+    if (Math.max(width, height) <= 480) return '移动端';
+    if (width > height * 1.45) return 'Web';
+    if (height > width * 1.3) return '长页面';
+    return '标准帧';
+  }
+
+  normalizeDesignCodeStatusValue(design = {}) {
+    const rawValue = design?.ddsJumpStatus ?? design?.dds_jump_status ?? null;
+    if (rawValue === null || rawValue === undefined || rawValue === '') {
+      return null;
+    }
+
+    const normalizedValue = Number(rawValue);
+    return Number.isFinite(normalizedValue) ? normalizedValue : null;
+  }
+
+  getDesignCodeStatus(design = {}) {
+    const statusValue = this.normalizeDesignCodeStatusValue(design);
+
+    if (statusValue === 1) {
+      return {
+        code: 'available',
+        label: '有代码',
+        title: '蓝湖代码数据可用'
+      };
+    }
+
+    if (statusValue === 4) {
+      return {
+        code: 'unavailable',
+        label: '无代码',
+        title: '蓝湖当前没有可用代码数据'
+      };
+    }
+
+    return {
+      code: 'unknown',
+      label: '待校验',
+      title: '蓝湖代码状态待校验'
+    };
+  }
+
+  getDesignRatio(width, height) {
+    const w = Number(width) || 0;
+    const h = Number(height) || 0;
+    if (!w || !h) return '';
+
+    const gcd = (a, b) => (b ? gcd(b, a % b) : a);
+    const d = gcd(w, h);
+    const rw = Math.round(w / d);
+    const rh = Math.round(h / d);
+    if (!rw || !rh) return '';
+    return `${rw}:${rh}`;
+  }
+
+  getSliceLabel(slice = {}) {
+    const format = String(slice.defaultFormat || '').toUpperCase();
+    if (format === 'SVG') return '矢量';
+    if (format === 'PNG' || format === 'JPG' || format === 'JPEG' || format === 'WEBP') return '位图';
+    return '资源';
+  }
+
+  loadSessionId() {
+    try {
+      return localStorage.getItem('sessionId') || this.defaultSessionId;
+    } catch (e) {
+      return this.defaultSessionId;
+    }
+  }
+
   generateSessionId() {
     const id = 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
     localStorage.setItem('sessionId', id);
@@ -423,19 +1613,7 @@ class LanhuViewer {
 
   renderLogs() {
     const logPanel = document.getElementById('logPanel');
-    const logContent = document.getElementById('logContent');
-    const logCount = document.getElementById('logCount');
-
-    if (this.logs.length > 0) {
-      logPanel.style.display = 'block';
-      logCount.textContent = this.logs.length;
-      logContent.innerHTML = this.logs.map(log =>
-        `<div class="log-item ${log.type}">
-          <span class="log-time">${log.time}</span>${log.message}
-        </div>`
-      ).join('');
-      logContent.scrollTop = logContent.scrollHeight;
-    } else {
+    if (logPanel) {
       logPanel.style.display = 'none';
     }
   }
@@ -498,8 +1676,13 @@ class LanhuViewer {
     this.saveNoteBtn = document.getElementById('saveNoteBtn');
 
     // 输入区
+    this.inputSection = document.getElementById('inputSection');
     this.urlInput = document.getElementById('urlInput');
     this.parseBtn = document.getElementById('parseBtn');
+    this.reparseDesignBtn = document.getElementById('reparseDesignBtn');
+    this.copyLinkBtn = document.getElementById('copyLinkBtn');
+    this.syncInputSectionVisibility();
+    this.updateCopyLinkButtonState();
 
     // 左侧栏
     this.emptyState = document.getElementById('emptyState');
@@ -519,19 +1702,48 @@ class LanhuViewer {
     this.previewSection = document.getElementById('previewSection');
     this.previewName = document.getElementById('previewName');
     this.previewSize = document.getElementById('previewSize');
+    this.copyDesignLinkBtn = document.getElementById('copyDesignLinkBtn');
     this.previewImage = document.getElementById('previewImage');
     this.hotspotModeBtn = document.getElementById('hotspotModeBtn');
     this.noteModeBtn = document.getElementById('noteModeBtn');
     this.layerModeBtn = document.getElementById('layerModeBtn');
     this.annotatePreviewBtn = document.getElementById('annotatePreviewBtn');
+    this.generatedFrameworkSelect = document.getElementById('generatedFrameworkSelect');
     this.generateHtmlBtn = document.getElementById('generateHtmlBtn');
+    this.toggleCodePanelBtn = document.getElementById('toggleCodePanelBtn');
     this.previewBody = document.getElementById('previewBody');
+    this.designPreviewFrameLabel = document.getElementById('designPreviewFrameLabel');
+    this.generatedPreviewSite = document.getElementById('generatedPreviewSite');
+    this.htmlPreviewModal = document.getElementById('htmlPreviewModal');
+    this.htmlPreviewModalBackdrop = document.getElementById('htmlPreviewModalBackdrop');
     this.htmlPreviewPanel = document.getElementById('htmlPreviewPanel');
     this.htmlPreviewFrame = document.getElementById('htmlPreviewFrame');
     this.htmlCodeOutput = document.getElementById('htmlCodeOutput');
+    this.generatedCodeStatus = document.getElementById('generatedCodeStatus');
+    this.generatedCodeSummary = document.getElementById('generatedCodeSummary');
+    this.generatedPreviewFrameLabel = document.getElementById('generatedPreviewFrameLabel');
+    this.generatedCodeFileCount = document.getElementById('generatedCodeFileCount');
+    this.generatedCodeFileSelect = document.getElementById('generatedCodeFileSelect');
+    this.generatedCodeTaskCard = document.getElementById('generatedCodeTaskCard');
+    this.generatedCodeTaskStep = document.getElementById('generatedCodeTaskStep');
+    this.generatedCodeTaskMeta = document.getElementById('generatedCodeTaskMeta');
+    this.generatedCodeProgressText = document.getElementById('generatedCodeProgressText');
+    this.generatedCodeProgressBar = document.getElementById('generatedCodeProgressBar');
+    this.generatedCodeCurrentAction = document.getElementById('generatedCodeCurrentAction');
+    this.generatedCodePrimaryBtn = document.getElementById('generatedCodePrimaryBtn');
+    this.generatedCodeLogList = document.getElementById('generatedCodeLogList');
     this.openHtmlInNewTabBtn = document.getElementById('openHtmlInNewTabBtn');
+    this.runDiagnosticsBtn = document.getElementById('runDiagnosticsBtn');
     this.copyHtmlBtn = document.getElementById('copyHtmlBtn');
     this.closeHtmlPreviewBtn = document.getElementById('closeHtmlPreviewBtn');
+    this.generatedDiagnosticsCard = document.getElementById('generatedDiagnosticsCard');
+    this.generatedDiagnosticsMeta = document.getElementById('generatedDiagnosticsMeta');
+    this.generatedDiagnosticsStatus = document.getElementById('generatedDiagnosticsStatus');
+    this.generatedDiagnosticsSummary = document.getElementById('generatedDiagnosticsSummary');
+    this.generatedDiagnosticsList = document.getElementById('generatedDiagnosticsList');
+    this.ensureGeneratedPreviewViewport();
+
+    this.syncGeneratedFrameworkSelect();
 
     // 右侧栏
     this.sidebarRight = document.getElementById('sidebarRight');
@@ -551,11 +1763,29 @@ class LanhuViewer {
     this.minZoom = 0.1;
     this.maxZoom = 5;
     this.zoomStep = 0.1;
+    this.wheelZoomIntensity = 0.0022;
     this.panX = 0;
     this.panY = 0;
     this.isDragging = false;
+    this.isWheelPanning = false;
     this.dragStartX = 0;
     this.dragStartY = 0;
+    this.isPinching = false;
+    this.pinchStartDistance = 0;
+    this.pinchStartZoom = 1;
+    this.pinchStartPanX = 0;
+    this.pinchStartPanY = 0;
+    this.pinchStartCenterX = 0;
+    this.pinchStartCenterY = 0;
+    this.pinchAnchorPoint = null;
+    this.pinchBaseCenterX = 0;
+    this.pinchBaseCenterY = 0;
+    this.pinchGestureMode = 'idle';
+    this.pinchPanThreshold = 6;
+    this.pinchZoomDistanceThreshold = 10;
+    this.pinchZoomRatioThreshold = 0.04;
+    this.trackpadWheelDeltaThreshold = 40;
+    this.wheelPanEndDelay = 120;
     this.previewContainer = document.getElementById('previewContainer');
 
     if (this.previewContainer) {
@@ -569,6 +1799,28 @@ class LanhuViewer {
       this.layerAnnotationLayer.style.display = 'none';
       this.previewContainer.appendChild(this.layerAnnotationLayer);
     }
+  }
+
+  initPanzoom() {
+    if (!this.previewImage || typeof window.Panzoom !== 'function') return;
+
+    this.panzoom = window.Panzoom(this.previewImage, {
+      noBind: true,
+      maxScale: this.maxZoom,
+      minScale: this.minZoom,
+      startScale: this.zoomLevel,
+      startX: this.panX,
+      startY: this.panY,
+      cursor: 'inherit',
+      touchAction: 'none'
+    });
+
+    this.previewImage.addEventListener('panzoomstart', () => this.handlePanzoomStart());
+    this.previewImage.addEventListener('panzoomchange', (event) => this.handlePanzoomChange(event));
+    this.previewImage.addEventListener('panzoomend', () => this.handlePanzoomEnd());
+
+    this.applyTransform();
+    this.syncPanzoomBinding();
   }
 
   initEvents() {
@@ -640,6 +1892,11 @@ class LanhuViewer {
         this.closeNoteModal();
       }
     });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && this.isCodePanelVisible) {
+        this.setCodePanelVisibility(false);
+      }
+    });
 
     // URL 输入
     this.urlInput.addEventListener('input', () => this.onUrlInput());
@@ -706,17 +1963,47 @@ class LanhuViewer {
     if (this.annotatePreviewBtn) {
       this.annotatePreviewBtn.addEventListener('click', () => this.toggleAnnotationPreview());
     }
+    if (this.generatedFrameworkSelect) {
+      this.generatedFrameworkSelect.addEventListener('change', () => this.handleGeneratedFrameworkChange());
+    }
     if (this.generateHtmlBtn) {
       this.generateHtmlBtn.addEventListener('click', () => this.generateHtmlPreview());
+    }
+    if (this.toggleCodePanelBtn) {
+      this.toggleCodePanelBtn.addEventListener('click', () => this.toggleCodePanel());
     }
     if (this.openHtmlInNewTabBtn) {
       this.openHtmlInNewTabBtn.addEventListener('click', () => this.openGeneratedHtmlInNewTab());
     }
+    if (this.runDiagnosticsBtn) {
+      this.runDiagnosticsBtn.addEventListener('click', () => this.runGeneratedPreviewDiagnostics());
+    }
     if (this.copyHtmlBtn) {
       this.copyHtmlBtn.addEventListener('click', () => this.copyGeneratedHtml());
     }
+    if (this.generatedCodePrimaryBtn) {
+      this.generatedCodePrimaryBtn.addEventListener('click', () => this.handleGeneratedCodePrimaryAction());
+    }
+    if (this.htmlPreviewFrame) {
+      this.htmlPreviewFrame.addEventListener('load', () => this.scheduleGeneratedPreviewRefitSequence());
+    }
+    if (this.generatedCodeFileSelect) {
+      this.generatedCodeFileSelect.addEventListener('change', () => this.handleGeneratedCodeFileChange());
+    }
+    if (this.copyLinkBtn) {
+      this.copyLinkBtn.addEventListener('click', () => this.copyCurrentLink());
+    }
+    if (this.reparseDesignBtn) {
+      this.reparseDesignBtn.addEventListener('click', () => this.reparseCurrentProject());
+    }
+    if (this.copyDesignLinkBtn) {
+      this.copyDesignLinkBtn.addEventListener('click', () => this.copySelectedDesignLink());
+    }
+    if (this.htmlPreviewModalBackdrop) {
+      this.htmlPreviewModalBackdrop.addEventListener('click', () => this.setCodePanelVisibility(false));
+    }
     if (this.closeHtmlPreviewBtn) {
-      this.closeHtmlPreviewBtn.addEventListener('click', () => this.hideHtmlPreview(false));
+      this.closeHtmlPreviewBtn.addEventListener('click', () => this.setCodePanelVisibility(false));
     }
 
     // 更新设计图按钮
@@ -727,25 +2014,51 @@ class LanhuViewer {
 
     if (this.previewImage) {
       this.previewImage.addEventListener('load', () => {
+        this.applyTransform();
+        this.ensurePreviewImageVisible({ save: true });
         this.scheduleHotspotRender();
         this.scheduleHotspotRender(140);
         this.scheduleHotspotRender(280);
+        this.queuePreviewImageRefresh(80);
       });
       this.previewImage.addEventListener('transitionend', () => this.scheduleHotspotRender());
+      this.previewImage.addEventListener('error', () => {
+        if (!this.currentPreviewOriginalUrl || this.isAnnotationPreview) return;
+        const fallbackUrl = this.getProxiedImageUrl(this.currentPreviewOriginalUrl);
+        if (this.previewImage.src === fallbackUrl) return;
+        this.currentPreviewSourceUrl = this.currentPreviewOriginalUrl;
+        this.currentPreviewRequestWidth = 0;
+        this.previewImage.src = fallbackUrl;
+      });
     }
 
     window.addEventListener('message', (event) => this.handleParentMessage(event));
-    window.addEventListener('resize', () => this.scheduleHotspotRender());
+    window.addEventListener('resize', () => {
+      this.scheduleHotspotRender();
+      this.queuePreviewImageRefresh(180);
+      this.queueGeneratedPreviewFit(120);
+    });
 
     if (this.previewContainer && 'ResizeObserver' in window) {
-      this.resizeObserver = new ResizeObserver(() => this.scheduleHotspotRender());
+      this.resizeObserver = new ResizeObserver(() => {
+        this.scheduleHotspotRender();
+        this.queuePreviewImageRefresh(180);
+        this.queueGeneratedPreviewFit(120);
+      });
       this.resizeObserver.observe(this.previewContainer);
       this.resizeObserver.observe(this.previewImage);
+      if (this.generatedPreviewFrameStage) {
+        this.resizeObserver.observe(this.generatedPreviewFrameStage);
+      }
     }
 
     // 鼠标滚轮缩放
     if (this.previewContainer) {
       this.previewContainer.addEventListener('wheel', (e) => this.handleWheel(e), { passive: false });
+      this.previewContainer.addEventListener('touchstart', (e) => this.handleTouchStart(e), { passive: false });
+      this.previewContainer.addEventListener('touchmove', (e) => this.handleTouchMove(e), { passive: false });
+      this.previewContainer.addEventListener('touchend', (e) => this.handleTouchEnd(e), { passive: false });
+      this.previewContainer.addEventListener('touchcancel', (e) => this.handleTouchCancel(e), { passive: false });
 
       // 拖动事件
       this.previewContainer.addEventListener('mousedown', (e) => {
@@ -757,6 +2070,7 @@ class LanhuViewer {
           this.startNoteDraw(e);
           return;
         }
+        if (this.panzoom) return;
         this.startDrag(e);
       });
       document.addEventListener('mousemove', (e) => {
@@ -768,6 +2082,7 @@ class LanhuViewer {
           this.updateNoteDraw(e);
           return;
         }
+        if (this.panzoom) return;
         this.doDrag(e);
       });
       document.addEventListener('mouseup', (e) => {
@@ -779,6 +2094,7 @@ class LanhuViewer {
           this.finishNoteDraw(e);
           return;
         }
+        if (this.panzoom) return;
         this.endDrag();
       });
     }
@@ -789,6 +2105,108 @@ class LanhuViewer {
     if (!originalUrl) return '';
     // 通过后端代理加载图片，在 URL 中携带 session-id（img 标签无法发送自定义 header）
     return `/api/image/preview?sessionId=${encodeURIComponent(this.sessionId)}&url=${encodeURIComponent(originalUrl)}`;
+  }
+
+  getSelectedDesign() {
+    if (!this.selectedDesignId || !Array.isArray(this.designs)) return null;
+    return this.designs.find((item) => item.id === this.selectedDesignId) || null;
+  }
+
+  isAdaptiveCoverPreviewUrl(url) {
+    const normalized = String(url || '').trim();
+    return /FigmaCover/i.test(normalized) && /(?:^https?:\/\/)?(?:assets|alipic)\.lanhuapp\.com/i.test(normalized);
+  }
+
+  getAdaptiveCoverBucket(targetWidth) {
+    const buckets = [375, 560, 778, 1000, 1280, 1500, 2000];
+    return buckets.find((bucket) => targetWidth <= bucket) || buckets[buckets.length - 1];
+  }
+
+  getDesiredPreviewRequestWidth(design = null) {
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    let visualWidth = 0;
+
+    if (this.previewImage) {
+      const rect = this.previewImage.getBoundingClientRect();
+      visualWidth = rect.width || 0;
+    }
+
+    if (visualWidth <= 1 && this.previewContainer) {
+      const containerRect = this.previewContainer.getBoundingClientRect();
+      const designWidth = Number(design?.width) || Number(this.previewImage?.naturalWidth) || 1;
+      const designHeight = Number(design?.height) || Number(this.previewImage?.naturalHeight) || 1;
+
+      if (containerRect.width > 0 && containerRect.height > 0 && designWidth > 0 && designHeight > 0) {
+        const fittedWidth = Math.min(containerRect.width, containerRect.height * (designWidth / designHeight));
+        visualWidth = fittedWidth * Math.max(1, this.zoomLevel || 1);
+      }
+    }
+
+    return Math.max(375, Math.round(visualWidth * dpr));
+  }
+
+  buildAdaptiveCoverPreviewUrl(originalUrl, requestWidth) {
+    if (!this.isAdaptiveCoverPreviewUrl(originalUrl)) return String(originalUrl || '');
+
+    try {
+      const parsed = new URL(String(originalUrl).trim());
+      parsed.hostname = 'assets.lanhuapp.com';
+      parsed.search = '';
+      parsed.searchParams.set(
+        'x-oss-process',
+        `image/quality,q_lossless/resize,w_${Math.max(375, Math.round(requestWidth || 0))}/format,webp`
+      );
+      return parsed.toString();
+    } catch (e) {
+      return String(originalUrl || '');
+    }
+  }
+
+  queuePreviewImageRefresh(delay = 160) {
+    clearTimeout(this.previewRefreshTimer);
+    this.previewRefreshTimer = setTimeout(() => {
+      this.previewRefreshTimer = null;
+      this.refreshPreviewImageForZoom();
+    }, delay);
+  }
+
+  refreshPreviewImageForZoom() {
+    if (this.isAnnotationPreview || !this.previewImage) return;
+
+    const design = this.getSelectedDesign();
+    const originalUrl = String(design?.url || '').trim();
+    if (!originalUrl || !this.isAdaptiveCoverPreviewUrl(originalUrl)) return;
+
+    const desiredWidth = this.getAdaptiveCoverBucket(this.getDesiredPreviewRequestWidth(design));
+    const loadedWidth = Math.max(
+      Number(this.previewImage.naturalWidth) || 0,
+      Number(this.currentPreviewRequestWidth) || 0
+    );
+
+    if (loadedWidth > 0 && desiredWidth <= loadedWidth + 24) return;
+    if (desiredWidth <= (Number(this.currentPreviewRequestWidth) || 0) + 24) return;
+
+    const nextUrl = this.buildAdaptiveCoverPreviewUrl(originalUrl, desiredWidth);
+    if (!nextUrl || nextUrl === this.currentPreviewSourceUrl) return;
+
+    this.currentPreviewOriginalUrl = originalUrl;
+    this.currentPreviewSourceUrl = nextUrl;
+    this.currentPreviewRequestWidth = desiredWidth;
+    this.previewImage.src = this.getProxiedImageUrl(nextUrl);
+  }
+
+  loadDesignPreviewImage(design, { resetAdaptiveState = false } = {}) {
+    const originalUrl = String(design?.url || '').trim();
+    if (!this.previewImage || !originalUrl) return;
+
+    if (resetAdaptiveState) {
+      this.currentPreviewRequestWidth = 0;
+    }
+
+    this.currentPreviewOriginalUrl = originalUrl;
+    this.currentPreviewSourceUrl = originalUrl;
+    this.previewImage.src = this.getProxiedImageUrl(originalUrl);
+    this.previewImage.alt = this.decodeHtmlEntities(design?.name) || '设计图预览';
   }
 
   // 检查会话状态
@@ -1060,6 +2478,7 @@ class LanhuViewer {
     if (this.previewContainer) {
       this.previewContainer.classList.toggle('mark-mode', this.isMarkMode || this.isNoteMode);
     }
+    this.syncPanzoomBinding();
   }
 
   clearDrawingDrafts() {
@@ -1088,18 +2507,491 @@ class LanhuViewer {
     return { imageRect, containerRect };
   }
 
+  getRectIntersection(rectA, rectB) {
+    if (!rectA || !rectB) {
+      return { width: 0, height: 0, area: 0 };
+    }
+
+    const width = Math.max(0, Math.min(rectA.right, rectB.right) - Math.max(rectA.left, rectB.left));
+    const height = Math.max(0, Math.min(rectA.bottom, rectB.bottom) - Math.max(rectA.top, rectB.top));
+    return {
+      width,
+      height,
+      area: width * height,
+    };
+  }
+
+  ensurePreviewImageVisible({ save = false } = {}) {
+    const viewport = this.getImageViewportRect();
+    if (!viewport) return false;
+
+    const { imageRect, containerRect } = viewport;
+    const intersection = this.getRectIntersection(imageRect, containerRect);
+    const isVisibleEnough =
+      intersection.width >= 24 &&
+      intersection.height >= 24 &&
+      intersection.area >= 1024;
+
+    if (isVisibleEnough) {
+      return false;
+    }
+
+    this.panX = 0;
+    this.panY = 0;
+    this.applyTransform();
+    this.updateZoomLevel();
+
+    if (save) {
+      this.saveCurrentDesignState();
+    }
+
+    return true;
+  }
+
+  getPointerClientPoint(event) {
+    if (event?.touches?.length) return event.touches[0];
+    if (event?.changedTouches?.length) return event.changedTouches[0];
+    return event || null;
+  }
+
+  isPrimaryPointerEvent(event) {
+    return typeof event?.button !== 'number' || event.button === 0;
+  }
+
   getNormalizedPointFromMouse(event) {
     const viewport = this.getImageViewportRect();
     if (!viewport) return null;
+    const point = this.getPointerClientPoint(event);
+    if (!point) return null;
     const { imageRect } = viewport;
     const clamp = (value) => Math.min(1, Math.max(0, value));
-    const x = clamp((event.clientX - imageRect.left) / imageRect.width);
-    const y = clamp((event.clientY - imageRect.top) / imageRect.height);
+    const x = clamp((point.clientX - imageRect.left) / imageRect.width);
+    const y = clamp((point.clientY - imageRect.top) / imageRect.height);
     return { x, y };
   }
 
+  getPreviewCenterPoint() {
+    if (!this.previewContainer) return { x: 0, y: 0 };
+    const rect = this.previewContainer.getBoundingClientRect();
+    return {
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+    };
+  }
+
+  getImageTransformMetrics(viewport = this.getImageViewportRect()) {
+    if (!viewport || !this.zoomLevel) return null;
+    const { imageRect } = viewport;
+    const centerX = imageRect.left + imageRect.width / 2;
+    const centerY = imageRect.top + imageRect.height / 2;
+    return {
+      centerX,
+      centerY,
+      baseCenterX: centerX - (this.panX || 0) * this.zoomLevel,
+      baseCenterY: centerY - (this.panY || 0) * this.zoomLevel,
+    };
+  }
+
+  getImageLocalPoint(clientX, clientY, viewport = this.getImageViewportRect()) {
+    const metrics = this.getImageTransformMetrics(viewport);
+    if (!metrics) return null;
+    return {
+      x: (clientX - metrics.centerX) / this.zoomLevel,
+      y: (clientY - metrics.centerY) / this.zoomLevel,
+    };
+  }
+
+  clampZoom(zoom) {
+    return Math.max(this.minZoom, Math.min(this.maxZoom, zoom));
+  }
+
+  isPreviewTransforming() {
+    return this.isDragging || this.isPinching || this.isWheelPanning || this.isPanzoomInteracting;
+  }
+
+  hidePreviewOverlays() {
+    if (this.layerAnnotationLayer) {
+      this.layerAnnotationLayer.style.display = 'none';
+    }
+    if (this.hotspotLayer) {
+      this.hotspotLayer.style.display = 'none';
+    }
+  }
+
+  restorePreviewOverlays() {
+    if (this.hotspotLayer) {
+      this.hotspotLayer.style.display = '';
+    }
+    if (this.layerAnnotationLayer) {
+      this.layerAnnotationLayer.style.display = this.isLayerMode ? 'block' : 'none';
+    }
+  }
+
+  setPreviewInteractionActive() {
+    const active = this.isPreviewTransforming();
+    if (this.previewContainer) {
+      this.previewContainer.classList.toggle('dragging', active);
+    }
+    if (active) {
+      this.hidePreviewOverlays();
+      return;
+    }
+    this.restorePreviewOverlays();
+  }
+
+  syncPanzoomState(detail = null) {
+    if (!this.panzoom) return;
+    const pan = this.panzoom.getPan();
+    this.zoomLevel = detail?.scale ?? this.panzoom.getScale();
+    this.panX = detail?.x ?? pan.x;
+    this.panY = detail?.y ?? pan.y;
+    this.updateZoomLevel();
+  }
+
+  handlePanzoomStart() {
+    if (!this.panzoom || !this.isPanzoomBound) return;
+    this.isPanzoomInteracting = true;
+    this.setPreviewInteractionActive();
+  }
+
+  handlePanzoomChange(event) {
+    if (!this.panzoom) return;
+    this.syncPanzoomState(event?.detail || null);
+    if (!this.isPreviewTransforming()) {
+      this.scheduleHotspotRender();
+      if (this.isLayerMode && this.layers.length > 0) {
+        this.scheduleLayerRender();
+      }
+    }
+  }
+
+  handlePanzoomEnd() {
+    if (!this.panzoom) return;
+    this.isPanzoomInteracting = false;
+    this.syncPanzoomState();
+    this.setPreviewInteractionActive();
+    this.saveCurrentDesignState();
+    this.scheduleHotspotRender();
+    this.queuePreviewImageRefresh(120);
+    if (this.isLayerMode && this.layers.length > 0) {
+      this.scheduleLayerRender();
+    }
+  }
+
+  syncPanzoomBinding() {
+    if (!this.panzoom) return;
+    const shouldBind = !this.isMarkMode && !this.isNoteMode;
+
+    if (shouldBind && !this.isPanzoomBound) {
+      this.panzoom.bind();
+      this.isPanzoomBound = true;
+      return;
+    }
+
+    if (!shouldBind && this.isPanzoomBound) {
+      this.panzoom.destroy();
+      this.isPanzoomBound = false;
+      this.isPanzoomInteracting = false;
+      this.setPreviewInteractionActive();
+    }
+  }
+
+  zoomToPoint(nextZoom, clientX, clientY) {
+    const clampedZoom = this.clampZoom(nextZoom);
+    if (clampedZoom === this.zoomLevel) return false;
+    const viewport = this.getImageViewportRect();
+    if (!viewport) return false;
+
+    const metrics = this.getImageTransformMetrics(viewport);
+    if (!metrics) return false;
+
+    const currentZoom = this.zoomLevel || 1;
+    const localX = (clientX - metrics.centerX) / currentZoom;
+    const localY = (clientY - metrics.centerY) / currentZoom;
+
+    this.zoomLevel = clampedZoom;
+    this.panX = (clientX - metrics.baseCenterX) / clampedZoom - localX;
+    this.panY = (clientY - metrics.baseCenterY) / clampedZoom - localY;
+    this.applyTransform();
+    this.updateZoomLevel();
+    this.queuePreviewImageRefresh(120);
+    return true;
+  }
+
+  queueDesignStateSave(delay = 300) {
+    clearTimeout(this.zoomSaveTimer);
+    this.zoomSaveTimer = setTimeout(() => this.saveCurrentDesignState(), delay);
+  }
+
+  isWheelZoomGesture(event) {
+    if (event.ctrlKey || event.metaKey) return true;
+
+    const absX = Math.abs(event.deltaX);
+    const absY = Math.abs(event.deltaY);
+    const maxDelta = Math.max(absX, absY);
+    const dominantVertical = absY >= absX;
+
+    if (event.deltaMode !== 0) return dominantVertical;
+    return dominantVertical && maxDelta >= this.trackpadWheelDeltaThreshold;
+  }
+
+  startWheelPan() {
+    if (!this.isWheelPanning) {
+      this.isWheelPanning = true;
+      this.setPreviewInteractionActive();
+    }
+
+    clearTimeout(this.wheelPanEndTimer);
+    this.wheelPanEndTimer = setTimeout(() => this.endWheelPan(), this.wheelPanEndDelay);
+  }
+
+  endWheelPan() {
+    clearTimeout(this.wheelPanEndTimer);
+    this.wheelPanEndTimer = null;
+    if (!this.isWheelPanning) return;
+
+    this.isWheelPanning = false;
+    this.setPreviewInteractionActive();
+    this.saveCurrentDesignState();
+    this.scheduleHotspotRender();
+    if (this.isLayerMode && this.layers.length > 0) {
+      this.scheduleLayerRender();
+    }
+  }
+
+  panByWheel(deltaX, deltaY) {
+    if (this.zoomLevel <= 1) return false;
+    this.startWheelPan();
+    if (this.panzoom) {
+      this.panzoom.pan(-deltaX / this.zoomLevel, -deltaY / this.zoomLevel, {
+        relative: true,
+        force: true,
+        animate: false,
+        silent: true
+      });
+      this.syncPanzoomState();
+    } else {
+      this.panX -= deltaX / this.zoomLevel;
+      this.panY -= deltaY / this.zoomLevel;
+      this.applyTransform();
+    }
+    return true;
+  }
+
+  getTouchDistance(touchA, touchB) {
+    return Math.hypot(touchA.clientX - touchB.clientX, touchA.clientY - touchB.clientY);
+  }
+
+  getTouchCenter(touchA, touchB) {
+    return {
+      x: (touchA.clientX + touchB.clientX) / 2,
+      y: (touchA.clientY + touchB.clientY) / 2,
+    };
+  }
+
+  startPinchZoom(event) {
+    if (!this.previewContainer || event.touches.length < 2) return;
+
+    const [touchA, touchB] = event.touches;
+    const viewport = this.getImageViewportRect();
+    if (!viewport) return;
+
+    const distance = this.getTouchDistance(touchA, touchB);
+    if (!distance) return;
+
+    if (this.isDrawingHotspot || this.isDrawingNote) {
+      this.clearDrawingDrafts();
+      this.renderHotspots();
+    }
+
+    if (this.isDragging) {
+      this.endDrag();
+    }
+
+    const center = this.getTouchCenter(touchA, touchB);
+    const anchorPoint = this.getImageLocalPoint(center.x, center.y, viewport);
+    if (!anchorPoint) return;
+
+    const metrics = this.getImageTransformMetrics(viewport);
+    if (!metrics) return;
+
+    this.isPinching = true;
+    this.pinchStartDistance = distance;
+    this.pinchStartZoom = this.zoomLevel;
+    this.pinchStartPanX = this.panX;
+    this.pinchStartPanY = this.panY;
+    this.pinchStartCenterX = center.x;
+    this.pinchStartCenterY = center.y;
+    this.pinchAnchorPoint = anchorPoint;
+    this.pinchBaseCenterX = metrics.baseCenterX;
+    this.pinchBaseCenterY = metrics.baseCenterY;
+    this.pinchGestureMode = 'pending';
+    this.setPreviewInteractionActive();
+  }
+
+  updatePinchZoom(event) {
+    if (!this.isPinching || event.touches.length < 2 || !this.pinchStartDistance || !this.pinchAnchorPoint) return;
+
+    const [touchA, touchB] = event.touches;
+    const distance = this.getTouchDistance(touchA, touchB);
+    if (!distance) return;
+
+    const center = this.getTouchCenter(touchA, touchB);
+    const centerDeltaX = center.x - this.pinchStartCenterX;
+    const centerDeltaY = center.y - this.pinchStartCenterY;
+    const centerDelta = Math.hypot(centerDeltaX, centerDeltaY);
+    const distanceDelta = Math.abs(distance - this.pinchStartDistance);
+    const zoomRatioDelta = Math.abs(distance / this.pinchStartDistance - 1);
+
+    if (this.pinchGestureMode === 'pending') {
+      if (distanceDelta >= this.pinchZoomDistanceThreshold || zoomRatioDelta >= this.pinchZoomRatioThreshold) {
+        this.pinchGestureMode = 'zoom';
+      } else if (centerDelta >= this.pinchPanThreshold) {
+        this.pinchGestureMode = 'pan';
+      } else {
+        return;
+      }
+    }
+
+    if (this.pinchGestureMode === 'pan') {
+      this.zoomLevel = this.pinchStartZoom;
+      this.panX = this.pinchStartPanX + centerDeltaX / this.pinchStartZoom;
+      this.panY = this.pinchStartPanY + centerDeltaY / this.pinchStartZoom;
+      this.applyTransform();
+      this.updateZoomLevel();
+      return;
+    }
+
+    const nextZoom = this.clampZoom(this.pinchStartZoom * (distance / this.pinchStartDistance));
+
+    this.zoomLevel = nextZoom;
+    this.panX = (center.x - this.pinchBaseCenterX) / nextZoom - this.pinchAnchorPoint.x;
+    this.panY = (center.y - this.pinchBaseCenterY) / nextZoom - this.pinchAnchorPoint.y;
+    this.applyTransform();
+    this.updateZoomLevel();
+  }
+
+  endPinchZoom() {
+    if (!this.isPinching) return;
+
+    this.isPinching = false;
+    this.pinchStartDistance = 0;
+    this.pinchStartZoom = this.zoomLevel;
+    this.pinchStartPanX = this.panX;
+    this.pinchStartPanY = this.panY;
+    this.pinchAnchorPoint = null;
+    this.pinchGestureMode = 'idle';
+    this.setPreviewInteractionActive();
+    this.saveCurrentDesignState();
+    this.scheduleHotspotRender();
+    if (this.isLayerMode && this.layers.length > 0) {
+      this.scheduleLayerRender();
+    }
+  }
+
+  handleTouchStart(event) {
+    if (this.panzoom && !this.isMarkMode && !this.isNoteMode) return;
+    if (event.touches.length >= 2) {
+      event.preventDefault();
+      this.startPinchZoom(event);
+      return;
+    }
+    if (event.touches.length !== 1 || this.isPinching) return;
+
+    if (this.isMarkMode) {
+      this.startHotspotDraw(event);
+      event.preventDefault();
+      return;
+    }
+    if (this.isNoteMode) {
+      this.startNoteDraw(event);
+      event.preventDefault();
+      return;
+    }
+    if (this.zoomLevel > 1) {
+      this.startDrag(event);
+      event.preventDefault();
+    }
+  }
+
+  handleTouchMove(event) {
+    if (this.panzoom && !this.isMarkMode && !this.isNoteMode) return;
+    if (this.isPinching) {
+      if (event.touches.length >= 2) {
+        event.preventDefault();
+        this.updatePinchZoom(event);
+      }
+      return;
+    }
+    if (event.touches.length >= 2) {
+      event.preventDefault();
+      this.startPinchZoom(event);
+      return;
+    }
+    if (event.touches.length !== 1) return;
+
+    if (this.isMarkMode && this.isDrawingHotspot) {
+      this.updateHotspotDraw(event);
+      event.preventDefault();
+      return;
+    }
+    if (this.isNoteMode && this.isDrawingNote) {
+      this.updateNoteDraw(event);
+      event.preventDefault();
+      return;
+    }
+    if (this.isDragging) {
+      this.doDrag(event);
+      event.preventDefault();
+    }
+  }
+
+  handleTouchEnd(event) {
+    if (this.panzoom && !this.isMarkMode && !this.isNoteMode) return;
+    if (this.isPinching) {
+      if (event.touches.length >= 2) {
+        this.startPinchZoom(event);
+        return;
+      }
+      this.endPinchZoom();
+      if (!this.isMarkMode && !this.isNoteMode && event.touches.length === 1 && this.zoomLevel > 1) {
+        this.startDrag(event);
+      }
+      event.preventDefault();
+      return;
+    }
+
+    if (this.isMarkMode && this.isDrawingHotspot) {
+      this.finishHotspotDraw(event);
+      return;
+    }
+    if (this.isNoteMode && this.isDrawingNote) {
+      this.finishNoteDraw(event);
+      return;
+    }
+    if (this.isDragging && event.touches.length === 0) {
+      this.endDrag();
+      event.preventDefault();
+    }
+  }
+
+  handleTouchCancel(event) {
+    if (this.panzoom && !this.isMarkMode && !this.isNoteMode) return;
+    if (this.isPinching) {
+      this.endPinchZoom();
+    }
+    if (this.isDragging) {
+      this.endDrag();
+    }
+    if (this.isDrawingHotspot || this.isDrawingNote) {
+      this.clearDrawingDrafts();
+      this.renderHotspots();
+    }
+    event?.preventDefault?.();
+  }
+
   startHotspotDraw(event) {
-    if (event.button !== 0) return;
+    if (!this.isPrimaryPointerEvent(event)) return;
     if (!this.selectedDesignId) return;
 
     const start = this.getNormalizedPointFromMouse(event);
@@ -1165,7 +3057,7 @@ class LanhuViewer {
   }
 
   startNoteDraw(event) {
-    if (event.button !== 0) return;
+    if (!this.isPrimaryPointerEvent(event)) return;
     if (!this.selectedDesignId) return;
 
     const start = this.getNormalizedPointFromMouse(event);
@@ -1323,6 +3215,7 @@ class LanhuViewer {
       hotspotEl.style.height = `${height}px`;
       hotspotEl.title = `接口 ID: ${hotspot.apiId}`;
       hotspotEl.addEventListener('mousedown', (e) => e.stopPropagation());
+      hotspotEl.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
 
       hotspotEl.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -1342,6 +3235,7 @@ class LanhuViewer {
       deleteBtn.textContent = '×';
       deleteBtn.title = '删除热点';
       deleteBtn.addEventListener('mousedown', (e) => e.stopPropagation());
+      deleteBtn.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
       deleteBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         this.postMessageToParent('lanhu-hotspot:delete-request', { id: hotspot.id });
@@ -1366,6 +3260,7 @@ class LanhuViewer {
       calloutEl.appendChild(methodEl);
       calloutEl.appendChild(nameEl);
       calloutEl.addEventListener('mousedown', (e) => e.stopPropagation());
+      calloutEl.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
       calloutEl.addEventListener('click', (e) => {
         e.stopPropagation();
         this.postMessageToParent('lanhu-hotspot:click', {
@@ -1409,6 +3304,7 @@ class LanhuViewer {
       noteEl.style.height = `${height}px`;
       noteEl.title = note.content;
       noteEl.addEventListener('mousedown', (e) => e.stopPropagation());
+      noteEl.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
       noteEl.addEventListener('click', (e) => {
         e.stopPropagation();
         this.openNoteModal(note);
@@ -1424,6 +3320,7 @@ class LanhuViewer {
       deleteBtn.textContent = '×';
       deleteBtn.title = '删除备注';
       deleteBtn.addEventListener('mousedown', (e) => e.stopPropagation());
+      deleteBtn.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
       deleteBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         this.postMessageToParent('lanhu-note:delete-request', { id: note.id });
@@ -1443,6 +3340,7 @@ class LanhuViewer {
       calloutEl.appendChild(badgeEl);
       calloutEl.appendChild(contentEl);
       calloutEl.addEventListener('mousedown', (e) => e.stopPropagation());
+      calloutEl.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
       calloutEl.addEventListener('click', (e) => {
         e.stopPropagation();
         this.openNoteModal(note);
@@ -1536,45 +3434,20 @@ class LanhuViewer {
   // 更新用户 UI
   updateUserUI(userInfo, cookies = null) {
     if (userInfo) {
+      const displayName = this.escapeHtml(userInfo.name || '用户');
       const initial = (userInfo.name || 'U').charAt(0).toUpperCase();
-      let cookieHtml = '';
-
-      if (cookies && cookies.length > 0) {
-        const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-        cookieHtml = `
-          <div class="cookie-info">
-            <div class="cookie-header">
-              <span>🍪 Cookie</span>
-              <button class="btn btn-small btn-secondary" id="copyCookieBtn">复制</button>
-            </div>
-            <div class="cookie-value" id="cookieValue">${cookieStr}</div>
-          </div>
-        `;
-      }
 
       this.userInfoEl.innerHTML = `
         <div class="user-info-wrapper">
           <div class="user-basic">
             <div class="user-avatar">${initial}</div>
-            <span class="user-name">${userInfo.name || '用户'}</span>
-            <button class="btn btn-secondary btn-small" id="logoutBtn">退出</button>
+            <span class="user-name">${displayName}</span>
+            <button class="btn btn-secondary btn-small" id="logoutBtn">退出空间</button>
           </div>
-          ${cookieHtml}
         </div>
       `;
 
       document.getElementById('logoutBtn').addEventListener('click', () => this.logout());
-
-      // 复制 cookie 按钮
-      const copyBtn = document.getElementById('copyCookieBtn');
-      if (copyBtn) {
-        copyBtn.addEventListener('click', () => {
-          const cookieText = document.getElementById('cookieValue').textContent;
-          navigator.clipboard.writeText(cookieText).then(() => {
-            this.showToast('Cookie 已复制', 'success');
-          });
-        });
-      }
     }
   }
 
@@ -1591,11 +3464,15 @@ class LanhuViewer {
     this.hideHtmlPreview(true);
     localStorage.removeItem('sessionId');
     this.sessionId = this.generateSessionId();
+    this.cookies = [];
     this.clearPageState();
     this.selectedDesignId = null;
+    this.updateCopyLinkButtonState();
+    this.updateSelectedDesignCopyButtonState();
+    this.updateGenerateHtmlButtonState();
 
     this.userInfoEl.innerHTML = `
-      <button class="btn btn-primary" id="loginBtn">登录蓝湖</button>
+      <button class="btn btn-primary" id="loginBtn">连接蓝湖</button>
     `;
 
     document.getElementById('loginBtn').addEventListener('click', () => this.login());
@@ -1606,6 +3483,7 @@ class LanhuViewer {
   onUrlInput() {
     const url = this.urlInput.value.trim();
     this.parseBtn.disabled = !url;
+    this.updateCopyLinkButtonState();
 
     // URL 变化时隐藏刷新按钮
     this.refreshBtn.style.display = 'none';
@@ -1645,6 +3523,7 @@ class LanhuViewer {
 
     // 新解析时清除之前的选中状态（但保留 pendingDesignId 用于恢复）
     this.selectedDesignId = null;
+    this.updateGenerateHtmlButtonState();
     this.refreshBtn.style.display = 'none';
 
     // 注意：不要清除 pendingDesignId，因为它用于恢复之前选中的设计图
@@ -1713,19 +3592,25 @@ class LanhuViewer {
       this.projectInfo.style.display = 'block';
       this.projectName.textContent = projectName;
 
-      let metaHtml = '';
-      if (data.project.creator) {
-        metaHtml += `<div class="meta-item"><span class="meta-icon">👤</span>${data.project.creator}</div>`;
-      }
-      if (data.project.memberCount) {
-        metaHtml += `<div class="meta-item"><span class="meta-icon">👥</span>${data.project.memberCount}人</div>`;
-      }
-      if (data.project.updatedAt) {
-        metaHtml += `<div class="meta-item"><span class="meta-icon">🕐</span>${this.formatDate(data.project.updatedAt)}</div>`;
-      }
-      metaHtml += `<div class="meta-item"><span class="meta-icon">📁</span>${this.getTypeLabel(data.type)}</div>`;
+      const creatorName = this.decodeHtmlEntities(data.project.creator || '') || '未指派';
+      const memberCount = Number(data.project.memberCount) || 0;
+      const totalDesigns = (data.designs && data.designs.length) || 0;
+      const updatedAt = data.project.updatedAt ? this.formatDate(data.project.updatedAt) : '待同步';
+      const typeLabel = this.getTypeLabel(data.type);
 
-      this.projectMeta.innerHTML = metaHtml;
+      const metaItems = [];
+      metaItems.push(['交付类型', typeLabel]);
+      metaItems.push(['画板规模', `${totalDesigns} 个画板`]);
+      metaItems.push(['负责人', creatorName]);
+      metaItems.push(['协作成员', memberCount ? `${memberCount} 位` : '未公开']);
+      metaItems.push(['最近同步', updatedAt]);
+
+      this.projectMeta.innerHTML = metaItems.map(([label, value]) => `
+        <div class="meta-card">
+          <span class="meta-label">${this.escapeHtml(label)}</span>
+          <span class="meta-value">${this.escapeHtml(value)}</span>
+        </div>
+      `).join('');
     }
 
     // 设计图列表
@@ -1735,17 +3620,47 @@ class LanhuViewer {
       this.designsSection.style.display = 'flex';
       this.designCount.textContent = `${data.designs.length} 张`;
 
-      this.designGrid.innerHTML = data.designs.map((design, index) => `
-        <div class="design-card" data-index="${index}" data-id="${design.id}" data-url="${design.url || ''}">
-          <div class="design-preview">
-            ${design.url ? `<img src="${this.getProxiedImageUrl(design.url)}" alt="${design.name}" loading="lazy">` : '<span>🖼️</span>'}
+      this.designGrid.innerHTML = data.designs.map((design, index) => {
+        const designName = this.decodeHtmlEntities(design.name) || `设计图 ${index + 1}`;
+        const safeName = this.escapeHtml(designName);
+        const safeAttrName = this.escapeAttr(designName);
+        const designId = this.escapeAttr(design.id || '');
+        const designRawUrl = this.escapeAttr(design.url || '');
+        const designLink = this.getDesignLink(design);
+        const safeDesignLink = this.escapeAttr(designLink);
+        const previewUrl = design.url ? this.getProxiedImageUrl(design.url) : '';
+        const viewportTag = this.getDesignViewportTag(design);
+        const width = Number(design.width) || 0;
+        const height = Number(design.height) || 0;
+        const hasSize = width > 0 && height > 0;
+        const orientation = hasSize ? (width >= height ? '横向' : '纵向') : '方向待定';
+        const ratio = hasSize ? this.getDesignRatio(width, height) : '';
+        const sizeText = hasSize ? `${width} × ${height}` : '尺寸待同步';
+        const metaText = ratio ? `${orientation} · ${ratio}` : orientation;
+        const codeStatus = this.getDesignCodeStatus(design);
+        const cardTitle = this.escapeAttr(`${designName}${hasSize ? ` (${width}×${height})` : ''} · ${codeStatus.title}`);
+
+        return `
+          <div class="design-card" data-index="${index}" data-id="${designId}" data-url="${designRawUrl}" data-link="${safeDesignLink}" title="${cardTitle}">
+            <div class="design-preview">
+              ${previewUrl ? `<img src="${this.escapeAttr(previewUrl)}" alt="${safeAttrName}" loading="lazy">` : '<span>FRAME</span>'}
+            </div>
+            <div class="design-info">
+              <div class="design-card-head">
+                <span class="design-index">${String(index + 1).padStart(2, '0')}</span>
+                <span class="design-tag">${this.escapeHtml(viewportTag)}</span>
+                <span class="design-code-badge ${this.escapeAttr(codeStatus.code)}" title="${this.escapeAttr(codeStatus.title)}">${this.escapeHtml(codeStatus.label)}</span>
+              </div>
+              <div class="design-name" title="${safeAttrName}">${safeName}</div>
+              <div class="design-meta-row">
+                <span class="design-size">${this.escapeHtml(sizeText)}</span>
+                <span class="design-size">${this.escapeHtml(metaText)}</span>
+              </div>
+            </div>
+            <div class="design-arrow">></div>
           </div>
-          <div class="design-info">
-            <div class="design-name" title="${design.name}">${design.name}</div>
-            <div class="design-size">${design.width} x ${design.height}</div>
-          </div>
-        </div>
-      `).join('');
+        `;
+      }).join('');
 
       // 绑定点击事件
       this.designGrid.querySelectorAll('.design-card').forEach(card => {
@@ -1774,6 +3689,9 @@ class LanhuViewer {
       this.designsSection.style.display = 'none';
       // 没有设计图时显示空状态
       this.selectedDesignId = null;
+      this.updateDesignPreviewFrameLabel('');
+      this.updateSelectedDesignCopyButtonState();
+      this.updateGenerateHtmlButtonState();
       this.contentEmpty.style.display = 'flex';
       this.previewSection.style.display = 'none';
       this.sidebarRight.style.display = 'none';
@@ -1814,6 +3732,8 @@ class LanhuViewer {
 
     // 更新当前选中的设计图
     this.selectedDesignId = designId;
+    this.updateSelectedDesignCopyButtonState();
+    this.updateGenerateHtmlButtonState();
     this.currentProjectData = projectData;
     this.closeNoteModal();
     if (!isDesignSwitched) {
@@ -1841,10 +3761,11 @@ class LanhuViewer {
 
     // 显示设计图预览
     if (designUrl) {
-      this.previewName.textContent = design.name;
+      const designName = this.decodeHtmlEntities(design.name) || '未命名设计图';
+      this.previewName.textContent = designName;
+      this.updateDesignPreviewFrameLabel(designName);
       this.previewSize.textContent = `${design.width} × ${design.height}`;
-      this.previewImage.src = this.getProxiedImageUrl(designUrl);
-      this.previewImage.alt = design.name;
+      this.loadDesignPreviewImage(design, { resetAdaptiveState: true });
 
       // 恢复该设计图的缩放状态（每个设计图独立记忆）
       const savedState = this.getDesignState(designId);
@@ -1863,6 +3784,19 @@ class LanhuViewer {
       this.scheduleHotspotRender(220);
       if (this.previewImage.complete && this.previewImage.naturalWidth > 0) {
         this.scheduleHotspotRender(0);
+      }
+
+      const targetFramework = this.getSelectedGeneratedFramework();
+      const restoredGeneratedCode = this.restoreGeneratedCodeCache(design, {
+        autoShow: true,
+        framework: targetFramework
+      });
+      if (!restoredGeneratedCode) {
+        this.restoreGeneratedCodeJob(design, {
+          autoShow: true,
+          silent: true,
+          framework: targetFramework
+        });
       }
     }
 
@@ -1923,7 +3857,7 @@ class LanhuViewer {
   renderSlices(data) {
     if (data.slices && data.slices.length > 0) {
       this.currentSlices = data.slices;
-      this.sliceCountEl.textContent = `${data.total} 张`;
+      this.sliceCountEl.textContent = `${data.total || data.slices.length} 张`;
       this.sliceFooter.style.display = 'block';
       // 始终显示设置面板
       this.sliceSettingsEl.style.display = 'block';
@@ -1940,12 +3874,6 @@ class LanhuViewer {
 
   // 根据平台设置渲染切图列表
   renderSliceList() {
-    // 获取当前项目所有可用的倍率
-    const allScales = new Set();
-    this.currentSlices.forEach(slice => {
-      Object.keys(slice.scales || {}).forEach(s => allScales.add(s));
-    });
-
     // 根据平台过滤要显示的倍率
     const platformScaleMap = {
       'ios': ['1x', '2x', '3x', 'svg'],
@@ -1960,22 +3888,30 @@ class LanhuViewer {
       const availableScales = slice.scales && Object.keys(slice.scales).length > 0
         ? slice.scales
         : { '1x': slice.defaultUrl || slice.url };
-      const safeName = this.escapeHtml(slice.name || '');
-      const safeAttrName = this.escapeAttr(slice.name || '');
+      const sliceName = slice.name || `asset_${index + 1}`;
+      const safeName = this.escapeHtml(sliceName);
+      const safeAttrName = this.escapeAttr(sliceName);
       const safeFallbackLabel = this.escapeHtml(slice.defaultFormat?.toUpperCase() || 'PNG');
+      const formatLabel = this.escapeHtml((slice.defaultFormat || Object.keys(availableScales)[0] || 'png').toUpperCase());
+      const assetType = this.getSliceLabel(slice);
+      const availableScaleCount = Object.keys(availableScales).filter(scale => allowedScales.includes(scale)).length;
+      const sizeText = `${slice.width || '--'} × ${slice.height || '--'}`;
+      const metaText = availableScaleCount > 0
+        ? `${sizeText} · ${availableScaleCount} 个规格`
+        : `${sizeText} · 1 个默认规格`;
 
       // 根据平台和可用倍率生成按钮
       let scaleBtns = allowedScales
         .filter(s => availableScales[s])
         .map(scale =>
-          `<button class="btn btn-small btn-secondary" onclick="app.downloadSliceWithScale(${index}, '${scale}')" title="${scale}">${scale.toUpperCase()}</button>`
+          `<button class="btn btn-small btn-secondary slice-scale-btn" onclick="app.downloadSliceWithScale(${index}, '${scale}')" title="${scale}">${scale.toUpperCase()}</button>`
         ).join('');
 
       // 如果没有生成任何按钮，使用默认下载按钮
       if (!scaleBtns) {
         const defaultUrl = slice.defaultUrl || slice.url;
         if (defaultUrl) {
-          scaleBtns = `<button class="btn btn-small btn-secondary" onclick="app.downloadSlice(${index})">下载</button>`;
+          scaleBtns = `<button class="btn btn-small btn-secondary slice-scale-btn" onclick="app.downloadSlice(${index})">下载</button>`;
         }
       }
 
@@ -1988,8 +3924,11 @@ class LanhuViewer {
             ${proxiedPreviewUrl ? `<img src="${this.escapeAttr(proxiedPreviewUrl)}" alt="${safeAttrName}" loading="lazy" onerror="this.style.display='none';this.parentElement.textContent='${safeFallbackLabel}'">` : `<span>${safeFallbackLabel}</span>`}
           </div>
           <div class="slice-info">
-            <div class="slice-name">${safeName}</div>
-            <div class="slice-meta">${slice.width} × ${slice.height}</div>
+            <div class="slice-title-row">
+              <div class="slice-name" title="${safeAttrName}">${safeName}</div>
+              <span class="slice-format-badge">${formatLabel}</span>
+            </div>
+            <div class="slice-meta">${this.escapeHtml(metaText)} · ${this.escapeHtml(assetType)}</div>
           </div>
           <div class="slice-actions">
             ${scaleBtns}
@@ -2216,8 +4155,13 @@ class LanhuViewer {
     }
   }
 
-  // 生成静态 HTML 并展示在右侧预览
+  // 读取蓝湖生成代码并展示在右侧预览
   async generateHtmlPreview() {
+    if (this.isGeneratingHtmlPreview) {
+      this.showToast(`${this.getGeneratedFrameworkLabel()} 代码正在加载中...`);
+      return;
+    }
+
     if (!this.selectedDesignId) {
       this.showToast('请先选择设计图', 'error');
       return;
@@ -2229,49 +4173,3306 @@ class LanhuViewer {
       return;
     }
 
-    this.log('开始生成静态 HTML...', 'info');
-    this.showToast('正在生成 HTML...');
+    const designId = this.selectedDesignId;
+    const targetFramework = this.getSelectedGeneratedFramework();
+    const frameworkLabel = this.getGeneratedFrameworkLabel(targetFramework);
 
-    // 确保已加载当前设计图图层
-    await this.loadLayers(true);
-
-    if (!Array.isArray(this.layers) || this.layers.length === 0) {
-      this.log('没有可用图层数据，生成 HTML 失败', 'error');
-      this.showToast('没有可用图层数据，无法生成 HTML', 'error');
+    if (this.hasGeneratedCodeForCurrentDesign()) {
+      this.showHtmlPreview({
+        revealCodePanel: true
+      });
+      this.showToast(`${frameworkLabel} 代码已展开`, 'success');
       return;
     }
 
-    const htmlCode = this.buildStaticHtmlFromLayers(design);
-    this.generatedHtmlCode = htmlCode;
-    this.generatedHtmlDesignId = this.selectedDesignId;
-    this.showHtmlPreview(htmlCode);
+    if (this.restoreGeneratedCodeCache(design, {
+      autoShow: true,
+      revealCodePanel: true,
+      framework: targetFramework
+    })) {
+      this.showToast(`已从缓存恢复 ${frameworkLabel} 代码`, 'success');
+      return;
+    }
 
-    this.log(`HTML 生成完成，图层数: ${this.layers.length}`, 'success');
-    this.showToast('HTML 生成完成', 'success');
+    this.generatedCodePollToken += 1;
+    const pollToken = this.generatedCodePollToken;
+    this.stopGeneratedCodePolling();
+    this.isGeneratingHtmlPreview = true;
+    this.generatedCodeJobId = '';
+    const initialTask = {
+      ...this.createInitialGeneratedCodeTaskState(),
+      status: 'queued',
+      stepKey: 'queued',
+      stepLabel: '任务已创建',
+      currentAction: `正在提交 ${frameworkLabel} 代码生成任务...`,
+      progressPercent: 2
+    };
+    this.generatedCodeFramework = '';
+    this.log(`开始读取蓝湖 ${frameworkLabel} 代码...`, 'info');
+    this.showToast(`正在读取 ${frameworkLabel} 代码...`);
+    this.prepareGeneratedCodeTaskWorkspace(initialTask, { showCodePanel: true, autoShow: true });
+
+    try {
+      const response = await fetch('/api/generated-code/start', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Session-Id': this.sessionId
+        },
+        body: JSON.stringify({
+          teamId: this.currentTeamId,
+          projectId: this.currentProjectId,
+          imageId: designId,
+          framework: targetFramework
+        })
+      });
+
+      const { payload: data, errorMessage } = await this.readGeneratedCodeApiResponse(
+        response,
+        '/api/generated-code/start',
+        '读取蓝湖代码失败'
+      );
+      if (!response.ok || data?.success === false) {
+        throw new Error(errorMessage);
+      }
+
+      const job = data?.job;
+      if (!job?.id) {
+        throw new Error('未获取到代码生成任务 ID');
+      }
+
+      this.setGeneratedCodeJobCache(job, design, targetFramework);
+
+      if (pollToken !== this.generatedCodePollToken) {
+        return;
+      }
+
+      this.applyGeneratedCodeJobState(job);
+      await this.trackGeneratedCodeJob(job.id, design, pollToken, {
+        framework: targetFramework,
+        notifyOnSuccess: true,
+        notifyOnError: true
+      });
+    } catch (e) {
+      if (pollToken !== this.generatedCodePollToken) {
+        return;
+      }
+      const displayErrorMessage = this.getGeneratedCodeDisplayErrorMessage(e, this.generatedCodeTask);
+      this.generatedCodeTask = {
+        ...this.generatedCodeTask,
+        id: this.generatedCodeJobId || this.generatedCodeTask?.id || '',
+        status: 'error',
+        errorMessage: displayErrorMessage,
+        currentAction: displayErrorMessage,
+        updatedAt: Date.now()
+      };
+      if (this.generatedCodeTask.id) {
+        this.setGeneratedCodeJobCache(this.generatedCodeTask, design, targetFramework);
+      }
+      this.renderGeneratedCodeTask();
+      this.updateGeneratedCodeMeta();
+      this.log(`读取蓝湖 ${frameworkLabel} 代码失败: ${displayErrorMessage}`, 'error');
+      this.showToast(`读取蓝湖 ${frameworkLabel} 代码失败: ${displayErrorMessage}`, 'error');
+    } finally {
+      if (pollToken === this.generatedCodePollToken) {
+        this.stopGeneratedCodePolling(false);
+        this.isGeneratingHtmlPreview = false;
+        this.updateGenerateHtmlButtonState();
+      }
+    }
   }
 
-  showHtmlPreview(htmlCode) {
-    if (!this.htmlPreviewPanel || !this.previewBody) return;
+  shouldCollapseCodePanelByDefault() {
+    return window.innerWidth <= 1450;
+  }
 
-    this.htmlPreviewPanel.style.display = 'flex';
-    this.previewBody.classList.add('html-preview-visible');
+  shouldStackCodePanelBelowPreview() {
+    return window.innerWidth <= 1280;
+  }
+
+  hasGeneratedCodeForCurrentDesign() {
+    const targetFramework = this.getSelectedGeneratedFramework();
+    return Boolean(
+      this.generatedHtmlDesignId &&
+      this.generatedHtmlDesignId === this.selectedDesignId &&
+      this.generatedCodeFramework === targetFramework &&
+      Array.isArray(this.generatedCodeFiles) &&
+      this.generatedCodeFiles.length > 0
+    );
+  }
+
+  hasGeneratedCodePanelContent() {
+    const taskStatus = String(this.generatedCodeTask?.status || 'idle').trim() || 'idle';
+    const design = this.getSelectedDesign();
+    const targetFramework = this.getSelectedGeneratedFramework();
+    const resumableJob = design ? this.getGeneratedCodeJobCache(design, targetFramework) : null;
+    const matchesCurrentFramework = this.generatedCodeFramework === targetFramework;
+    return this.hasGeneratedCodeForCurrentDesign() ||
+      Boolean(resumableJob) ||
+      (matchesCurrentFramework && ['queued', 'running', 'error'].includes(taskStatus));
+  }
+
+  canOpenGeneratedCodePanel() {
+    return Boolean(this.getSelectedDesign());
+  }
+
+  updateGeneratedCodePanelToggleButton() {
+    if (!this.toggleCodePanelBtn) return;
+
+    const canToggle = this.canOpenGeneratedCodePanel();
+    const hasPanelContent = this.hasGeneratedCodePanelContent();
+    this.toggleCodePanelBtn.hidden = !canToggle;
+    this.toggleCodePanelBtn.disabled = !canToggle;
+    this.toggleCodePanelBtn.classList.toggle('active', this.isCodePanelVisible);
+    this.toggleCodePanelBtn.textContent = this.isCodePanelVisible ? '收起代码' : '代码面板';
+    this.toggleCodePanelBtn.title = this.isCodePanelVisible
+      ? '收起代码与进度弹窗'
+      : hasPanelContent
+        ? '打开代码与进度弹窗'
+        : '打开代码与进度弹窗（当前框架尚未生成）';
+  }
+
+  setCodePanelVisibility(visible) {
+    this.isCodePanelVisible = Boolean(visible);
+
+    if (this.htmlPreviewModal) {
+      this.htmlPreviewModal.hidden = !this.isCodePanelVisible;
+    }
+    document.body.classList.toggle('code-panel-modal-open', this.isCodePanelVisible);
+
+    this.updateGeneratedCodePanelToggleButton();
+  }
+
+  scrollCodePanelIntoView() {
+    if (!this.shouldStackCodePanelBelowPreview() || !this.previewBody || !this.htmlPreviewPanel || this.htmlPreviewPanel.hidden) {
+      return;
+    }
+
+    const bodyRect = this.previewBody.getBoundingClientRect();
+    const panelRect = this.htmlPreviewPanel.getBoundingClientRect();
+    const top = this.previewBody.scrollTop + (panelRect.top - bodyRect.top) - 12;
+    this.previewBody.scrollTo({
+      top: Math.max(0, top),
+      behavior: 'smooth'
+    });
+  }
+
+  scrollPreviewWorkspaceToTop() {
+    if (!this.shouldStackCodePanelBelowPreview() || !this.previewBody) {
+      return;
+    }
+
+    this.previewBody.scrollTo({
+      top: 0,
+      behavior: 'smooth'
+    });
+  }
+
+  toggleCodePanel() {
+    if (!this.canOpenGeneratedCodePanel()) {
+      this.showToast('请先选择设计图');
+      return;
+    }
+
+    this.setCodePanelVisibility(!this.isCodePanelVisible);
+  }
+
+  showGeneratedCodePanel({ showCodePanel = true } = {}) {
+    this.setCodePanelVisibility(showCodePanel);
     if (this.generateHtmlBtn) {
       this.generateHtmlBtn.classList.add('active');
     }
+  }
 
-    if (this.htmlPreviewFrame) {
-      this.htmlPreviewFrame.srcdoc = htmlCode;
+  stopGeneratedCodePolling(resetJobId = true) {
+    if (this.generatedCodePollTimer) {
+      clearTimeout(this.generatedCodePollTimer);
+      this.generatedCodePollTimer = null;
     }
-    if (this.htmlCodeOutput) {
-      this.htmlCodeOutput.value = htmlCode;
-      this.htmlCodeOutput.scrollTop = 0;
+    if (typeof this.generatedCodePollResolve === 'function') {
+      const resolve = this.generatedCodePollResolve;
+      this.generatedCodePollResolve = null;
+      resolve();
+    }
+    if (resetJobId) {
+      this.generatedCodeJobId = '';
     }
   }
 
-  hideHtmlPreview(clearCode = false) {
-    if (this.htmlPreviewPanel) {
-      this.htmlPreviewPanel.style.display = 'none';
+  cancelGeneratedCodeTracking(resetTask = false) {
+    this.generatedCodePollToken += 1;
+    this.stopGeneratedCodePolling();
+    this.isGeneratingHtmlPreview = false;
+    this.updateGenerateHtmlButtonState();
+    if (resetTask) {
+      this.generatedCodeTask = this.createInitialGeneratedCodeTaskState();
+      this.renderGeneratedCodeTask();
+      this.updateGeneratedCodeMeta();
     }
+  }
+
+  async trackGeneratedCodeJob(jobId, design = null, pollToken = this.generatedCodePollToken, {
+    framework = 'html',
+    notifyOnSuccess = true,
+    notifyOnError = true
+  } = {}) {
+    const resolvedDesign = this.resolveDesignEntity(design);
+    const frameworkLabel = this.getGeneratedFrameworkLabel(framework);
+
+    try {
+      const completedJob = await this.waitForGeneratedCodeJob(jobId, pollToken, {
+        design: resolvedDesign,
+        framework
+      });
+      if (!completedJob || pollToken !== this.generatedCodePollToken) {
+        return null;
+      }
+
+      this.consumeGeneratedCodeResult(completedJob.result, resolvedDesign?.id || this.selectedDesignId);
+      if (notifyOnSuccess) {
+        this.showToast(`${frameworkLabel} 代码已加载`, 'success');
+      }
+      return completedJob;
+    } catch (error) {
+      if (pollToken !== this.generatedCodePollToken) {
+        return null;
+      }
+
+      const displayErrorMessage = this.getGeneratedCodeDisplayErrorMessage(error, this.generatedCodeTask);
+      this.generatedCodeTask = this.normalizeGeneratedCodeTaskState({
+        ...this.generatedCodeTask,
+        id: jobId || this.generatedCodeTask?.id || '',
+        status: 'error',
+        errorMessage: displayErrorMessage,
+        currentAction: displayErrorMessage,
+        updatedAt: Date.now()
+      });
+
+      if (error?.clearGeneratedCodeJobCache) {
+        this.clearGeneratedCodeJobCacheEntry(resolvedDesign, framework);
+      } else if (this.generatedCodeTask.id) {
+        this.setGeneratedCodeJobCache(this.generatedCodeTask, resolvedDesign, framework);
+      }
+
+      this.renderGeneratedCodeTask();
+      this.updateGeneratedCodeMeta();
+      this.log(`读取 ${frameworkLabel} 代码失败: ${displayErrorMessage}`, 'error');
+      if (notifyOnError) {
+        this.showToast(`读取 ${frameworkLabel} 代码失败: ${displayErrorMessage}`, 'error');
+      }
+      return null;
+    } finally {
+      if (pollToken === this.generatedCodePollToken) {
+        this.stopGeneratedCodePolling(false);
+        this.isGeneratingHtmlPreview = false;
+        this.updateGenerateHtmlButtonState();
+      }
+    }
+  }
+
+  restoreGeneratedCodeJob(design = null, {
+    autoShow = true,
+    silent = true,
+    framework = this.getSelectedGeneratedFramework()
+  } = {}) {
+    const resolvedDesign = this.resolveDesignEntity(design);
+    if (!resolvedDesign) return false;
+
+    const targetFramework = this.normalizeGeneratedFrameworkValue(framework || this.getSelectedGeneratedFramework());
+    const cachedPayload = this.getGeneratedCodeCache(resolvedDesign, targetFramework);
+    if (cachedPayload) {
+      this.clearGeneratedCodeJobCacheEntry(resolvedDesign, targetFramework);
+      return false;
+    }
+
+    const jobEntry = this.getGeneratedCodeJobCache(resolvedDesign, targetFramework);
+    if (!jobEntry?.jobId) return false;
+
+    this.generatedCodePollToken += 1;
+    const pollToken = this.generatedCodePollToken;
+    this.stopGeneratedCodePolling();
+
+    const taskStatus = jobEntry.task?.status || 'queued';
+    const restoredMessage = taskStatus === 'success'
+      ? '后台任务已完成，正在同步结果...'
+      : taskStatus === 'error'
+        ? '已恢复上次失败记录'
+        : '已恢复进行中的蓝湖代码任务';
+    const restoredTask = this.appendGeneratedCodeTaskLog({
+      ...jobEntry.task,
+      id: jobEntry.jobId,
+      status: taskStatus === 'success' ? 'running' : taskStatus,
+      currentAction: taskStatus === 'success'
+        ? '后台任务已完成，正在同步结果...'
+        : taskStatus === 'error'
+          ? (jobEntry.task?.errorMessage || jobEntry.task?.currentAction || '读取蓝湖代码失败')
+          : `已恢复任务进度，${jobEntry.task?.currentAction || '继续读取中...'}`,
+      progressPercent: taskStatus === 'success'
+        ? Math.max(96, Number(jobEntry.task?.progressPercent) || 0)
+        : Number(jobEntry.task?.progressPercent) || 0,
+      updatedAt: Date.now()
+    }, restoredMessage, taskStatus === 'error' ? 'error' : 'info');
+
+    this.generatedCodeFramework = this.normalizeGeneratedFrameworkValue(jobEntry.framework || targetFramework);
+    this.generatedCodeJobId = jobEntry.jobId;
+    this.isGeneratingHtmlPreview = taskStatus !== 'error';
+    this.prepareGeneratedCodeTaskWorkspace(restoredTask, { showCodePanel: true, autoShow });
+
+    if (!silent) {
+      this.showToast(taskStatus === 'error' ? '已恢复上次失败信息' : '已恢复蓝湖代码生成进度');
+    }
+
+    if (taskStatus === 'error') {
+      this.setGeneratedCodeJobCache(restoredTask, resolvedDesign, jobEntry.framework || targetFramework);
+      return true;
+    }
+
+    this.log(taskStatus === 'success'
+      ? '已接回后台完成的蓝湖代码任务，正在同步结果...'
+      : '已恢复蓝湖代码生成进度', 'info');
+    void this.trackGeneratedCodeJob(jobEntry.jobId, resolvedDesign, pollToken, {
+      framework: jobEntry.framework || targetFramework,
+      notifyOnSuccess: !silent,
+      notifyOnError: !silent
+    });
+    return true;
+  }
+
+  applyGeneratedCodeJobState(job) {
+    if (!job || typeof job !== 'object') {
+      return;
+    }
+
+    const { result, ...jobState } = job;
+    this.generatedCodeJobId = job.id || this.generatedCodeJobId;
+    this.generatedCodeTask = this.normalizeGeneratedCodeTaskState({
+      ...this.createInitialGeneratedCodeTaskState(),
+      ...jobState,
+      logs: Array.isArray(job.logs) ? job.logs : []
+    });
+    this.renderGeneratedCodeTask();
+    this.updateGeneratedCodeMeta();
+  }
+
+  applyGeneratedCodePayload(payload, designId, { fromCache = false } = {}) {
+    this.generatedCodeFramework = this.normalizeGeneratedFrameworkValue(payload?.framework?.value || payload?.framework || 'html');
+    this.selectedGeneratedFramework = this.generatedCodeFramework;
+    this.saveGeneratedFrameworkPreference();
+    this.syncGeneratedFrameworkSelect();
+    this.generatedCodeFiles = Array.isArray(payload?.files)
+      ? payload.files.filter((file) => file && file.name && typeof file.content === 'string')
+      : [];
+    this.generatedPreviewHtml = String(payload?.previewHtml || '');
+    this.generatedPreviewRepairState = this.createInitialGeneratedPreviewRepairState();
+    this.generatedHtmlDesignId = designId;
+
+    const preferredFileName = String(payload?.selectedFileName || '').trim();
+    this.generatedCodeFileName = preferredFileName ||
+      this.generatedCodeFiles.find((file) => file.isPrimary)?.name ||
+      this.generatedCodeFiles[0]?.name ||
+      '';
+
+    if (!this.generatedCodeFiles.length) {
+      throw new Error('蓝湖未返回可用代码文件');
+    }
+
+    if (fromCache) {
+      this.generatedCodeTask = this.createGeneratedCodeCachedTaskState(payload);
+      this.renderGeneratedCodeTask();
+      this.updateGeneratedCodeMeta();
+    }
+  }
+
+  renderGeneratedCodeTask() {
+    const task = this.generatedCodeTask || this.createInitialGeneratedCodeTaskState();
+    const totalSteps = Math.max(1, Number(task.totalSteps) || 6);
+    const currentStep = Math.min(totalSteps, Math.max(0, Number(task.currentStep) || 0));
+    const progressPercent = Math.max(0, Math.min(100, Number(task.progressPercent) || 0));
+    const logs = Array.isArray(task.logs) ? task.logs.slice(-4) : [];
+
+    if (this.generatedCodeTaskCard) {
+      this.generatedCodeTaskCard.dataset.status = task.status || 'idle';
+    }
+    if (this.generatedCodeTaskStep) {
+      this.generatedCodeTaskStep.textContent = task.stepLabel || '等待开始';
+    }
+    if (this.generatedCodeProgressText) {
+      this.generatedCodeProgressText.textContent = `${progressPercent}%`;
+    }
+    if (this.generatedCodeTaskMeta) {
+      if (task.status === 'success') {
+        this.generatedCodeTaskMeta.textContent = `已完成 · ${totalSteps} / ${totalSteps}`;
+      } else if (task.status === 'error') {
+        this.generatedCodeTaskMeta.textContent = `中断于 ${currentStep || '-'} / ${totalSteps}`;
+      } else if (task.status === 'queued') {
+        this.generatedCodeTaskMeta.textContent = `排队中 · 0 / ${totalSteps}`;
+      } else {
+        this.generatedCodeTaskMeta.textContent = `${currentStep} / ${totalSteps}`;
+      }
+    }
+    if (this.generatedCodeProgressBar) {
+      this.generatedCodeProgressBar.style.width = `${progressPercent}%`;
+    }
+    if (this.generatedCodeCurrentAction) {
+      const errorMessage = task.errorMessage ? `失败原因：${task.errorMessage}` : '';
+      this.generatedCodeCurrentAction.textContent = errorMessage || task.currentAction || '等待开始';
+    }
+    if (this.generatedCodeLogList) {
+      this.generatedCodeLogList.innerHTML = logs.length
+        ? logs.map((log) => {
+            const type = this.escapeAttr(log.type || 'info');
+            return `
+              <div class="generated-task-log-item ${type}">
+                <span class="generated-task-log-time">${this.escapeHtml(log.time || '--:--:--')}</span>
+                <span class="generated-task-log-message">${this.escapeHtml(log.message || '')}</span>
+              </div>
+            `;
+          }).join('')
+        : '<div class="generated-task-log-item placeholder">生成中的关键日志会显示在这里。</div>';
+    }
+  }
+
+  async waitForGeneratedCodeJob(jobId, pollToken, { design = null, framework = 'html' } = {}) {
+    while (pollToken === this.generatedCodePollToken) {
+      const response = await fetch(`/api/generated-code/jobs/${encodeURIComponent(jobId)}`, {
+        headers: {
+          'X-Session-Id': this.sessionId
+        }
+      });
+
+      const { payload: data, errorMessage } = await this.readGeneratedCodeApiResponse(
+        response,
+        `/api/generated-code/jobs/${encodeURIComponent(jobId)}`,
+        '获取蓝湖代码生成进度失败'
+      );
+      if (pollToken !== this.generatedCodePollToken) {
+        return null;
+      }
+
+      if (!response.ok || data?.success === false) {
+        const requestError = new Error(errorMessage);
+        if (response.status === 401 || response.status === 404) {
+          requestError.clearGeneratedCodeJobCache = true;
+        }
+        throw requestError;
+      }
+
+      const job = data?.job;
+      if (!job) {
+        const missingJobError = new Error('未获取到蓝湖代码生成状态');
+        missingJobError.clearGeneratedCodeJobCache = true;
+        throw missingJobError;
+      }
+
+      this.setGeneratedCodeJobCache(job, design, framework);
+      this.applyGeneratedCodeJobState(job);
+
+      if (job.status === 'success') {
+        return job;
+      }
+
+      if (job.status === 'error') {
+        throw new Error(job.errorMessage || job.currentAction || '读取蓝湖代码失败');
+      }
+
+      await new Promise((resolve) => {
+        this.generatedCodePollResolve = resolve;
+        this.generatedCodePollTimer = window.setTimeout(() => {
+          this.generatedCodePollTimer = null;
+          this.generatedCodePollResolve = null;
+          resolve();
+        }, 900);
+      });
+    }
+
+    return null;
+  }
+
+  consumeGeneratedCodeResult(result, designId) {
+    this.applyGeneratedCodePayload(result, designId);
+    const isCached = this.setGeneratedCodeCache(designId);
+    if (isCached) {
+      this.clearGeneratedCodeJobCacheEntry(designId, this.generatedCodeFramework || 'html');
+    }
+    this.showHtmlPreview({ revealCodePanel: !this.generatedPreviewHtml || this.isCodePanelVisible });
+    if (!isCached) {
+      this.log('蓝湖代码已加载，但本地缓存写入失败，可能是浏览器存储空间不足', 'warn');
+    }
+    this.log(`${this.getGeneratedFrameworkLabel(this.generatedCodeFramework)} 代码读取完成，文件数: ${this.generatedCodeFiles.length}`, 'success');
+  }
+
+  restoreGeneratedCodeCache(design = null, {
+    autoShow = true,
+    revealCodePanel,
+    framework = this.getSelectedGeneratedFramework()
+  } = {}) {
+    const resolvedDesign = this.resolveDesignEntity(design);
+    if (!resolvedDesign) return false;
+
+    const targetFramework = this.normalizeGeneratedFrameworkValue(framework || this.getSelectedGeneratedFramework());
+    const cachedPayload = this.getGeneratedCodeCache(resolvedDesign, targetFramework);
+    if (!cachedPayload) return false;
+
+    try {
+      this.applyGeneratedCodePayload(cachedPayload, resolvedDesign.id, { fromCache: true });
+      this.clearGeneratedCodeJobCacheEntry(resolvedDesign, targetFramework);
+      if (autoShow) {
+        this.showHtmlPreview({ revealCodePanel });
+      } else {
+        this.refreshGeneratedCodeOutput();
+      }
+      this.updateGenerateHtmlButtonState();
+      return true;
+    } catch (error) {
+      const cacheKey = this.getGeneratedCodeCacheKey(resolvedDesign, targetFramework);
+      if (cacheKey && this.generatedCodeCache[cacheKey]) {
+        delete this.generatedCodeCache[cacheKey];
+        this.saveGeneratedCodeCache();
+      }
+      return false;
+    }
+  }
+
+  getSelectedDesignDisplayName() {
+    const selectedDesign = this.designs?.find((item) => item.id === this.selectedDesignId);
+    const designName = this.decodeHtmlEntities(selectedDesign?.name || '').trim();
+    return designName || this.previewName?.textContent || '当前设计图';
+  }
+
+  updateDesignPreviewFrameLabel(designName = '') {
+    if (!this.designPreviewFrameLabel) return;
+    const resolvedName = this.decodeHtmlEntities(String(designName || '')).trim() || '当前设计图';
+    this.designPreviewFrameLabel.textContent = `${resolvedName} · 设计稿`;
+  }
+
+  createGeneratedPreviewDiagnosticsToken() {
+    return `diag_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  getGeneratedPreviewDiagnosticsDisplayState(state = this.generatedPreviewDiagnostics) {
+    const normalizedState = state || this.createInitialGeneratedPreviewDiagnostics();
+    const report = normalizedState.report;
+    const issues = Array.isArray(report?.issues) ? report.issues : [];
+    const hasError = issues.some((issue) => issue.level === 'error');
+
+    if (normalizedState.status === 'pending') {
+      return { status: 'pending', label: '采集中' };
+    }
+    if (!report) {
+      if (normalizedState.status === 'unavailable') {
+        return { status: 'idle', label: '不可用' };
+      }
+      return { status: 'idle', label: '未运行' };
+    }
+    if (hasError) {
+      return { status: 'error', label: `${issues.filter((issue) => issue.level === 'error').length} 个异常` };
+    }
+    if (issues.length > 0) {
+      return { status: 'issues', label: `${issues.length} 个提示` };
+    }
+    return { status: 'ready', label: '通过' };
+  }
+
+  formatGeneratedPreviewDiagnosticsTime(timestamp) {
+    const value = Number(timestamp) || 0;
+    if (!value) return '--:--:--';
+    try {
+      return new Date(value).toLocaleTimeString();
+    } catch (e) {
+      return '--:--:--';
+    }
+  }
+
+  normalizeGeneratedPreviewDiagnosticsReport(payload = {}) {
+    const report = payload && typeof payload === 'object' ? payload : {};
+    const summarySource = report.summary && typeof report.summary === 'object' ? report.summary : {};
+    const normalizeCounter = (source = {}) => ({
+      total: Math.max(0, Number(source.total) || 0),
+      loaded: Math.max(0, Number(source.loaded) || 0),
+      failed: Math.max(0, Number(source.failed) || 0),
+      pending: Math.max(0, Number(source.pending) || 0)
+    });
+    const normalizeCssCounter = (source = {}) => ({
+      ...normalizeCounter(source),
+      sampled: Math.max(0, Number(source.sampled) || 0),
+      failedSamples: Array.isArray(source.failedSamples)
+        ? source.failedSamples.map((item) => String(item || '').trim().slice(0, 220)).filter(Boolean).slice(0, 4)
+        : []
+    });
+    const normalizeIssue = (issue = {}) => ({
+      level: ['error', 'warn', 'info'].includes(String(issue.level || '').trim()) ? String(issue.level).trim() : 'info',
+      label: String(issue.label || '').trim().slice(0, 120) || '未命名诊断项',
+      detail: String(issue.detail || '').trim().slice(0, 600)
+    });
+    const normalizeRoot = (item = {}) => ({
+      selector: String(item.selector || '').trim().slice(0, 160),
+      width: Math.max(0, Number(item.width) || 0),
+      height: Math.max(0, Number(item.height) || 0),
+      childCount: Math.max(0, Number(item.childCount) || 0)
+    });
+    const normalizeVisualLayer = (item = {}) => ({
+      selector: String(item.selector || '').trim().slice(0, 160),
+      kind: String(item.kind || '').trim().slice(0, 48),
+      width: Math.max(0, Number(item.width) || 0),
+      height: Math.max(0, Number(item.height) || 0),
+      area: Math.max(0, Number(item.area) || 0),
+      opacity: Math.max(0, Number(item.opacity) || 0),
+      zIndex: String(item.zIndex || '').trim().slice(0, 32),
+      flags: Array.isArray(item.flags)
+        ? item.flags.map((flag) => String(flag || '').trim().slice(0, 40)).filter(Boolean).slice(0, 6)
+        : []
+    });
+    const normalizeRisk = (source = {}) => ({
+      transformCount: Math.max(0, Number(source.transformCount) || 0),
+      overflowHiddenCount: Math.max(0, Number(source.overflowHiddenCount) || 0),
+      clipPathCount: Math.max(0, Number(source.clipPathCount) || 0),
+      maskCount: Math.max(0, Number(source.maskCount) || 0),
+      blendModeCount: Math.max(0, Number(source.blendModeCount) || 0),
+      backdropFilterCount: Math.max(0, Number(source.backdropFilterCount) || 0),
+      pseudoElementCount: Math.max(0, Number(source.pseudoElementCount) || 0),
+      pseudoAssetCount: Math.max(0, Number(source.pseudoAssetCount) || 0)
+    });
+
+    return {
+      token: String(report.token || '').trim(),
+      trigger: String(report.trigger || '').trim(),
+      generatedAt: Number(report.generatedAt) || Date.now(),
+      summary: {
+        title: String(summarySource.title || '').trim().slice(0, 160),
+        viewportWidth: Math.max(0, Number(summarySource.viewportWidth) || 0),
+        viewportHeight: Math.max(0, Number(summarySource.viewportHeight) || 0),
+        scrollWidth: Math.max(0, Number(summarySource.scrollWidth) || 0),
+        scrollHeight: Math.max(0, Number(summarySource.scrollHeight) || 0),
+        elementCount: Math.max(0, Number(summarySource.elementCount) || 0),
+        bodyChildCount: Math.max(0, Number(summarySource.bodyChildCount) || 0),
+        absoluteElementCount: Math.max(0, Number(summarySource.absoluteElementCount) || 0),
+        textLength: Math.max(0, Number(summarySource.textLength) || 0),
+        images: normalizeCounter(summarySource.images),
+        cssImages: normalizeCssCounter(summarySource.cssImages),
+        stylesheets: normalizeCounter(summarySource.stylesheets),
+        scripts: normalizeCounter(summarySource.scripts),
+        risk: normalizeRisk(summarySource.risk),
+        roots: Array.isArray(summarySource.roots)
+          ? summarySource.roots.map((item) => normalizeRoot(item)).filter((item) => item.selector).slice(0, 4)
+          : [],
+        visualLayers: Array.isArray(summarySource.visualLayers)
+          ? summarySource.visualLayers.map((item) => normalizeVisualLayer(item)).filter((item) => item.selector).slice(0, 6)
+          : []
+      },
+      issues: Array.isArray(report.issues)
+        ? report.issues.map((issue) => normalizeIssue(issue)).filter((issue) => issue.label).slice(0, 12)
+        : []
+    };
+  }
+
+  buildGeneratedPreviewDiagnosticsSummary(report) {
+    const summary = report?.summary;
+    if (!summary) {
+      return '预览加载后会自动采集资源、脚本和页面结构信息。';
+    }
+
+    const pieces = [];
+    if (summary.scrollWidth > 0 && summary.scrollHeight > 0) {
+      pieces.push(`页面尺寸 ${summary.scrollWidth} × ${summary.scrollHeight}`);
+    } else if (summary.viewportWidth > 0 && summary.viewportHeight > 0) {
+      pieces.push(`视口尺寸 ${summary.viewportWidth} × ${summary.viewportHeight}`);
+    }
+    if (summary.elementCount > 0) {
+      pieces.push(`DOM ${summary.elementCount} 节点`);
+    }
+    if (summary.images.total > 0) {
+      pieces.push(`图片 ${summary.images.loaded}/${summary.images.total}`);
+    }
+    if (summary.cssImages.total > 0) {
+      pieces.push(`CSS装饰 ${summary.cssImages.total}`);
+    }
+    if (summary.stylesheets.total > 0) {
+      pieces.push(`样式 ${summary.stylesheets.loaded}/${summary.stylesheets.total}`);
+    }
+    if (summary.scripts.total > 0) {
+      pieces.push(`脚本 ${summary.scripts.loaded}/${summary.scripts.total}`);
+    }
+    if (summary.absoluteElementCount > 0) {
+      pieces.push(`绝对定位 ${summary.absoluteElementCount}`);
+    }
+    return pieces.join(' · ') || '预览结构已采集，但暂无足够的统计信息。';
+  }
+
+  buildGeneratedPreviewDiagnosticsRiskSummary(summary = null) {
+    const risk = summary?.risk;
+    if (!summary || !risk) return '';
+
+    const parts = [];
+    if (summary.cssImages.total > 0) {
+      const checked = summary.cssImages.loaded + summary.cssImages.failed;
+      const checkedText = checked > 0 ? `，已校验 ${checked}` : '';
+      const failedText = summary.cssImages.failed > 0 ? `，失败 ${summary.cssImages.failed}` : '';
+      parts.push(`CSS 装饰资源 ${summary.cssImages.total}${checkedText}${failedText}`);
+    }
+    if (risk.pseudoElementCount > 0) {
+      parts.push(`伪元素 ${risk.pseudoElementCount}`);
+    }
+    if (risk.maskCount > 0) {
+      parts.push(`mask ${risk.maskCount}`);
+    }
+    if (risk.clipPathCount > 0) {
+      parts.push(`clip-path ${risk.clipPathCount}`);
+    }
+    if (risk.blendModeCount > 0) {
+      parts.push(`blend-mode ${risk.blendModeCount}`);
+    }
+    if (risk.backdropFilterCount > 0) {
+      parts.push(`backdrop-filter ${risk.backdropFilterCount}`);
+    }
+    if (risk.transformCount > 0) {
+      parts.push(`transform ${risk.transformCount}`);
+    }
+    if (risk.overflowHiddenCount > 0) {
+      parts.push(`overflow hidden ${risk.overflowHiddenCount}`);
+    }
+    return parts.join(' · ');
+  }
+
+  buildGeneratedPreviewDiagnosticsItems(report) {
+    if (!report?.summary) {
+      return [{
+        level: 'info',
+        label: '等待诊断',
+        detail: '预览加载完成后，这里会显示资源失败、脚本报错和页面结构摘要。'
+      }];
+    }
+
+    const items = [];
+    items.push({
+      level: 'info',
+      label: '页面概览',
+      detail: this.buildGeneratedPreviewDiagnosticsSummary(report)
+    });
+
+    if (report.summary.roots.length > 0) {
+      const rootSummary = report.summary.roots
+        .map((root) => `${root.selector} (${root.width}×${root.height}，子节点 ${root.childCount})`)
+        .join('；');
+      items.push({
+        level: 'info',
+        label: '首层容器',
+        detail: rootSummary
+      });
+    }
+
+    if (report.summary.visualLayers.length > 0) {
+      const layerSummary = report.summary.visualLayers
+        .map((layer) => {
+          const flags = layer.flags.length ? `，${layer.flags.join('/')}` : '';
+          const zIndex = layer.zIndex ? `，z=${layer.zIndex}` : '';
+          return `${layer.selector} [${layer.kind}] (${layer.width}×${layer.height}${zIndex}${flags})`;
+        })
+        .join('；');
+      items.push({
+        level: 'info',
+        label: '关键视觉层',
+        detail: layerSummary
+      });
+    }
+
+    const riskSummary = this.buildGeneratedPreviewDiagnosticsRiskSummary(report.summary);
+    if (riskSummary) {
+      const hasRiskWarning = Array.isArray(report.issues)
+        ? report.issues.some((issue) => issue.level === 'warn' && /高保真|CSS 装饰|复杂样式/.test(issue.label || issue.detail || ''))
+        : false;
+      items.push({
+        level: hasRiskWarning ? 'warn' : 'info',
+        label: '高保真信号',
+        detail: riskSummary
+      });
+    }
+
+    if (Array.isArray(report.issues) && report.issues.length > 0) {
+      items.push(...report.issues);
+    } else {
+      items.push({
+        level: 'info',
+        label: '未发现明显异常',
+        detail: '当前预览没有检测到基础资源失败或显式脚本错误。若视觉仍异常，优先检查蓝湖导出代码本身的布局策略。'
+      });
+    }
+
+    return items.slice(0, 12);
+  }
+
+  renderGeneratedPreviewDiagnostics() {
+    const state = this.generatedPreviewDiagnostics || this.createInitialGeneratedPreviewDiagnostics();
+    const report = state.report;
+    const hasPreview = Boolean(this.generatedPreviewHtml);
+    const displayState = this.getGeneratedPreviewDiagnosticsDisplayState(state);
+    const items = this.buildGeneratedPreviewDiagnosticsItems(report);
+
+    if (this.generatedDiagnosticsCard) {
+      this.generatedDiagnosticsCard.hidden = !hasPreview && !report && state.status !== 'pending';
+    }
+
+    if (this.generatedDiagnosticsMeta) {
+      this.generatedDiagnosticsMeta.textContent = report
+        ? `最近更新 ${this.formatGeneratedPreviewDiagnosticsTime(state.updatedAt || report.generatedAt)}${state.trigger ? ` · ${state.trigger === 'manual' ? '手动触发' : '自动触发'}` : ''}`
+        : hasPreview
+          ? (state.status === 'pending' ? '正在等待预览页上报诊断信息' : '预览加载后会自动开始采集')
+          : '当前没有可诊断的 HTML 预览';
+    }
+
+    if (this.generatedDiagnosticsStatus) {
+      this.generatedDiagnosticsStatus.dataset.status = displayState.status;
+      this.generatedDiagnosticsStatus.textContent = displayState.label;
+    }
+
+    if (this.generatedDiagnosticsSummary) {
+      this.generatedDiagnosticsSummary.textContent = state.status === 'pending'
+        ? '正在采集当前预览的资源、脚本和布局摘要，请稍候。'
+        : this.buildGeneratedPreviewDiagnosticsSummary(report);
+    }
+
+    if (this.generatedDiagnosticsList) {
+      this.generatedDiagnosticsList.innerHTML = items.map((item) => `
+        <div class="generated-diagnostics-item${item.detail ? '' : ' placeholder'}" data-level="${this.escapeAttr(item.level || 'info')}">
+          <span class="generated-diagnostics-item-label">${this.escapeHtml(item.label || '未命名诊断项')}</span>
+          <span class="generated-diagnostics-item-detail">${this.escapeHtml(item.detail || '')}</span>
+        </div>
+      `).join('');
+    }
+
+    if (this.runDiagnosticsBtn) {
+      this.runDiagnosticsBtn.disabled = !hasPreview || state.status === 'pending';
+      this.runDiagnosticsBtn.title = hasPreview
+        ? (state.status === 'pending' ? '正在采集预览诊断，请稍候' : '重新采集当前预览的诊断信息')
+        : '当前没有可诊断的 HTML 预览';
+    }
+  }
+
+  handleGeneratedPreviewDiagnostics(payload = {}) {
+    const report = this.normalizeGeneratedPreviewDiagnosticsReport(payload);
+    const currentToken = String(this.generatedPreviewDiagnostics?.token || '').trim();
+    if (currentToken && report.token && report.token !== currentToken) {
+      return;
+    }
+
+    this.generatedPreviewDiagnostics = {
+      token: report.token || currentToken,
+      status: 'ready',
+      updatedAt: report.generatedAt || Date.now(),
+      trigger: report.trigger || 'auto',
+      report
+    };
+    this.renderGeneratedPreviewDiagnostics();
+    if (this.getGeneratedPreviewRepairMode() === 'dds') {
+      this.maybeSwitchGeneratedPreviewRepairMode(report);
+    }
+  }
+
+  runGeneratedPreviewDiagnostics() {
+    if (!this.generatedPreviewHtml) {
+      this.showToast('当前没有可诊断的 HTML 预览', 'error');
+      return;
+    }
+
+    const diagnosticsApi = this.htmlPreviewFrame?.contentWindow?.__LANHU_GENERATED_PREVIEW_DIAGNOSTICS__;
+    if (diagnosticsApi && typeof diagnosticsApi.publish === 'function') {
+      this.generatedPreviewDiagnostics = {
+        ...this.generatedPreviewDiagnostics,
+        status: 'pending',
+        updatedAt: Date.now(),
+        trigger: 'manual'
+      };
+      this.renderGeneratedPreviewDiagnostics();
+      diagnosticsApi.publish('manual');
+      return;
+    }
+
+    this.showToast('预览尚未准备好，正在重新加载诊断环境', 'success');
+    this.showHtmlPreview({ revealCodePanel: this.isCodePanelVisible });
+  }
+
+  collectExpectedGeneratedPreviewModules(layerContext, frameMetrics) {
+    if (!layerContext || !Array.isArray(layerContext.layers) || !layerContext.layers.length || !frameMetrics) {
+      return [];
+    }
+
+    const modulePrefixes = new Set();
+    layerContext.layers.forEach((layer) => {
+      if (!layer || layer.visible === false || !layer.has_image) return;
+      const prefix = this.getLayerModulePrefix(layer.path || layer.name || '');
+      if (prefix) {
+        modulePrefixes.add(prefix);
+      }
+    });
+
+    const pageArea = Math.max(1, frameMetrics.width * frameMetrics.height);
+    return Array.from(modulePrefixes)
+      .map((pathPrefix) => {
+        const moduleLayers = layerContext.layers.filter((layer) => {
+          if (!layer || layer.visible === false) return false;
+          const layerPath = String(layer.path || '').trim();
+          return layerPath === pathPrefix || layerPath.startsWith(`${pathPrefix}/`);
+        });
+        if (!moduleLayers.length) return null;
+
+        const imageLayers = moduleLayers.filter((layer) => layer.has_image);
+        if (!imageLayers.length) return null;
+
+        const moduleData = this.extractModuleFromLayers(imageLayers, { pathPrefix });
+        if (!moduleData.bounds || !moduleData.layers.length) return null;
+
+        const imageCount = imageLayers.length;
+        const textCount = moduleLayers.filter((layer) => this.resolveLayerText(layer).trim().length > 0).length;
+        const area = moduleData.bounds.width * moduleData.bounds.height;
+        const areaRatio = area / pageArea;
+
+        if (
+          moduleData.bounds.width < frameMetrics.width * 0.3 &&
+          areaRatio < 0.045
+        ) {
+          return null;
+        }
+        if (moduleData.bounds.top > frameMetrics.height * 0.96) {
+          return null;
+        }
+
+        return {
+          id: pathPrefix,
+          pathPrefix,
+          box: {
+            left: moduleData.bounds.left,
+            top: moduleData.bounds.top,
+            width: moduleData.bounds.width,
+            height: moduleData.bounds.height
+          },
+          area,
+          areaRatio,
+          traits: {
+            imageCount,
+            textCount,
+            hasPrimaryVisual: areaRatio >= 0.08 || moduleData.bounds.width >= frameMetrics.width * 0.72
+          }
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => {
+        const topDiff = a.box.top - b.box.top;
+        if (topDiff !== 0) return topDiff;
+        return b.area - a.area;
+      })
+      .slice(0, 12);
+  }
+
+  collectActualGeneratedPreviewVisuals(frameMetrics) {
+    if (!frameMetrics?.root || !frameMetrics.frameWindow) return [];
+
+    const rootRect = frameMetrics.rootRect;
+    const pageArea = Math.max(1, frameMetrics.width * frameMetrics.height);
+    return Array.from(frameMetrics.root.querySelectorAll('*'))
+      .filter((node) => node instanceof frameMetrics.frameWindow.HTMLElement)
+      .map((node) => {
+        const rect = node.getBoundingClientRect();
+        if (rect.width <= 1 || rect.height <= 1) return null;
+
+        const computed = frameMetrics.frameWindow.getComputedStyle(node);
+        if (!computed || computed.display === 'none' || computed.visibility === 'hidden') return null;
+
+        const opacity = Number.parseFloat(computed.opacity || '1');
+        if (Number.isFinite(opacity) && opacity < 0.08) return null;
+
+        const hasVisual = node.tagName === 'IMG' || (computed.backgroundImage && computed.backgroundImage !== 'none');
+        if (!hasVisual) return null;
+
+        const width = Math.round(rect.width);
+        const height = Math.round(rect.height);
+        const area = width * height;
+        if (
+          width > frameMetrics.width * 1.2 ||
+          area > pageArea * 0.5
+        ) {
+          return null;
+        }
+        if (
+          width < frameMetrics.width * 0.18 &&
+          area < frameMetrics.width * 120
+        ) {
+          return null;
+        }
+
+        return {
+          left: Math.max(0, Math.round(rect.left - rootRect.left)),
+          top: Math.max(0, Math.round(rect.top - rootRect.top)),
+          width,
+          height,
+          area
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.area - a.area)
+      .slice(0, 24);
+  }
+
+  getGeneratedPreviewSizeSimilarity(expectedBox, actualBox) {
+    if (!expectedBox || !actualBox) return 0;
+
+    const widthScore = Math.min(
+      Math.max(1, Number(expectedBox.width) || 0),
+      Math.max(1, Number(actualBox.width) || 0)
+    ) / Math.max(
+      1,
+      Math.max(Number(expectedBox.width) || 0, Number(actualBox.width) || 0)
+    );
+    const heightScore = Math.min(
+      Math.max(1, Number(expectedBox.height) || 0),
+      Math.max(1, Number(actualBox.height) || 0)
+    ) / Math.max(
+      1,
+      Math.max(Number(expectedBox.height) || 0, Number(actualBox.height) || 0)
+    );
+
+    return Math.sqrt(widthScore * heightScore);
+  }
+
+  getGeneratedPreviewCenterScore(expectedBox, actualBox) {
+    if (!expectedBox || !actualBox) return 0;
+
+    const expectedCenterX = (Number(expectedBox.left) || 0) + (Number(expectedBox.width) || 0) / 2;
+    const expectedCenterY = (Number(expectedBox.top) || 0) + (Number(expectedBox.height) || 0) / 2;
+    const actualCenterX = (Number(actualBox.left) || 0) + (Number(actualBox.width) || 0) / 2;
+    const actualCenterY = (Number(actualBox.top) || 0) + (Number(actualBox.height) || 0) / 2;
+    const distance = Math.hypot(expectedCenterX - actualCenterX, expectedCenterY - actualCenterY);
+    const baseline = Math.max(
+      40,
+      Math.hypot(Number(expectedBox.width) || 0, Number(expectedBox.height) || 0) * 0.8
+    );
+
+    return Math.max(0, 1 - distance / baseline);
+  }
+
+  getGeneratedPreviewModuleMatchScore(expectedBox, actualBox) {
+    if (!expectedBox || !actualBox) return 0;
+
+    const left = Math.max(expectedBox.left, actualBox.left);
+    const top = Math.max(expectedBox.top, actualBox.top);
+    const right = Math.min(expectedBox.left + expectedBox.width, actualBox.left + actualBox.width);
+    const bottom = Math.min(expectedBox.top + expectedBox.height, actualBox.top + actualBox.height);
+    if (right <= left || bottom <= top) return 0;
+
+    const overlapArea = (right - left) * (bottom - top);
+    const expectedArea = Math.max(1, expectedBox.width * expectedBox.height);
+    const overlapRatio = overlapArea / expectedArea;
+    const sizeSimilarity = this.getGeneratedPreviewSizeSimilarity(expectedBox, actualBox);
+    const centerScore = this.getGeneratedPreviewCenterScore(expectedBox, actualBox);
+
+    return overlapRatio * 0.55 + sizeSimilarity * 0.25 + centerScore * 0.2;
+  }
+
+  buildGeneratedPreviewRepairReport(report = null) {
+    const design = this.getGeneratedPreviewSourceDesign();
+    const layerContext = this.getGeneratedPreviewLayerContext(design);
+    const frameMetrics = this.getGeneratedPreviewFrameMetrics();
+    if (!design || !layerContext || !frameMetrics) {
+      return null;
+    }
+
+    const expectedModules = this.collectExpectedGeneratedPreviewModules(layerContext, frameMetrics);
+    if (!expectedModules.length) {
+      return null;
+    }
+    const actualVisuals = this.collectActualGeneratedPreviewVisuals(frameMetrics);
+    if (!actualVisuals.length) {
+      return {
+        design,
+        expectedModules: expectedModules.length,
+        actualVisuals: 0,
+        missingModules: expectedModules.slice(0, 6).map((moduleItem) => moduleItem.pathPrefix),
+        missingModuleItems: expectedModules.slice(0, 6),
+        shouldFallback: true,
+        summary: '首屏视觉层为空'
+      };
+    }
+
+    const missingModules = expectedModules
+      .map((moduleItem) => {
+        const bestScore = actualVisuals.reduce((score, visual) => {
+          const nextScore = this.getGeneratedPreviewModuleMatchScore(moduleItem.box, visual);
+          return nextScore > score ? nextScore : score;
+        }, 0);
+
+        return {
+          ...moduleItem,
+          bestScore,
+          matched: bestScore >= 0.72
+        };
+      })
+      .filter((moduleItem) => !moduleItem.matched && moduleItem.traits.hasPrimaryVisual);
+
+    if (!missingModules.length) {
+      return null;
+    }
+
+    const severeMissing = missingModules.filter((moduleItem) => (
+      moduleItem.areaRatio >= 0.08 ||
+      moduleItem.box.width >= frameMetrics.width * 0.72
+    ));
+    const highRiskSignal = (
+      (Number(report?.summary?.cssImages?.total) || 0) >= 24 ||
+      (Number(report?.summary?.risk?.pseudoElementCount) || 0) >= 4 ||
+      (Number(report?.summary?.risk?.overflowHiddenCount) || 0) >= 72
+    );
+    const issueText = Array.isArray(report?.issues)
+      ? report.issues.map((item) => `${item.label || ''} ${item.detail || ''}`).join(' ')
+      : '';
+    const issueIndicatesBrokenPreview = /图片未成功加载|样式表可能未生效|页面高度偏小/.test(issueText);
+    const shouldFallback = (
+      severeMissing.length >= 2 ||
+      (issueIndicatesBrokenPreview && missingModules.length >= 1) ||
+      (highRiskSignal && severeMissing.length >= 1 && missingModules.length >= 2)
+    );
+
+    return {
+      design,
+      expectedModules: expectedModules.length,
+      actualVisuals: actualVisuals.length,
+      missingModules: missingModules.slice(0, 6).map((moduleItem) => moduleItem.pathPrefix),
+      missingModuleItems: missingModules.slice(0, 6),
+      shouldFallback,
+      summary: `缺失模块 ${missingModules.slice(0, 3).map((moduleItem) => moduleItem.pathPrefix.split('/').slice(-1)[0]).join('、')}`
+    };
+  }
+
+  shouldIgnoreGeneratedPreviewModuleForOverlay(moduleItem, frameMetrics) {
+    if (!moduleItem?.box || !frameMetrics) return true;
+
+    const width = Math.max(1, Number(moduleItem.box.width) || 0);
+    const height = Math.max(1, Number(moduleItem.box.height) || 0);
+    const areaRatio = Number(moduleItem.areaRatio) || 0;
+    const nearFullWidth = width >= frameMetrics.width * 0.92;
+    const veryTall = height >= frameMetrics.height * 0.48;
+    const veryThinStrip = nearFullWidth && height <= frameMetrics.height * 0.05;
+
+    if (nearFullWidth && veryTall && areaRatio >= 0.38) {
+      return true;
+    }
+    if (veryThinStrip) {
+      return true;
+    }
+
+    return false;
+  }
+
+  buildGeneratedPreviewModuleOverlayFragment(moduleItem, layerContext) {
+    const pathPrefix = String(moduleItem?.pathPrefix || '').trim();
+    if (!pathPrefix || !layerContext?.layers?.length) {
+      return null;
+    }
+
+    const moduleData = this.extractModuleFromLayers(layerContext.layers, { pathPrefix });
+    if (!moduleData.bounds || !moduleData.layers.length) {
+      return null;
+    }
+
+    const imageLayers = moduleData.layers.filter((layer) => layer?.visible !== false && layer?.has_image && layer?.image);
+    if (!imageLayers.length) {
+      return null;
+    }
+
+    const normalized = this.buildRenderableModuleLayers(imageLayers, {
+      slices: layerContext.slices,
+      targetWidth: moduleData.bounds.width,
+      targetHeight: moduleData.bounds.height,
+      useDirectLayerImages: true
+    });
+    const html = normalized.layers
+      .map((layer, index) => this.renderLayerToHtml(layer, index))
+      .filter(Boolean)
+      .join('');
+
+    if (!html) {
+      return null;
+    }
+
+    return {
+      moduleId: pathPrefix,
+      pathPrefix,
+      box: {
+        left: Math.round(Number(moduleData.bounds.left) || 0),
+        top: Math.round(Number(moduleData.bounds.top) || 0),
+        width: Math.round(Number(normalized.canvasWidth) || Number(moduleData.bounds.width) || 0),
+        height: Math.round(Number(normalized.canvasHeight) || Number(moduleData.bounds.height) || 0)
+      },
+      html
+    };
+  }
+
+  buildGeneratedPreviewModuleFallbackPlan(repairReport, layerContext = this.getGeneratedPreviewLayerContext(repairReport?.design)) {
+    if (!repairReport?.missingModuleItems?.length || !layerContext?.layers?.length) {
+      return [];
+    }
+
+    const frameMetrics = this.getGeneratedPreviewFrameMetrics();
+    return repairReport.missingModuleItems
+      .filter((moduleItem) => !this.shouldIgnoreGeneratedPreviewModuleForOverlay(moduleItem, frameMetrics))
+      .map((moduleItem) => this.buildGeneratedPreviewModuleOverlayFragment(moduleItem, layerContext))
+      .filter(Boolean);
+  }
+
+  maybeSwitchGeneratedPreviewRepairMode(report = null) {
+    if (!this.generatedPreviewHtml || this.getGeneratedPreviewRepairMode() !== 'dds') {
+      return false;
+    }
+
+    const repairReport = this.buildGeneratedPreviewRepairReport(report);
+    if (!repairReport?.shouldFallback) {
+      return false;
+    }
+
+    const layerContext = this.getGeneratedPreviewLayerContext(repairReport.design);
+    const modulePlan = this.buildGeneratedPreviewModuleFallbackPlan(repairReport, layerContext);
+    if (modulePlan.length > 0) {
+      this.generatedPreviewRepairState = {
+        mode: 'module',
+        reason: repairReport.summary,
+        missingModules: repairReport.missingModules,
+        overlayModules: modulePlan,
+        updatedAt: Date.now()
+      };
+      this.log(`检测到 DDS 预览缺失关键模块，已切换 HTML 模块修复预览: ${repairReport.summary}`, 'warn');
+      this.showToast('检测到生成页缺失关键模块，已切换 HTML 模块修复预览');
+      this.showHtmlPreview({ revealCodePanel: this.isCodePanelVisible });
+      return true;
+    }
+
+    const fallbackHtml = this.buildLayerFallbackPreviewHtml(repairReport.design);
+    if (!fallbackHtml) {
+      return false;
+    }
+
+    this.generatedPreviewRepairState = {
+      mode: 'layer',
+      reason: repairReport.summary,
+      missingModules: repairReport.missingModules,
+      overlayModules: [],
+      updatedAt: Date.now()
+    };
+    this.log(`检测到 DDS 预览缺失关键模块，已切换图层兜底预览: ${repairReport.summary}`, 'warn');
+    this.showToast('检测到生成页缺失关键模块，已切换图层兜底预览');
+    this.showHtmlPreview({ revealCodePanel: this.isCodePanelVisible });
+    return true;
+  }
+
+  updateGeneratedCodeMeta() {
+    const fileCount = Array.isArray(this.generatedCodeFiles) ? this.generatedCodeFiles.length : 0;
+    const currentFile = this.getSelectedGeneratedFile();
+    const designName = this.getSelectedDesignDisplayName();
+    const task = this.generatedCodeTask || this.createInitialGeneratedCodeTaskState();
+    const frameworkLabel = this.getGeneratedFrameworkLabel(this.generatedCodeFramework || this.getSelectedGeneratedFramework());
+    const isGenerating = task.status === 'queued' || task.status === 'running';
+    const isFailed = task.status === 'error';
+    const repairMode = this.getGeneratedPreviewRepairMode();
+    const isLayerFallback = repairMode === 'layer';
+    const isModuleFallback = repairMode === 'module';
+    const primaryAction = this.getGeneratedCodePrimaryActionState();
+
+    this.updateDesignPreviewFrameLabel(designName);
+
+    if (this.generatedCodeStatus) {
+      this.generatedCodeStatus.textContent = isGenerating
+        ? `生成中 ${Math.max(0, Number(task.currentStep) || 0)}/${task.totalSteps || 6}`
+        : isFailed
+          ? '生成失败'
+          : fileCount
+            ? '已生成'
+            : '未加载';
+    }
+
+    if (this.generatedCodeSummary) {
+      this.generatedCodeSummary.textContent = isGenerating
+        ? `${task.stepLabel || '正在生成'} · ${task.currentAction || '请稍候'}`
+        : isFailed
+          ? `失败于 ${task.stepLabel || '未知步骤'}：${task.errorMessage || task.currentAction || '未知错误'}`
+          : isModuleFallback
+            ? `已切换为 HTML 模块修复预览，原始 ${frameworkLabel} 代码仍保留在代码面板。`
+          : isLayerFallback
+            ? `已切换为图层兜底预览，原始 ${frameworkLabel} 代码仍保留在代码面板。`
+          : fileCount
+            ? `已生成 ${fileCount} 个 ${frameworkLabel} 文件，可切换查看。`
+            : primaryAction.visible
+              ? `${primaryAction.label}，进度会显示在当前弹窗。`
+              : '当前弹窗可查看代码文件与实时进度。';
+    }
+
+    if (this.generatedCodeFileCount) {
+      this.generatedCodeFileCount.textContent = fileCount
+        ? (currentFile?.name ? `${fileCount} 个文件 · 当前 ${currentFile.name}` : `${fileCount} 个文件`)
+        : isGenerating
+          ? `生成中 · ${Math.max(0, Number(task.currentStep) || 0)}/${task.totalSteps || 6}`
+          : isFailed
+            ? '生成失败'
+            : '暂无文件';
+    }
+
+    if (this.generatedPreviewFrameLabel) {
+      this.generatedPreviewFrameLabel.textContent = fileCount && this.generatedPreviewHtml
+        ? `${designName} · ${isLayerFallback ? '图层兜底预览' : isModuleFallback ? `${frameworkLabel} 修复预览` : `${frameworkLabel} 页面`}`
+        : isGenerating
+          ? `${designName} · ${frameworkLabel} 生成中`
+          : fileCount
+            ? `${designName} · ${frameworkLabel} 代码`
+            : '实时页面预览';
+    }
+
+    if (this.openHtmlInNewTabBtn) {
+      this.openHtmlInNewTabBtn.disabled = !this.generatedPreviewHtml;
+      this.openHtmlInNewTabBtn.title = this.generatedPreviewHtml
+        ? '在新标签页打开当前生成页面'
+        : `${frameworkLabel} 当前没有可直接预览的页面`;
+    }
+
+    if (this.generatedCodePrimaryBtn) {
+      this.generatedCodePrimaryBtn.hidden = !primaryAction.visible;
+      this.generatedCodePrimaryBtn.disabled = primaryAction.disabled;
+      this.generatedCodePrimaryBtn.textContent = primaryAction.label;
+      this.generatedCodePrimaryBtn.title = primaryAction.title;
+    }
+
+    this.renderGeneratedPreviewDiagnostics();
+    this.updateGeneratedCodePanelToggleButton();
+  }
+
+  getGeneratedCodePrimaryActionState() {
+    const design = this.getSelectedDesign();
+    const targetFramework = this.getSelectedGeneratedFramework();
+    const frameworkLabel = this.getGeneratedFrameworkLabel(targetFramework);
+    const taskStatus = String(this.generatedCodeTask?.status || 'idle').trim() || 'idle';
+    const hasLoadedCode = this.hasGeneratedCodeForCurrentDesign();
+    const hasCachedCode = Boolean(design && this.getGeneratedCodeCache(design, targetFramework));
+    const resumableJob = design ? this.getGeneratedCodeJobCache(design, targetFramework) : null;
+
+    if (!design) {
+      return {
+        visible: true,
+        disabled: true,
+        label: '请选择设计图',
+        title: '请先选择设计图'
+      };
+    }
+
+    if (this.isGeneratingHtmlPreview || ['queued', 'running'].includes(taskStatus)) {
+      return {
+        visible: true,
+        disabled: true,
+        label: '生成中...',
+        title: `正在读取 ${frameworkLabel} 代码`
+      };
+    }
+
+    if (hasLoadedCode) {
+      return {
+        visible: false,
+        disabled: false,
+        label: '',
+        title: ''
+      };
+    }
+
+    if (hasCachedCode) {
+      return {
+        visible: true,
+        disabled: false,
+        label: `打开已缓存${frameworkLabel}代码`,
+        title: `从本地缓存恢复 ${frameworkLabel} 代码`
+      };
+    }
+
+    if (resumableJob && resumableJob.task?.status !== 'error') {
+      return {
+        visible: true,
+        disabled: false,
+        label: `继续同步${frameworkLabel}进度`,
+        title: `继续同步 ${frameworkLabel} 代码生成进度`
+      };
+    }
+
+    if (taskStatus === 'error') {
+      return {
+        visible: true,
+        disabled: false,
+        label: `重新生成${frameworkLabel}代码`,
+        title: `重新读取蓝湖 ${frameworkLabel} 代码`
+      };
+    }
+
+    return {
+      visible: true,
+      disabled: false,
+      label: `开始生成${frameworkLabel}代码`,
+      title: `读取蓝湖 ${frameworkLabel} 代码`
+    };
+  }
+
+  handleGeneratedCodePrimaryAction() {
+    const actionState = this.getGeneratedCodePrimaryActionState();
+    if (actionState.disabled) {
+      return;
+    }
+    this.generateHtmlPreview();
+  }
+
+  getSelectedGeneratedFile() {
+    if (!Array.isArray(this.generatedCodeFiles) || this.generatedCodeFiles.length === 0) {
+      return null;
+    }
+
+    const preferredName = String(this.generatedCodeFileName || '').trim();
+    if (preferredName) {
+      const matched = this.generatedCodeFiles.find((file) => file.name === preferredName);
+      if (matched) return matched;
+    }
+
+    return this.generatedCodeFiles[0];
+  }
+
+  refreshGeneratedCodeOutput() {
+    const currentFile = this.getSelectedGeneratedFile();
+    this.generatedHtmlCode = currentFile?.content || '';
+
+    if (this.generatedCodeFileSelect) {
+      this.generatedCodeFileSelect.innerHTML = this.generatedCodeFiles.map((file) => {
+        const selected = file.name === currentFile?.name ? ' selected' : '';
+        return `<option value="${this.escapeAttr(file.name)}"${selected}>${this.escapeHtml(file.name)}</option>`;
+      }).join('');
+      this.generatedCodeFileSelect.disabled = this.generatedCodeFiles.length <= 1;
+    }
+
+    if (this.htmlCodeOutput) {
+      this.htmlCodeOutput.value = this.generatedHtmlCode;
+      this.htmlCodeOutput.scrollTop = 0;
+    }
+
+    this.updateGeneratedCodeMeta();
+  }
+
+  handleGeneratedCodeFileChange() {
+    if (!this.generatedCodeFileSelect) return;
+    this.generatedCodeFileName = this.generatedCodeFileSelect.value || '';
+    this.refreshGeneratedCodeOutput();
+  }
+
+  ensureGeneratedPreviewViewport() {
+    if (!this.htmlPreviewFrame) return;
+
+    const shell = this.htmlPreviewFrame.closest('.generated-preview-shell');
+    if (!shell) return;
+
+    let stage = shell.querySelector('.generated-preview-frame-stage');
+    if (!stage) {
+      stage = document.createElement('div');
+      stage.className = 'generated-preview-frame-stage';
+      shell.appendChild(stage);
+    }
+
+    let wrap = stage.querySelector('.generated-preview-frame-wrap');
+    if (!wrap) {
+      wrap = document.createElement('div');
+      wrap.className = 'generated-preview-frame-wrap';
+      stage.appendChild(wrap);
+    }
+
+    if (this.htmlPreviewFrame.parentElement !== wrap) {
+      wrap.appendChild(this.htmlPreviewFrame);
+    }
+
+    this.generatedPreviewFrameStage = stage;
+    this.generatedPreviewFrameWrap = wrap;
+  }
+
+  clearGeneratedPreviewFitTimers() {
+    if (this.generatedPreviewFitTimer) {
+      clearTimeout(this.generatedPreviewFitTimer);
+      this.generatedPreviewFitTimer = null;
+    }
+    if (this.generatedPreviewFitRaf) {
+      cancelAnimationFrame(this.generatedPreviewFitRaf);
+      this.generatedPreviewFitRaf = 0;
+    }
+    if (Array.isArray(this.generatedPreviewLoadTimers) && this.generatedPreviewLoadTimers.length > 0) {
+      this.generatedPreviewLoadTimers.forEach((timerId) => clearTimeout(timerId));
+      this.generatedPreviewLoadTimers = [];
+    }
+  }
+
+  getGeneratedPreviewContentMetrics() {
+    if (!this.htmlPreviewFrame) return null;
+
+    const frameWindow = this.htmlPreviewFrame.contentWindow;
+    const frameDocument = this.htmlPreviewFrame.contentDocument;
+    const docEl = frameDocument?.documentElement;
+    const body = frameDocument?.body;
+    const previewRoot = body?.firstElementChild instanceof frameWindow?.HTMLElement
+      ? body.firstElementChild
+      : null;
+
+    if (!frameWindow || !docEl || !body) {
+      return null;
+    }
+
+    const rootWidthCandidates = previewRoot
+      ? [
+          previewRoot.offsetWidth,
+          previewRoot.clientWidth,
+          Math.round(previewRoot.getBoundingClientRect().width || 0)
+        ]
+      : [];
+
+    const rootHeightCandidates = previewRoot
+      ? [
+          previewRoot.offsetHeight,
+          previewRoot.clientHeight,
+          Math.round(previewRoot.getBoundingClientRect().height || 0)
+        ]
+      : [];
+
+    const candidatesWidth = [
+      body.offsetWidth,
+      body.clientWidth,
+      docEl.offsetWidth,
+      docEl.clientWidth,
+      Math.round(body.getBoundingClientRect().width || 0),
+      Math.round(docEl.getBoundingClientRect().width || 0),
+      Math.round(frameWindow.innerWidth || 0),
+      ...rootWidthCandidates
+    ].filter((value) => Number.isFinite(value) && value > 0);
+
+    const candidatesHeight = [
+      body.scrollHeight,
+      body.offsetHeight,
+      body.clientHeight,
+      docEl.scrollHeight,
+      docEl.offsetHeight,
+      docEl.clientHeight,
+      Math.round(body.getBoundingClientRect().height || 0),
+      Math.round(docEl.getBoundingClientRect().height || 0),
+      ...rootHeightCandidates
+    ].filter((value) => Number.isFinite(value) && value > 0);
+
+    if (!candidatesWidth.length || !candidatesHeight.length) {
+      return null;
+    }
+
+    return {
+      width: Math.max(...(rootWidthCandidates.length ? rootWidthCandidates : candidatesWidth)),
+      height: Math.max(...(rootHeightCandidates.length ? rootHeightCandidates : candidatesHeight))
+    };
+  }
+
+  fitGeneratedPreviewToViewport() {
+    this.ensureGeneratedPreviewViewport();
+    if (!this.htmlPreviewFrame || !this.generatedPreviewFrameStage || !this.generatedPreviewFrameWrap) return;
+    if (!this.generatedPreviewHtml) return;
+
+    const stageRect = this.generatedPreviewFrameStage.getBoundingClientRect();
+    if (stageRect.width <= 0 || stageRect.height <= 0) return;
+
+    const metrics = this.getGeneratedPreviewContentMetrics();
+    if (!metrics || metrics.width <= 0 || metrics.height <= 0) return;
+
+    // Keep the iframe's internal viewport at the page's own dimensions and only
+    // scale the rendered surface. DDS pages rely heavily on absolute positioning,
+    // fixed elements, and viewport units, so shrinking the internal viewport
+    // itself causes false layout regressions.
+    const scale = Math.min(1, stageRect.width / metrics.width);
+    const safeScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
+    const scaledWidth = Math.max(1, Math.round(metrics.width * safeScale));
+    const scaledHeight = Math.max(1, Math.round(metrics.height * safeScale));
+
+    this.generatedPreviewFrameWrap.style.width = `${scaledWidth}px`;
+    this.generatedPreviewFrameWrap.style.height = `${scaledHeight}px`;
+
+    this.htmlPreviewFrame.style.width = `${metrics.width}px`;
+    this.htmlPreviewFrame.style.height = `${metrics.height}px`;
+    this.htmlPreviewFrame.style.transformOrigin = 'top left';
+    this.htmlPreviewFrame.style.transform = safeScale >= 0.999 ? 'none' : `scale(${safeScale})`;
+  }
+
+  queueGeneratedPreviewFit(delay = 0) {
+    this.clearGeneratedPreviewFitTimers();
+    const run = () => {
+      this.generatedPreviewFitRaf = requestAnimationFrame(() => {
+        this.generatedPreviewFitRaf = 0;
+        this.fitGeneratedPreviewToViewport();
+      });
+    };
+
+    if (delay > 0) {
+      this.generatedPreviewFitTimer = setTimeout(() => {
+        this.generatedPreviewFitTimer = null;
+        run();
+      }, delay);
+      return;
+    }
+
+    run();
+  }
+
+  scheduleGeneratedPreviewRefitSequence() {
+    this.queueGeneratedPreviewFit();
+    const followUpDelays = [80, 220, 500, 1200];
+    this.generatedPreviewLoadTimers = followUpDelays.map((delay) => setTimeout(() => {
+      this.fitGeneratedPreviewToViewport();
+    }, delay));
+  }
+
+  buildGeneratedPreviewDiagnosticsBootstrapScript(token) {
+    const serializedToken = JSON.stringify(String(token || ''));
+    return `<script>
+(() => {
+  const token = ${serializedToken};
+  const MAX_ITEMS = 12;
+  const MAX_CSS_ASSET_SAMPLES = 120;
+  const trackedNodes = new WeakSet();
+  const errorKeys = new Set();
+  const state = { resourceErrors: [], runtimeErrors: [] };
+  let publishTimer = null;
+  let publishVersion = 0;
+
+  const clip = (value, max = 220) => {
+    const normalized = String(value || '').replace(/\\s+/g, ' ').trim();
+    if (!normalized) return '';
+    return normalized.length > max ? normalized.slice(0, max - 1) + '…' : normalized;
+  };
+
+  const toNumber = (value) => {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? Math.max(0, Math.round(numeric)) : 0;
+  };
+
+  const normalizeUrl = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    try {
+      return new URL(raw, window.location.href).toString();
+    } catch (error) {
+      return raw;
+    }
+  };
+
+  const hasMeaningfulVisualValue = (value) => {
+    const normalized = String(value || '').trim().toLowerCase();
+    return Boolean(
+      normalized &&
+      normalized !== 'none' &&
+      normalized !== 'normal' &&
+      normalized !== 'auto' &&
+      normalized !== 'initial' &&
+      normalized !== 'unset'
+    );
+  };
+
+  const getSelector = (node) => {
+    if (!node || !node.tagName) return 'unknown';
+    const tag = node.tagName.toLowerCase();
+    const id = node.id ? '#' + clip(node.id, 48) : '';
+    const className = typeof node.className === 'string'
+      ? node.className.trim().split(/\\s+/).filter(Boolean).slice(0, 2).map((item) => '.' + clip(item, 24)).join('')
+      : '';
+    return clip(tag + id + className, 96) || tag;
+  };
+
+  const pushRuntimeError = (label, detail) => {
+    const normalizedDetail = clip(detail, 360);
+    const key = label + '::' + normalizedDetail;
+    if (errorKeys.has(key)) return;
+    errorKeys.add(key);
+    state.runtimeErrors.push({ level: 'error', label, detail: normalizedDetail });
+    if (state.runtimeErrors.length > MAX_ITEMS) state.runtimeErrors.length = MAX_ITEMS;
+  };
+
+  const pushResourceError = (label, detail) => {
+    const normalizedDetail = clip(detail, 360);
+    const key = label + '::' + normalizedDetail;
+    if (errorKeys.has(key)) return;
+    errorKeys.add(key);
+    state.resourceErrors.push({ level: 'error', label, detail: normalizedDetail });
+    if (state.resourceErrors.length > MAX_ITEMS) state.resourceErrors.length = MAX_ITEMS;
+  };
+
+  const markNodeState = (node, status, reason = '') => {
+    if (!node || !node.dataset) return;
+    node.dataset.lhDiagState = status;
+    if (status !== 'error') return;
+    const tag = node.tagName ? node.tagName.toLowerCase() : 'resource';
+    const rawUrl = tag === 'link'
+      ? (node.href || node.getAttribute('href') || '')
+      : (node.currentSrc || node.src || node.getAttribute('src') || '');
+    const url = normalizeUrl(rawUrl);
+    const selector = getSelector(node);
+    const detail = [selector, url].filter(Boolean).join(' -> ');
+    pushResourceError(tag + ' 资源加载失败', detail + (reason ? ' (' + clip(reason, 120) + ')' : ''));
+  };
+
+  const inspectNode = (node) => {
+    if (!node || trackedNodes.has(node) || !node.tagName) return;
+    const tag = node.tagName.toLowerCase();
+    if (tag !== 'img' && tag !== 'script' && !(tag === 'link' && /stylesheet/i.test(String(node.rel || '')))) return;
+
+    trackedNodes.add(node);
+    node.addEventListener('load', () => {
+      markNodeState(node, 'loaded');
+      schedulePublish('resource-load', 60);
+    }, { once: true });
+    node.addEventListener('error', () => {
+      markNodeState(node, 'error');
+      schedulePublish('resource-error', 0);
+    }, { once: true });
+
+    if (tag === 'img' && node.complete) {
+      markNodeState(node, node.naturalWidth > 0 ? 'loaded' : 'error', node.naturalWidth > 0 ? '' : '图片尺寸为 0');
+    }
+    if (tag === 'link' && node.sheet) {
+      markNodeState(node, 'loaded');
+    }
+  };
+
+  const inspectTree = (root = document) => {
+    if (root && root.matches) inspectNode(root);
+    if (!root || !root.querySelectorAll) return;
+    root.querySelectorAll('img,script[src],link[rel~=stylesheet]').forEach((node) => inspectNode(node));
+  };
+
+  const countResources = (nodes, kind) => {
+    const list = Array.from(nodes || []).filter((node) => {
+      if (!node || !node.tagName) return false;
+      if (kind === 'stylesheets') return node.tagName.toLowerCase() === 'link' && /stylesheet/i.test(String(node.rel || ''));
+      if (kind === 'scripts') return node.tagName.toLowerCase() === 'script' && Boolean(node.src || node.getAttribute('src'));
+      return node.tagName.toLowerCase() === 'img';
+    });
+    const failed = list.filter((node) => node.dataset && node.dataset.lhDiagState === 'error').length;
+    const loaded = kind === 'images'
+      ? list.filter((node) => node.complete && node.naturalWidth > 0).length
+      : list.filter((node) => node.dataset && node.dataset.lhDiagState === 'loaded').length;
+    const pending = Math.max(0, list.length - loaded - failed);
+    return { total: list.length, loaded, failed, pending };
+  };
+
+  const collectRoots = () => Array.from(document.body ? document.body.children : [])
+    .slice(0, 4)
+    .map((node) => ({
+      selector: getSelector(node),
+      width: toNumber(node.getBoundingClientRect ? node.getBoundingClientRect().width : 0),
+      height: toNumber(node.getBoundingClientRect ? node.getBoundingClientRect().height : 0),
+      childCount: toNumber(node.childElementCount || 0)
+    }))
+    .filter((item) => item.selector);
+
+  const extractCssUrls = (value) => {
+    const urls = [];
+    String(value || '').replace(/url\\(\\s*(['"]?)(.*?)\\1\\s*\\)/gi, (match, quote, rawValue) => {
+      const normalized = normalizeUrl(rawValue);
+      if (normalized && !/^data:/i.test(normalized) && normalized !== 'about:blank') {
+        urls.push(normalized);
+      }
+      return match;
+    });
+    return Array.from(new Set(urls));
+  };
+
+  const addCssAsset = (assetMap, url, source) => {
+    if (!url) return;
+    if (!assetMap.has(url)) {
+      assetMap.set(url, { url, sources: [] });
+    }
+    const entry = assetMap.get(url);
+    if (source && entry.sources.length < 3 && !entry.sources.includes(source)) {
+      entry.sources.push(source);
+    }
+  };
+
+  const collectCssUrlsFromStyle = (style) => {
+    if (!style) return [];
+    const urls = [];
+    [
+      style.backgroundImage,
+      style.borderImageSource,
+      style.maskImage,
+      style.webkitMaskImage,
+      style.WebkitMaskImage
+    ].forEach((value) => {
+      extractCssUrls(value).forEach((url) => urls.push(url));
+    });
+    return Array.from(new Set(urls));
+  };
+
+  const collectStyleDiagnostics = (allElements) => {
+    const cssAssetMap = new Map();
+    const risk = {
+      transformCount: 0,
+      overflowHiddenCount: 0,
+      clipPathCount: 0,
+      maskCount: 0,
+      blendModeCount: 0,
+      backdropFilterCount: 0,
+      pseudoElementCount: 0,
+      pseudoAssetCount: 0
+    };
+
+    allElements.forEach((node) => {
+      let computed = null;
+      try {
+        computed = window.getComputedStyle(node);
+      } catch (error) {
+        computed = null;
+      }
+      if (!computed) return;
+
+      const selector = getSelector(node);
+      if (computed.transform && computed.transform !== 'none') {
+        risk.transformCount += 1;
+      }
+      if (
+        computed.overflowX === 'hidden' ||
+        computed.overflowY === 'hidden' ||
+        computed.overflowX === 'clip' ||
+        computed.overflowY === 'clip'
+      ) {
+        risk.overflowHiddenCount += 1;
+      }
+      if (hasMeaningfulVisualValue(computed.clipPath)) {
+        risk.clipPathCount += 1;
+      }
+      const maskImage = computed.maskImage || computed.webkitMaskImage || computed.WebkitMaskImage || '';
+      if (hasMeaningfulVisualValue(maskImage)) {
+        risk.maskCount += 1;
+      }
+      if (hasMeaningfulVisualValue(computed.mixBlendMode) && computed.mixBlendMode !== 'normal') {
+        risk.blendModeCount += 1;
+      }
+      const backdropFilter = computed.backdropFilter || computed.webkitBackdropFilter || computed.WebkitBackdropFilter || '';
+      if (hasMeaningfulVisualValue(backdropFilter)) {
+        risk.backdropFilterCount += 1;
+      }
+
+      collectCssUrlsFromStyle(computed).forEach((url) => addCssAsset(cssAssetMap, url, selector));
+
+      ['::before', '::after'].forEach((pseudoName) => {
+        let pseudo = null;
+        try {
+          pseudo = window.getComputedStyle(node, pseudoName);
+        } catch (error) {
+          pseudo = null;
+        }
+        if (!pseudo) return;
+
+        const pseudoSelector = selector + pseudoName;
+        const pseudoUrls = collectCssUrlsFromStyle(pseudo);
+        const pseudoContent = String(pseudo.content || '').trim();
+        const pseudoWidth = parseFloat(pseudo.width) || 0;
+        const pseudoHeight = parseFloat(pseudo.height) || 0;
+        const hasPseudo = (
+          (pseudoContent && pseudoContent !== 'none' && pseudoContent !== 'normal') ||
+          pseudoUrls.length > 0 ||
+          ((pseudoWidth > 0 || pseudoHeight > 0) && pseudo.display !== 'none')
+        );
+
+        if (hasPseudo) {
+          risk.pseudoElementCount += 1;
+        }
+        if (pseudoUrls.length > 0) {
+          risk.pseudoAssetCount += pseudoUrls.length;
+          pseudoUrls.forEach((url) => addCssAsset(cssAssetMap, url, pseudoSelector));
+        }
+        if (hasMeaningfulVisualValue(pseudo.clipPath)) {
+          risk.clipPathCount += 1;
+        }
+        const pseudoMask = pseudo.maskImage || pseudo.webkitMaskImage || pseudo.WebkitMaskImage || '';
+        if (hasMeaningfulVisualValue(pseudoMask)) {
+          risk.maskCount += 1;
+        }
+        if (hasMeaningfulVisualValue(pseudo.mixBlendMode) && pseudo.mixBlendMode !== 'normal') {
+          risk.blendModeCount += 1;
+        }
+        const pseudoBackdropFilter = pseudo.backdropFilter || pseudo.webkitBackdropFilter || pseudo.WebkitBackdropFilter || '';
+        if (hasMeaningfulVisualValue(pseudoBackdropFilter)) {
+          risk.backdropFilterCount += 1;
+        }
+        if (pseudo.transform && pseudo.transform !== 'none') {
+          risk.transformCount += 1;
+        }
+      });
+    });
+
+    return { cssAssetMap, risk };
+  };
+
+  const collectVisualLayers = (allElements) => {
+    const layers = [];
+    const pushLayer = ({ selector, kind, width, height, opacity, zIndex, flags }) => {
+      const safeWidth = toNumber(width);
+      const safeHeight = toNumber(height);
+      const area = safeWidth * safeHeight;
+      if (!selector || area <= 0) return;
+      layers.push({
+        selector,
+        kind,
+        width: safeWidth,
+        height: safeHeight,
+        area,
+        opacity: Number.isFinite(Number(opacity)) ? Number(opacity) : 1,
+        zIndex: String(zIndex || '').trim(),
+        flags: Array.isArray(flags) ? flags.filter(Boolean).slice(0, 6) : []
+      });
+    };
+
+    allElements.forEach((node) => {
+      let computed = null;
+      let rect = null;
+      try {
+        computed = window.getComputedStyle(node);
+        rect = node.getBoundingClientRect();
+      } catch (error) {
+        computed = null;
+        rect = null;
+      }
+      if (!computed || !rect) return;
+
+      const selector = getSelector(node);
+      const width = rect.width || parseFloat(computed.width) || 0;
+      const height = rect.height || parseFloat(computed.height) || 0;
+      const opacity = parseFloat(computed.opacity);
+      const flags = [];
+      if (computed.display === 'none') flags.push('display-none');
+      if (computed.visibility === 'hidden') flags.push('hidden');
+      if (Number.isFinite(opacity) && opacity < 0.08) flags.push('low-opacity');
+      if (rect.bottom <= 0 || rect.top >= (window.innerHeight || 0)) flags.push('offscreen');
+
+      const tagName = node.tagName ? node.tagName.toLowerCase() : '';
+      if (tagName === 'img') {
+        pushLayer({
+          selector,
+          kind: 'img',
+          width,
+          height,
+          opacity,
+          zIndex: computed.zIndex,
+          flags
+        });
+      }
+
+      const cssUrls = collectCssUrlsFromStyle(computed);
+      if (cssUrls.length > 0) {
+        pushLayer({
+          selector,
+          kind: 'css-bg',
+          width,
+          height,
+          opacity,
+          zIndex: computed.zIndex,
+          flags
+        });
+      }
+
+      ['::before', '::after'].forEach((pseudoName) => {
+        let pseudo = null;
+        try {
+          pseudo = window.getComputedStyle(node, pseudoName);
+        } catch (error) {
+          pseudo = null;
+        }
+        if (!pseudo) return;
+
+        const pseudoUrls = collectCssUrlsFromStyle(pseudo);
+        const pseudoContent = String(pseudo.content || '').trim();
+        const pseudoWidth = parseFloat(pseudo.width) || width;
+        const pseudoHeight = parseFloat(pseudo.height) || height;
+        const hasPseudoLayer = pseudoUrls.length > 0 || (pseudoContent && pseudoContent !== 'none' && pseudoContent !== 'normal');
+        if (!hasPseudoLayer) return;
+
+        const pseudoFlags = [];
+        const pseudoOpacity = parseFloat(pseudo.opacity);
+        if (pseudo.display === 'none') pseudoFlags.push('display-none');
+        if (pseudo.visibility === 'hidden') pseudoFlags.push('hidden');
+        if (Number.isFinite(pseudoOpacity) && pseudoOpacity < 0.08) pseudoFlags.push('low-opacity');
+        if (rect.bottom <= 0 || rect.top >= (window.innerHeight || 0)) pseudoFlags.push('offscreen');
+
+        pushLayer({
+          selector: selector + pseudoName,
+          kind: pseudoUrls.length > 0 ? 'pseudo-bg' : 'pseudo',
+          width: pseudoWidth,
+          height: pseudoHeight,
+          opacity: pseudoOpacity,
+          zIndex: pseudo.zIndex,
+          flags: pseudoFlags
+        });
+      });
+    });
+
+    return layers
+      .sort((a, b) => {
+        if (b.area !== a.area) return b.area - a.area;
+        return (Number(b.opacity) || 0) - (Number(a.opacity) || 0);
+      })
+      .slice(0, 6);
+  };
+
+  const summarizeCssAssetEntry = (entry) => {
+    const sourceText = entry.sources && entry.sources.length ? ' @ ' + entry.sources.join(' | ') : '';
+    return clip(entry.url + sourceText, 220);
+  };
+
+  const probeCssAsset = (entry) => new Promise((resolve) => {
+    const image = new Image();
+    let settled = false;
+    const timer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({ status: 'timeout', entry });
+    }, 4000);
+
+    const finalize = (status) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      resolve({ status, entry });
+    };
+
+    image.onload = () => finalize(image.naturalWidth > 0 ? 'loaded' : 'failed');
+    image.onerror = () => finalize('failed');
+
+    try {
+      image.decoding = 'async';
+      image.src = entry.url;
+      if (image.complete) {
+        finalize(image.naturalWidth > 0 ? 'loaded' : 'failed');
+      }
+    } catch (error) {
+      finalize('failed');
+    }
+  });
+
+  const probeCssAssets = async (assetMap) => {
+    const entries = Array.from(assetMap.values());
+    const sampledEntries = entries.slice(0, MAX_CSS_ASSET_SAMPLES);
+
+    if (!sampledEntries.length) {
+      return {
+        total: 0,
+        loaded: 0,
+        failed: 0,
+        pending: 0,
+        sampled: 0,
+        failedSamples: []
+      };
+    }
+
+    const results = await Promise.all(sampledEntries.map((entry) => probeCssAsset(entry)));
+    let loaded = 0;
+    let failed = 0;
+    const failedSamples = [];
+
+    results.forEach(({ status, entry }) => {
+      if (status === 'loaded') {
+        loaded += 1;
+        return;
+      }
+
+      failed += 1;
+      const summary = summarizeCssAssetEntry(entry);
+      if (failedSamples.length < 4) {
+        failedSamples.push(summary);
+      }
+      pushResourceError('CSS 装饰资源加载失败', summary);
+    });
+
+    return {
+      total: entries.length,
+      loaded,
+      failed,
+      pending: Math.max(0, entries.length - sampledEntries.length),
+      sampled: sampledEntries.length,
+      failedSamples
+    };
+  };
+
+  const collectSummary = async () => {
+    const allElements = Array.from(document.getElementsByTagName('*'));
+    const absoluteElementCount = allElements.reduce((count, node) => {
+      try {
+        const position = window.getComputedStyle(node).position;
+        return count + ((position === 'absolute' || position === 'fixed') ? 1 : 0);
+      } catch (error) {
+        return count;
+      }
+    }, 0);
+    const bodyText = document.body && typeof document.body.innerText === 'string'
+      ? document.body.innerText.replace(/\\s+/g, ' ').trim()
+      : '';
+    const { cssAssetMap, risk } = collectStyleDiagnostics(allElements);
+    const visualLayers = collectVisualLayers(allElements);
+    const cssImages = await probeCssAssets(cssAssetMap);
+
+    return {
+      title: clip(document.title || '', 120),
+      viewportWidth: toNumber(window.innerWidth || document.documentElement.clientWidth || 0),
+      viewportHeight: toNumber(window.innerHeight || document.documentElement.clientHeight || 0),
+      scrollWidth: toNumber(Math.max(document.documentElement.scrollWidth || 0, document.body ? document.body.scrollWidth || 0 : 0)),
+      scrollHeight: toNumber(Math.max(document.documentElement.scrollHeight || 0, document.body ? document.body.scrollHeight || 0 : 0)),
+      elementCount: toNumber(allElements.length),
+      bodyChildCount: toNumber(document.body ? document.body.children.length : 0),
+      absoluteElementCount: toNumber(absoluteElementCount),
+      textLength: toNumber(bodyText.length),
+      images: countResources(document.images || [], 'images'),
+      cssImages,
+      stylesheets: countResources(document.querySelectorAll('link[rel~=stylesheet]'), 'stylesheets'),
+      scripts: countResources(document.querySelectorAll('script[src]'), 'scripts'),
+      risk,
+      visualLayers,
+      roots: collectRoots()
+    };
+  };
+
+  const buildIssues = (summary) => {
+    const issues = [];
+    state.resourceErrors.forEach((item) => issues.push(item));
+    state.runtimeErrors.forEach((item) => issues.push(item));
+
+    if (summary.images.total > 0 && summary.images.loaded === 0) {
+      issues.push({ level: 'warn', label: '图片未成功加载', detail: '当前检测到 ' + summary.images.total + ' 张图片，但全部未加载成功。' });
+    }
+    if (summary.stylesheets.total > 0 && summary.stylesheets.loaded === 0) {
+      issues.push({ level: 'warn', label: '样式表可能未生效', detail: '检测到外链样式表，但没有任何一份样式表确认加载成功。' });
+    }
+    if (summary.cssImages.failed > 0) {
+      const sampleText = summary.cssImages.failedSamples.length
+        ? ' 样本：' + summary.cssImages.failedSamples.join('；')
+        : '';
+      issues.push({
+        level: 'error',
+        label: 'CSS 装饰资源加载失败',
+        detail: '检测到 ' + summary.cssImages.failed + ' 个 CSS 背景或蒙版资源加载失败。' + sampleText
+      });
+    } else if (summary.cssImages.total > 0 && summary.cssImages.pending > 0) {
+      issues.push({
+        level: 'info',
+        label: 'CSS 装饰资源为抽样诊断',
+        detail: '当前识别到 ' + summary.cssImages.total + ' 个 CSS 装饰资源，本次校验了 ' + summary.cssImages.sampled + ' 个。'
+      });
+    }
+
+    const riskSignals = [];
+    if (summary.cssImages.total >= 8) {
+      riskSignals.push('CSS 装饰资源 ' + summary.cssImages.total + ' 个');
+    }
+    if (summary.risk.pseudoElementCount >= 6) {
+      riskSignals.push('伪元素 ' + summary.risk.pseudoElementCount + ' 个');
+    }
+    if (summary.risk.maskCount > 0) {
+      riskSignals.push('mask ' + summary.risk.maskCount + ' 处');
+    }
+    if (summary.risk.clipPathCount > 0) {
+      riskSignals.push('clip-path ' + summary.risk.clipPathCount + ' 处');
+    }
+    if (summary.risk.blendModeCount > 0) {
+      riskSignals.push('blend-mode ' + summary.risk.blendModeCount + ' 处');
+    }
+    if (summary.risk.backdropFilterCount > 0) {
+      riskSignals.push('backdrop-filter ' + summary.risk.backdropFilterCount + ' 处');
+    }
+    if (summary.risk.transformCount >= 12) {
+      riskSignals.push('transform ' + summary.risk.transformCount + ' 处');
+    }
+    if (summary.risk.overflowHiddenCount >= 12) {
+      riskSignals.push('overflow hidden ' + summary.risk.overflowHiddenCount + ' 处');
+    }
+    if (riskSignals.length > 0) {
+      issues.push({
+        level: 'warn',
+        label: '存在高保真风险',
+        detail: '页面命中 ' + riskSignals.join('、') + '，即使基础资源加载成功，仍可能因为蓝湖导出的布局语义导致装饰层缺失或错位。'
+      });
+    }
+
+    const suspiciousVisualLayers = Array.isArray(summary.visualLayers)
+      ? summary.visualLayers.filter((layer) => Array.isArray(layer.flags) && layer.flags.length > 0)
+      : [];
+    if (suspiciousVisualLayers.length > 0) {
+      const details = suspiciousVisualLayers
+        .slice(0, 3)
+        .map((layer) => layer.selector + ' [' + layer.kind + '] ' + layer.flags.join('/'))
+        .join('；');
+      issues.push({
+        level: 'info',
+        label: '关键视觉层需人工确认',
+        detail: details + '。这些层已存在但状态可疑，可能是透明、被裁切或不在首屏区域。'
+      });
+    }
+
+    if (summary.scrollHeight > 0 && summary.viewportHeight > 0 && summary.scrollHeight < Math.max(320, Math.round(summary.viewportHeight * 0.6))) {
+      issues.push({ level: 'warn', label: '页面高度偏小', detail: 'scrollHeight=' + summary.scrollHeight + '，可能主内容没有正常渲染。' });
+    }
+    if (summary.elementCount > 0 && summary.elementCount < 20) {
+      issues.push({ level: 'info', label: 'DOM 结构较少', detail: '当前仅检测到 ' + summary.elementCount + ' 个元素，页面可能只渲染了壳层。' });
+    }
+    const firstRoot = summary.roots && summary.roots[0];
+    if (firstRoot && firstRoot.height <= 8) {
+      issues.push({ level: 'warn', label: '首层容器高度异常', detail: firstRoot.selector + ' 高度仅 ' + firstRoot.height + 'px。' });
+    }
+
+    return issues.slice(0, MAX_ITEMS);
+  };
+
+  const publish = async (trigger = 'auto') => {
+    const currentVersion = ++publishVersion;
+    let summary;
+
+    try {
+      inspectTree(document);
+      summary = await collectSummary();
+    } catch (error) {
+      pushRuntimeError('诊断脚本异常', error && error.message ? error.message : String(error || '未知错误'));
+      summary = {
+        title: clip(document.title || '', 120),
+        viewportWidth: toNumber(window.innerWidth || document.documentElement.clientWidth || 0),
+        viewportHeight: toNumber(window.innerHeight || document.documentElement.clientHeight || 0),
+        scrollWidth: 0,
+        scrollHeight: 0,
+        elementCount: 0,
+        bodyChildCount: 0,
+        absoluteElementCount: 0,
+        textLength: 0,
+        images: { total: 0, loaded: 0, failed: 0, pending: 0 },
+        cssImages: { total: 0, loaded: 0, failed: 0, pending: 0, sampled: 0, failedSamples: [] },
+        stylesheets: { total: 0, loaded: 0, failed: 0, pending: 0 },
+        scripts: { total: 0, loaded: 0, failed: 0, pending: 0 },
+        risk: {
+          transformCount: 0,
+          overflowHiddenCount: 0,
+          clipPathCount: 0,
+          maskCount: 0,
+          blendModeCount: 0,
+          backdropFilterCount: 0,
+          pseudoElementCount: 0,
+          pseudoAssetCount: 0
+        },
+        visualLayers: [],
+        roots: []
+      };
+    }
+
+    if (currentVersion !== publishVersion) return;
+
+    const payload = {
+      token,
+      trigger,
+      generatedAt: Date.now(),
+      summary,
+      issues: buildIssues(summary)
+    };
+
+    try {
+      if (window.parent && typeof window.parent.__lanhuViewerReceiveGeneratedPreviewDiagnostics === 'function') {
+        window.parent.__lanhuViewerReceiveGeneratedPreviewDiagnostics(payload);
+      }
+    } catch (error) {}
+  };
+
+  const schedulePublish = (trigger = 'auto', delay = 0) => {
+    if (publishTimer) window.clearTimeout(publishTimer);
+    publishTimer = window.setTimeout(() => {
+      publishTimer = null;
+      publish(trigger).catch(() => {});
+    }, delay);
+  };
+
+  window.addEventListener('error', (event) => {
+    if (event.target && event.target !== window) {
+      markNodeState(event.target, 'error', event.message || '资源请求失败');
+      schedulePublish('resource-error', 0);
+      return;
+    }
+    const location = [event.filename || '', event.lineno || '', event.colno || ''].filter(Boolean).join(':');
+    pushRuntimeError('脚本执行异常', [event.message || '', location].filter(Boolean).join(' @ '));
+    schedulePublish('runtime-error', 0);
+  }, true);
+
+  window.addEventListener('unhandledrejection', (event) => {
+    const reason = event && event.reason;
+    let detail = '';
+    if (typeof reason === 'string') {
+      detail = reason;
+    } else if (reason && reason.message) {
+      detail = reason.message;
+    } else {
+      try {
+        detail = JSON.stringify(reason || '未知 Promise 错误');
+      } catch (error) {
+        detail = String(reason || '未知 Promise 错误');
+      }
+    }
+    pushRuntimeError('Promise 未处理异常', detail);
+    schedulePublish('unhandledrejection', 0);
+  });
+
+  document.addEventListener('DOMContentLoaded', () => {
+    inspectTree(document);
+    schedulePublish('domcontentloaded', 60);
+  });
+
+  window.addEventListener('load', () => {
+    inspectTree(document);
+    schedulePublish('load', 60);
+    window.setTimeout(() => { publish('load-stable').catch(() => {}); }, 360);
+    window.setTimeout(() => { publish('load-final').catch(() => {}); }, 1200);
+  });
+
+  const observer = new MutationObserver((mutations) => {
+    mutations.forEach((mutation) => {
+      mutation.addedNodes.forEach((node) => inspectTree(node));
+    });
+    schedulePublish('mutation', 160);
+  });
+
+  if (document.documentElement) {
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  inspectTree(document);
+  window.__LANHU_GENERATED_PREVIEW_DIAGNOSTICS__ = {
+    publish: (trigger = 'manual') => publish(trigger)
+  };
+})();
+</script>`;
+  }
+
+  injectGeneratedPreviewHeadMarkup(html, markup) {
+    const source = String(html || '');
+    const injectedMarkup = String(markup || '').trim();
+
+    if (!injectedMarkup) {
+      return source;
+    }
+
+    if (/<head(\s[^>]*)?>/i.test(source)) {
+      return source.replace(/<head(\s[^>]*)?>/i, (match) => `${match}\n${injectedMarkup}\n`);
+    }
+
+    if (/<html(\s[^>]*)?>/i.test(source)) {
+      return source.replace(/<html(\s[^>]*)?>/i, (match) => `${match}\n<head>\n${injectedMarkup}\n</head>\n`);
+    }
+
+    if (/<body(\s[^>]*)?>/i.test(source)) {
+      return source.replace(/<body(\s[^>]*)?>/i, (match) => `<head>\n${injectedMarkup}\n</head>\n${match}`);
+    }
+
+    return `<head>\n${injectedMarkup}\n</head>\n${source}`;
+  }
+
+  serializeGeneratedPreviewInlineData(value) {
+    try {
+      return JSON.stringify(value ?? [])
+        .replace(/</g, '\\u003c')
+        .replace(/>/g, '\\u003e')
+        .replace(/&/g, '\\u0026');
+    } catch (error) {
+      return '[]';
+    }
+  }
+
+  buildGeneratedPreviewCompatibilityStyleTag() {
+    return `<style data-generated-preview-compat>
+html,
+body {
+  margin: 0 !important;
+  padding: 0 !important;
+  min-height: 100%;
+}
+body {
+  overflow-x: hidden !important;
+  background: transparent !important;
+}
+</style>`;
+  }
+
+  buildGeneratedPreviewPatchStyleTag() {
+    return `<style data-generated-preview-patch>
+[data-generated-preview-root="1"] {
+  isolation: isolate !important;
+  position: relative !important;
+}
+[data-generated-preview-patch-mask="1"] {
+  background: transparent !important;
+  background-color: transparent !important;
+}
+[data-generated-preview-patch-edge-decor="1"] {
+  z-index: 0 !important;
+}
+[data-generated-preview-patch-foreground="1"] {
+  z-index: 2 !important;
+}
+[data-generated-preview-patch-promote="1"] {
+  z-index: 3 !important;
+}
+[data-generated-preview-patch-button-anchor="1"] {
+  position: relative !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  overflow: visible !important;
+  border-color: rgba(255, 255, 255, 0.82) !important;
+  background:
+    radial-gradient(circle at 35% 26%, rgba(255, 255, 255, 0.42) 0, rgba(255, 255, 255, 0.12) 24%, rgba(255, 255, 255, 0) 42%),
+    linear-gradient(180deg, rgba(255, 152, 233, 0.92) 0%, rgba(219, 110, 255, 0.94) 55%, rgba(124, 130, 255, 0.94) 100%) !important;
+  box-shadow:
+    0 14px 28px rgba(176, 112, 255, 0.3),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.22) !important;
+}
+[data-generated-preview-patch-button-anchor="1"]::before {
+  content: '' !important;
+  position: absolute !important;
+  inset: 10px 12px 18px !important;
+  border-radius: inherit !important;
+  background: radial-gradient(circle at 50% 36%, rgba(255, 255, 255, 0.42) 0, rgba(255, 255, 255, 0.06) 54%, rgba(255, 255, 255, 0) 78%) !important;
+  pointer-events: none !important;
+}
+[data-generated-preview-patch-button-anchor="1"] > img {
+  position: absolute !important;
+  left: 50% !important;
+  top: 46% !important;
+  width: 34px !important;
+  height: 34px !important;
+  margin: 0 !important;
+  transform: translate(-50%, -50%) !important;
+  filter: drop-shadow(0 4px 10px rgba(255, 255, 255, 0.35)) !important;
+}
+[data-generated-preview-patch-button-label="1"] {
+  left: 50% !important;
+  right: auto !important;
+  top: calc(100% - 6px) !important;
+  bottom: auto !important;
+  transform: translateX(-50%) !important;
+  width: max-content !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  padding: 4px 10px !important;
+  border-radius: 999px !important;
+  white-space: nowrap !important;
+  text-align: center !important;
+  color: #fff !important;
+  font-weight: 600 !important;
+  line-height: 1.2 !important;
+  background: linear-gradient(180deg, rgba(255, 122, 224, 0.98) 0%, rgba(201, 93, 255, 0.98) 100%) !important;
+  box-shadow: 0 8px 20px rgba(177, 90, 255, 0.26) !important;
+  -webkit-text-fill-color: currentColor !important;
+  -webkit-background-clip: border-box !important;
+  background-clip: border-box !important;
+  text-shadow: 0 1px 2px rgba(77, 38, 108, 0.35) !important;
+}
+[data-generated-preview-patch-vertical-anchor="1"] {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  overflow: visible !important;
+}
+[data-generated-preview-patch-vertical-label="1"] {
+  display: block !important;
+  white-space: pre-line !important;
+  text-align: center !important;
+  width: 1.15em !important;
+  min-width: 0 !important;
+  max-width: 1.15em !important;
+  height: auto !important;
+  line-height: 1.08 !important;
+  letter-spacing: 0 !important;
+  margin: 0 auto !important;
+}
+[data-generated-preview-design-crop-overlay] {
+  position: absolute !important;
+  display: block !important;
+  pointer-events: none !important;
+  background-repeat: no-repeat !important;
+  z-index: 6 !important;
+  overflow: hidden !important;
+}
+[data-generated-preview-design-crop-overlay]::after {
+  content: '' !important;
+  position: absolute !important;
+  inset: 0 !important;
+  border-radius: inherit !important;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14) !important;
+  pointer-events: none !important;
+}
+[data-generated-preview-module-suppressed="1"] {
+  visibility: hidden !important;
+}
+[data-generated-preview-module-overlay] {
+  position: absolute !important;
+  display: block !important;
+  pointer-events: none !important;
+  overflow: hidden !important;
+  isolation: isolate !important;
+  z-index: 14 !important;
+}
+[data-generated-preview-module-canvas] {
+  position: relative !important;
+  width: 100% !important;
+  height: 100% !important;
+  overflow: hidden !important;
+}
+[data-generated-preview-module-canvas] .lh-layer {
+  position: absolute !important;
+  display: block !important;
+  overflow: hidden !important;
+  pointer-events: none !important;
+}
+[data-generated-preview-module-canvas] .lh-image {
+  object-fit: fill !important;
+  user-select: none !important;
+  -webkit-user-drag: none !important;
+}
+[data-generated-preview-module-canvas] .lh-text {
+  white-space: pre-wrap !important;
+  word-break: break-word !important;
+}
+</style>`;
+  }
+
+  buildGeneratedPreviewPatchBootstrapScript(moduleFallbackPlan = []) {
+    const serializedModulePlan = this.serializeGeneratedPreviewInlineData(Array.isArray(moduleFallbackPlan) ? moduleFallbackPlan : []);
+    return `<script data-generated-preview-patch>
+(() => {
+  const PATCH_ATTRS = [
+    'data-generated-preview-root',
+    'data-generated-preview-patch-mask',
+    'data-generated-preview-patch-edge-decor',
+    'data-generated-preview-patch-foreground',
+    'data-generated-preview-patch-promote',
+    'data-generated-preview-patch-button-anchor',
+    'data-generated-preview-patch-button-label',
+    'data-generated-preview-patch-vertical-anchor',
+    'data-generated-preview-patch-vertical-label'
+  ];
+  const ORIGINAL_TEXT_ATTR = 'data-generated-preview-patch-original-text';
+  const DESIGN_CROP_OVERLAY_ATTR = 'data-generated-preview-design-crop-overlay';
+  const MODULE_OVERLAY_ATTR = 'data-generated-preview-module-overlay';
+  const MODULE_CANVAS_ATTR = 'data-generated-preview-module-canvas';
+  const MODULE_SUPPRESSED_ATTR = 'data-generated-preview-module-suppressed';
+  const MODULE_FALLBACK_PLAN = ${serializedModulePlan};
+  const DESIGN_CROP_PATCHES = [
+    {
+      key: 'sweet-task-cp-hero',
+      designNamePattern: /^甜蜜任务$/,
+      coordinateWidth: 750,
+      layerImages: [
+        {
+          key: 'hero-couple',
+          path: '甜蜜任务/头图',
+          renderBox: { left: 96, top: 176, width: 558, height: 852 },
+          sourceBox: { left: 96, top: 0 },
+          zIndex: 4
+        },
+        {
+          key: 'hero-title',
+          path: '甜蜜任务/标题分割',
+          renderBox: { left: 0, top: 665, width: 750, height: 260 },
+          sourceBox: { left: 0, top: 0 },
+          zIndex: 5
+        },
+        {
+          key: 'background',
+          path: '甜蜜任务/登顶CP/登顶CP背景',
+          zIndex: 6
+        },
+        {
+          key: 'center-badge',
+          path: '甜蜜任务/登顶CP/信息/Group 427319820',
+          zIndex: 9
+        },
+        {
+          key: 'left-frame',
+          path: '甜蜜任务/登顶CP/信息/头像/头像框',
+          expectedX: 169,
+          zIndex: 8
+        },
+        {
+          key: 'right-frame',
+          path: '甜蜜任务/登顶CP/信息/头像/头像框',
+          expectedX: 411,
+          zIndex: 8
+        }
+      ],
+      previewCrops: [
+        {
+          key: 'left-avatar',
+          crop: { left: 197, top: 662, width: 116, height: 116 },
+          radius: 58,
+          zIndex: 7
+        },
+        {
+          key: 'right-avatar',
+          crop: { left: 439, top: 662, width: 116, height: 116 },
+          radius: 58,
+          zIndex: 7
+        }
+      ]
+    }
+  ];
+  let rafId = 0;
+  let timerId = 0;
+
+  const parseColor = (value) => {
+    const match = String(value || '').match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)(?:,\\s*([\\d.]+))?\\)/i);
+    if (!match) return null;
+    return {
+      r: Number(match[1]),
+      g: Number(match[2]),
+      b: Number(match[3]),
+      a: match[4] == null ? 1 : Number(match[4])
+    };
+  };
+
+  const clearNodePatchState = (node) => {
+    if (node.hasAttribute(ORIGINAL_TEXT_ATTR)) {
+      node.textContent = node.getAttribute(ORIGINAL_TEXT_ATTR) || '';
+      node.removeAttribute(ORIGINAL_TEXT_ATTR);
+    }
+    PATCH_ATTRS.forEach((attr) => node.removeAttribute(attr));
+  };
+
+  const collectText = (node) => String(node.textContent || '').replace(/\\s+/g, '').trim();
+  const removeDesignCropOverlays = (root) => {
+    root.querySelectorAll(\`[\${DESIGN_CROP_OVERLAY_ATTR}]\`).forEach((node) => node.remove());
+  };
+  const removeModuleOverlays = (root) => {
+    root.querySelectorAll(\`[\${MODULE_OVERLAY_ATTR}]\`).forEach((node) => node.remove());
+  };
+  const clearModuleSuppressedNodes = (root) => {
+    root.querySelectorAll(\`[\${MODULE_SUPPRESSED_ATTR}]\`).forEach((node) => node.removeAttribute(MODULE_SUPPRESSED_ATTR));
+  };
+  const buildNodeBox = (rect, rootRect) => ({
+    left: Math.max(0, Math.round(rect.left - rootRect.left)),
+    top: Math.max(0, Math.round(rect.top - rootRect.top)),
+    width: Math.round(rect.width),
+    height: Math.round(rect.height)
+  });
+  const getOverlapArea = (a, b) => {
+    const left = Math.max(a.left, b.left);
+    const top = Math.max(a.top, b.top);
+    const right = Math.min(a.left + a.width, b.left + b.width);
+    const bottom = Math.min(a.top + a.height, b.top + b.height);
+    if (right <= left || bottom <= top) return 0;
+    return (right - left) * (bottom - top);
+  };
+  const shouldSuppressNodeForModule = (node, rootRect, moduleBox) => {
+    if (!(node instanceof HTMLElement)) return false;
+    if (node.hasAttribute(MODULE_OVERLAY_ATTR)) return false;
+    if (node.closest(\`[\${MODULE_OVERLAY_ATTR}]\`)) return false;
+    if (node.tagName === 'SCRIPT' || node.tagName === 'STYLE' || node.tagName === 'LINK') return false;
+
+    const rect = node.getBoundingClientRect();
+    if (rect.width <= 1 || rect.height <= 1) return false;
+
+    const computed = window.getComputedStyle(node);
+    if (!computed || computed.display === 'none' || computed.visibility === 'hidden') return false;
+
+    const hasVisual = node.tagName === 'IMG' || (computed.backgroundImage && computed.backgroundImage !== 'none');
+    if (!hasVisual) return false;
+
+    const nodeBox = buildNodeBox(rect, rootRect);
+    const overlapArea = getOverlapArea(nodeBox, moduleBox);
+    if (overlapArea <= 0) return false;
+
+    const nodeArea = Math.max(1, nodeBox.width * nodeBox.height);
+    const overlapRatio = overlapArea / nodeArea;
+    const centerX = nodeBox.left + nodeBox.width / 2;
+    const centerY = nodeBox.top + nodeBox.height / 2;
+    const centerInside = (
+      centerX >= moduleBox.left &&
+      centerX <= moduleBox.left + moduleBox.width &&
+      centerY >= moduleBox.top &&
+      centerY <= moduleBox.top + moduleBox.height
+    );
+
+    return overlapRatio >= 0.58 || (centerInside && nodeArea <= moduleBox.width * moduleBox.height * 1.8);
+  };
+  const applyModuleFallbackOverlays = (root, rootRect) => {
+    removeModuleOverlays(root);
+    clearModuleSuppressedNodes(root);
+
+    if (!Array.isArray(MODULE_FALLBACK_PLAN) || !MODULE_FALLBACK_PLAN.length) {
+      return;
+    }
+
+    const nodes = Array.from(root.querySelectorAll('*')).filter((node) => node instanceof HTMLElement);
+
+    MODULE_FALLBACK_PLAN.forEach((moduleItem, index) => {
+      const box = moduleItem && typeof moduleItem.box === 'object' ? moduleItem.box : null;
+      if (!box || (Number(box.width) || 0) <= 1 || (Number(box.height) || 0) <= 1) {
+        return;
+      }
+
+      nodes.forEach((node) => {
+        if (shouldSuppressNodeForModule(node, rootRect, box)) {
+          node.setAttribute(MODULE_SUPPRESSED_ATTR, '1');
+        }
+      });
+
+      const overlay = document.createElement('div');
+      overlay.setAttribute(MODULE_OVERLAY_ATTR, moduleItem.pathPrefix || moduleItem.moduleId || 'module-' + index);
+      overlay.style.left = String(Math.round(Number(box.left) || 0)) + 'px';
+      overlay.style.top = String(Math.round(Number(box.top) || 0)) + 'px';
+      overlay.style.width = String(Math.round(Number(box.width) || 0)) + 'px';
+      overlay.style.height = String(Math.round(Number(box.height) || 0)) + 'px';
+      overlay.style.setProperty('z-index', String(14 + index), 'important');
+
+      const canvas = document.createElement('div');
+      canvas.setAttribute(MODULE_CANVAS_ATTR, '1');
+      canvas.innerHTML = String(moduleItem.html || '');
+      overlay.appendChild(canvas);
+      root.appendChild(overlay);
+    });
+  };
+
+  const readPreviewContextFromWindow = (targetWindow) => {
+    try {
+      const targetDocument = targetWindow?.document;
+      const previewImage = targetDocument?.getElementById('previewImage');
+      const previewName = targetDocument?.getElementById('previewName');
+      const src = previewImage?.currentSrc || previewImage?.src || '';
+      const designWidth = Number(previewImage?.naturalWidth) || 0;
+      const designHeight = Number(previewImage?.naturalHeight) || 0;
+      const designName = String(previewName?.textContent || '').trim();
+
+      if (!src || designWidth <= 0 || designHeight <= 0) {
+        return null;
+      }
+
+      return {
+        src,
+        designName,
+        designWidth,
+        designHeight
+      };
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const readPreviewContext = () => (
+    readPreviewContextFromWindow(window.parent && window.parent !== window ? window.parent : null) ||
+    readPreviewContextFromWindow(window.opener) ||
+    null
+  );
+
+  const readLayerCacheEntryFromWindow = (targetWindow, designName) => {
+    try {
+      const raw = targetWindow?.localStorage?.getItem('lanhuLayerCache');
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return Object.values(parsed || {}).find((entry) => String(entry?.canvasInfo?.name || '').trim() === designName) || null;
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const readLayerCacheEntry = (designName) => (
+    readLayerCacheEntryFromWindow(window.parent && window.parent !== window ? window.parent : null, designName) ||
+    readLayerCacheEntryFromWindow(window.opener, designName) ||
+    null
+  );
+
+  const findLayerImage = (entry, path, expectedX = null) => {
+    const layers = Array.isArray(entry?.layers) ? entry.layers : [];
+    const matches = layers.filter((layer) => layer?.has_image && layer?.path === path);
+    if (!matches.length) {
+      return null;
+    }
+    if (expectedX == null) {
+      return matches[0];
+    }
+    return matches.reduce((best, layer) => {
+      if (!best) return layer;
+      return Math.abs(Number(layer.x) - expectedX) < Math.abs(Number(best.x) - expectedX) ? layer : best;
+    }, null);
+  };
+
+  const appendOverlay = (
+    root,
+    key,
+    {
+      left,
+      top,
+      width,
+      height,
+      zIndex = 6,
+      radius = 0,
+      shadow = 'none',
+      image,
+      size = '100% 100%',
+      position = '0 0'
+    }
+  ) => {
+    if (!image || width <= 2 || height <= 2) {
+      return;
+    }
+
+    const overlay = document.createElement('div');
+    overlay.setAttribute(DESIGN_CROP_OVERLAY_ATTR, key);
+    overlay.style.left = String(left) + 'px';
+    overlay.style.top = String(top) + 'px';
+    overlay.style.width = String(width) + 'px';
+    overlay.style.height = String(height) + 'px';
+    overlay.style.borderRadius = radius > 0 ? (String(radius) + 'px') : '0';
+    overlay.style.setProperty('z-index', String(zIndex), 'important');
+    overlay.style.backgroundImage = 'url("' + String(image).replace(/"/g, '\\"') + '")';
+    overlay.style.backgroundSize = size;
+    overlay.style.backgroundPosition = position;
+    overlay.style.boxShadow = shadow;
+    root.appendChild(overlay);
+  };
+
+  const applyDesignCropPatches = (root, rootWidth, rootHeight) => {
+    removeDesignCropOverlays(root);
+
+    const previewContext = readPreviewContext();
+    if (!previewContext) {
+      return;
+    }
+
+    const layerCacheEntry = readLayerCacheEntry(previewContext.designName);
+
+    DESIGN_CROP_PATCHES.forEach((patch) => {
+      if (!patch.designNamePattern.test(previewContext.designName)) {
+        return;
+      }
+
+      const layoutWidth = Math.max(
+        1,
+        Number(root.offsetWidth) ||
+          Number(root.clientWidth) ||
+          Number(root.scrollWidth) ||
+          rootWidth
+      );
+      const layoutHeight = Math.max(
+        1,
+        Number(root.offsetHeight) ||
+          Number(root.clientHeight) ||
+          Number(root.scrollHeight) ||
+          rootHeight
+      );
+      const coordinateWidth = Math.max(
+        1,
+        Number(patch.coordinateWidth) ||
+          layoutWidth
+      );
+      const placementScale = layoutWidth / coordinateWidth;
+      const previewSourceScale = layoutWidth / Math.max(1, previewContext.designWidth);
+
+      if (layerCacheEntry) {
+        (patch.layerImages || []).forEach((item) => {
+          const layer = findLayerImage(layerCacheEntry, item.path, item.expectedX);
+          if (!layer) {
+            return;
+          }
+          const renderBox = item.renderBox || {
+            left: Number(layer.x) || 0,
+            top: Number(layer.y) || 0,
+            width: Number(layer.width) || 0,
+            height: Number(layer.height) || 0
+          };
+          const sourceBox = item.sourceBox || null;
+          appendOverlay(root, patch.key + '-' + item.key, {
+            left: Math.round(Number(renderBox.left) * placementScale),
+            top: Math.round(Number(renderBox.top) * placementScale),
+            width: Math.round(Number(renderBox.width) * placementScale),
+            height: Math.round(Number(renderBox.height) * placementScale),
+            zIndex: item.zIndex || 6,
+            radius: Math.max(0, Math.round((item.radius || 0) * placementScale)),
+            shadow: item.shadow || 'none',
+            image: layer.image,
+            size: sourceBox
+              ? String(Math.round(Number(layer.width) * placementScale)) + 'px ' +
+                String(Math.round(Number(layer.height) * placementScale)) + 'px'
+              : '100% 100%',
+            position: sourceBox
+              ? '-' + String(Math.round((Number(sourceBox.left) || 0) * placementScale)) + 'px -' +
+                String(Math.round((Number(sourceBox.top) || 0) * placementScale)) + 'px'
+              : '0 0'
+          });
+        });
+      }
+
+      (patch.previewCrops || []).forEach((item) => {
+        const cropLeft = Math.round(item.crop.left * placementScale);
+        const cropTop = Math.round(item.crop.top * placementScale);
+        const cropWidth = Math.round(item.crop.width * placementScale);
+        const cropHeight = Math.round(item.crop.height * placementScale);
+
+        if (
+          cropWidth <= 24 ||
+          cropHeight <= 24 ||
+          cropLeft >= layoutWidth ||
+          cropTop >= layoutHeight
+        ) {
+          return;
+        }
+
+        appendOverlay(root, patch.key + '-' + item.key, {
+          left: cropLeft,
+          top: cropTop,
+          width: cropWidth,
+          height: cropHeight,
+          zIndex: item.zIndex || 7,
+          radius: Math.max(18, Math.round((item.radius || 24) * placementScale)),
+          shadow: item.shadow || '0 8px 18px rgba(130, 87, 220, 0.14)',
+          image: previewContext.src,
+          size: String(layoutWidth) + 'px ' + String(Math.round(previewContext.designHeight * previewSourceScale)) + 'px',
+          position: '-' + String(cropLeft) + 'px -' + String(cropTop) + 'px'
+        });
+      });
+    });
+  };
+
+  const applyPatch = () => {
+    rafId = 0;
+    timerId = 0;
+    const root = document.querySelector('.page') || document.body?.firstElementChild || document.body;
+    if (!(root instanceof HTMLElement)) {
+      return;
+    }
+
+    const rootRect = root.getBoundingClientRect();
+    const rootWidth = Math.max(
+      1,
+      Math.round(rootRect.width || root.offsetWidth || root.clientWidth || root.scrollWidth || window.innerWidth || 750)
+    );
+    const rootHeight = Math.max(
+      1,
+      Math.round(rootRect.height || root.offsetHeight || root.clientHeight || root.scrollHeight || window.innerHeight || 1)
+    );
+    const rootArea = rootWidth * rootHeight;
+
+    root.setAttribute('data-generated-preview-root', '1');
+    removeDesignCropOverlays(root);
+
+    const nodes = Array.from(root.querySelectorAll('*')).filter((node) => node instanceof HTMLElement);
+    nodes.forEach((node) => clearNodePatchState(node));
+
+    nodes.forEach((node) => {
+      const rect = node.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) {
+        return;
+      }
+
+      const area = rect.width * rect.height;
+      if (area >= rootArea * 0.92) {
+        return;
+      }
+
+      const styles = window.getComputedStyle(node);
+      const text = collectText(node);
+      const isVisual = node.tagName === 'IMG' || (styles.backgroundImage && styles.backgroundImage !== 'none');
+      const hasBackgroundImage = Boolean(styles.backgroundImage && styles.backgroundImage !== 'none');
+      const childVisual = Array.from(node.children || []).some((child) => {
+        if (!(child instanceof HTMLElement)) return false;
+        const childStyles = window.getComputedStyle(child);
+        return child.tagName === 'IMG' || (childStyles.backgroundImage && childStyles.backgroundImage !== 'none');
+      });
+
+      const color = parseColor(styles.backgroundColor);
+      const hasDarkBackground = Boolean(
+        color &&
+        color.a > 0.6 &&
+        color.r < 24 &&
+        color.g < 24 &&
+        color.b < 24
+      );
+      const isPositioned = styles.position === 'absolute' || styles.position === 'fixed' || styles.position === 'relative';
+      const spillsEdge =
+        rect.left < rootRect.left - 24 ||
+        rect.right > rootRect.right + 24 ||
+        rect.top < rootRect.top - 24;
+
+      if (
+        hasDarkBackground &&
+        !hasBackgroundImage &&
+        isPositioned &&
+        rect.width >= rootWidth * 0.35 &&
+        rect.height >= 48 &&
+        rect.height <= 220 &&
+        childVisual
+      ) {
+        node.setAttribute('data-generated-preview-patch-mask', '1');
+      }
+
+      if (
+        isVisual &&
+        text.length === 0 &&
+        (styles.position === 'absolute' || styles.position === 'fixed') &&
+        spillsEdge &&
+        rect.width >= rootWidth * 0.18 &&
+        rect.height >= 80
+      ) {
+        node.setAttribute('data-generated-preview-patch-edge-decor', '1');
+      }
+
+      if (
+        text.length > 0 &&
+        (hasBackgroundImage || childVisual) &&
+        isPositioned &&
+        rect.width >= rootWidth * 0.22 &&
+        area <= rootArea * 0.42
+      ) {
+        node.setAttribute('data-generated-preview-patch-foreground', '1');
+      }
+
+      if (
+        isVisual &&
+        text.length === 0 &&
+        !spillsEdge &&
+        isPositioned &&
+        rect.top < rootRect.top + 1400 &&
+        rect.left > rootRect.left + rootWidth * 0.08 &&
+        rect.right < rootRect.right - rootWidth * 0.08 &&
+        rect.width >= rootWidth * 0.18 &&
+        rect.width <= rootWidth * 0.75 &&
+        rect.height >= 96 &&
+        rect.height <= Math.max(480, rootWidth * 1.2)
+      ) {
+        node.setAttribute('data-generated-preview-patch-promote', '1');
+      }
+
+      const parent = node.parentElement;
+      if (
+        parent instanceof HTMLElement &&
+        text.length > 0 &&
+        styles.position === 'absolute'
+      ) {
+        const parentRect = parent.getBoundingClientRect();
+        const parentStyles = window.getComputedStyle(parent);
+        const parentRadius = parseFloat(parentStyles.borderRadius) || 0;
+        const isSmallRoundButton =
+          parentRect.width <= 100 &&
+          parentRect.height <= 100 &&
+          parentRadius >= Math.min(parentRect.width, parentRect.height) * 0.35;
+
+        if (
+          isSmallRoundButton &&
+          rect.width > parentRect.width &&
+          (rect.left < parentRect.left - 12 || (parseFloat(styles.left) || 0) < -20)
+        ) {
+          parent.setAttribute('data-generated-preview-patch-button-anchor', '1');
+          node.setAttribute('data-generated-preview-patch-button-label', '1');
+        }
+      }
+
+      if (
+        text.length >= 3 &&
+        text.length <= 8 &&
+        rect.width <= 40 &&
+        rect.height >= 80 &&
+        styles.writingMode !== 'vertical-rl' &&
+        parent instanceof HTMLElement
+      ) {
+        const parentRect = parent.getBoundingClientRect();
+        const parentStyles = window.getComputedStyle(parent);
+        const parentHasVisual = Boolean(
+          parentStyles.backgroundImage && parentStyles.backgroundImage !== 'none'
+        );
+
+        if (
+          parentRect.width <= 72 &&
+          parentRect.height >= 110 &&
+          parentHasVisual
+        ) {
+          parent.setAttribute('data-generated-preview-patch-vertical-anchor', '1');
+          if (!node.hasAttribute(ORIGINAL_TEXT_ATTR)) {
+            node.setAttribute(ORIGINAL_TEXT_ATTR, text);
+          }
+          node.textContent = Array.from(text).join('\\n');
+          node.setAttribute('data-generated-preview-patch-vertical-label', '1');
+        }
+      }
+    });
+
+    applyDesignCropPatches(root, rootWidth, rootHeight);
+    applyModuleFallbackOverlays(root, rootRect);
+  };
+
+  const schedulePatch = (delay = 0) => {
+    if (timerId) {
+      window.clearTimeout(timerId);
+      timerId = 0;
+    }
+    if (rafId) {
+      window.cancelAnimationFrame(rafId);
+      rafId = 0;
+    }
+
+    const run = () => {
+      rafId = window.requestAnimationFrame(applyPatch);
+    };
+
+    if (delay > 0) {
+      timerId = window.setTimeout(run, delay);
+      return;
+    }
+
+    run();
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => schedulePatch(), { once: true });
+  } else {
+    schedulePatch();
+  }
+
+  window.addEventListener('load', () => {
+    schedulePatch();
+    window.setTimeout(() => schedulePatch(), 280);
+    window.setTimeout(() => schedulePatch(), 960);
+  });
+
+  const observer = new MutationObserver(() => schedulePatch(140));
+  if (document.documentElement) {
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  window.__LANHU_GENERATED_PREVIEW_PATCH__ = {
+    apply: () => applyPatch()
+  };
+})();
+</script>`;
+  }
+
+  buildEmbeddedGeneratedPreviewHtml(
+    html,
+    {
+      includeDiagnostics = true,
+      includePreviewPatch = true,
+      baseHref = 'https://dds.lanhuapp.com/',
+      moduleFallbackPlan = []
+    } = {}
+  ) {
+    if (!html) {
+      if (includeDiagnostics) {
+        this.generatedPreviewDiagnostics = this.createInitialGeneratedPreviewDiagnostics();
+        this.renderGeneratedPreviewDiagnostics();
+      }
+      return '';
+    }
+
+    const source = String(html);
+    const markupParts = [];
+
+    if (baseHref && !/<base\b/i.test(source)) {
+      markupParts.push(`<base href="${this.escapeAttr(baseHref)}" />`);
+    }
+    if (!/data-generated-preview-compat/i.test(source)) {
+      markupParts.push(this.buildGeneratedPreviewCompatibilityStyleTag());
+    }
+    if (includePreviewPatch && !/data-generated-preview-patch/i.test(source)) {
+      markupParts.push(this.buildGeneratedPreviewPatchStyleTag());
+      markupParts.push(this.buildGeneratedPreviewPatchBootstrapScript(moduleFallbackPlan));
+    }
+
+    if (includeDiagnostics) {
+      const token = this.createGeneratedPreviewDiagnosticsToken();
+      this.generatedPreviewDiagnostics = {
+        token,
+        status: 'pending',
+        updatedAt: Date.now(),
+        trigger: 'auto',
+        report: null
+      };
+      this.renderGeneratedPreviewDiagnostics();
+      markupParts.push(this.buildGeneratedPreviewDiagnosticsBootstrapScript(token));
+    }
+
+    return this.injectGeneratedPreviewHeadMarkup(source, markupParts.join('\n'));
+  }
+
+  buildLayerFallbackPreviewHtml(design = this.getGeneratedPreviewSourceDesign()) {
+    const layerContext = this.getGeneratedPreviewLayerContext(design);
+    if (!layerContext) {
+      return '';
+    }
+
+    const frameMetrics = this.getGeneratedPreviewFrameMetrics();
+    return this.buildStaticHtmlFromLayers(design, {
+      layers: layerContext.layers,
+      canvasInfo: layerContext.canvasInfo,
+      slices: layerContext.slices,
+      preferredWidth: frameMetrics?.width || 0,
+      preferredHeight: frameMetrics?.height || 0
+    });
+  }
+
+  buildGeneratedPreviewFrameDocument({ includeDiagnostics = true } = {}) {
+    if (!this.generatedPreviewHtml) {
+      if (includeDiagnostics) {
+        this.generatedPreviewDiagnostics = this.createInitialGeneratedPreviewDiagnostics();
+        this.renderGeneratedPreviewDiagnostics();
+      }
+      return '';
+    }
+
+    if (this.getGeneratedPreviewRepairMode() === 'layer') {
+      const fallbackHtml = this.buildLayerFallbackPreviewHtml();
+      if (fallbackHtml) {
+        return this.buildEmbeddedGeneratedPreviewHtml(fallbackHtml, {
+          includeDiagnostics,
+          includePreviewPatch: false,
+          baseHref: ''
+        });
+      }
+    }
+
+    const moduleFallbackPlan = this.getGeneratedPreviewRepairMode() === 'module'
+      ? (Array.isArray(this.generatedPreviewRepairState?.overlayModules) ? this.generatedPreviewRepairState.overlayModules : [])
+      : [];
+    return this.buildEmbeddedGeneratedPreviewHtml(this.generatedPreviewHtml, {
+      includeDiagnostics,
+      includePreviewPatch: true,
+      moduleFallbackPlan
+    });
+  }
+
+  showHtmlPreview({ revealCodePanel } = {}) {
+    if (!this.previewBody) return;
+    const hasPreview = Boolean(this.generatedPreviewHtml);
+    const isAlreadyVisible = this.previewBody.classList.contains('html-preview-visible') && hasPreview;
+
+    const shouldShowCodePanel = typeof revealCodePanel === 'boolean'
+      ? revealCodePanel
+      : (!hasPreview || this.isCodePanelVisible);
+
+    this.showGeneratedCodePanel({ showCodePanel: shouldShowCodePanel });
+    if (hasPreview && !isAlreadyVisible) {
+      this.resetZoom(true);
+    }
+    if (this.generatedPreviewSite) {
+      this.generatedPreviewSite.hidden = !hasPreview;
+    }
+    if (this.previewBody) {
+      this.previewBody.classList.toggle('html-preview-visible', hasPreview);
+    }
+
+    if (this.htmlPreviewFrame) {
+      this.htmlPreviewFrame.srcdoc = hasPreview
+        ? this.buildGeneratedPreviewFrameDocument()
+        : '';
+      if (hasPreview) {
+        this.scheduleGeneratedPreviewRefitSequence();
+      } else {
+        this.clearGeneratedPreviewFitTimers();
+      }
+    }
+    this.refreshGeneratedCodeOutput();
+  }
+
+  hideHtmlPreview(clearCode = false) {
+    if (this.generatedPreviewSite) {
+      this.generatedPreviewSite.hidden = true;
+    }
+    this.setCodePanelVisibility(false);
     if (this.previewBody) {
       this.previewBody.classList.remove('html-preview-visible');
     }
@@ -2280,34 +7481,143 @@ class LanhuViewer {
     }
     if (this.htmlPreviewFrame) {
       this.htmlPreviewFrame.srcdoc = '';
+      this.htmlPreviewFrame.style.transform = 'none';
+      this.htmlPreviewFrame.style.width = '100%';
+      this.htmlPreviewFrame.style.height = '100%';
     }
+    if (this.generatedPreviewFrameWrap) {
+      this.generatedPreviewFrameWrap.style.width = '';
+      this.generatedPreviewFrameWrap.style.height = '';
+    }
+    this.clearGeneratedPreviewFitTimers();
+    this.generatedPreviewDiagnostics = this.createInitialGeneratedPreviewDiagnostics();
 
     if (clearCode) {
+      this.cancelGeneratedCodeTracking(true);
       this.generatedHtmlCode = '';
       this.generatedHtmlDesignId = null;
+      this.generatedPreviewHtml = '';
+      this.generatedCodeFiles = [];
+      this.generatedCodeFileName = '';
       if (this.htmlCodeOutput) {
         this.htmlCodeOutput.value = '';
       }
+      if (this.generatedCodeFileSelect) {
+        this.generatedCodeFileSelect.innerHTML = '';
+        this.generatedCodeFileSelect.disabled = true;
+      }
     }
+
+    this.updateGeneratedCodeMeta();
+  }
+
+  fallbackCopyText(text) {
+    if (!document?.body) return false;
+
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.setAttribute('aria-hidden', 'true');
+    textarea.style.position = 'fixed';
+    textarea.style.top = '-9999px';
+    textarea.style.left = '-9999px';
+    textarea.style.opacity = '0';
+
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    textarea.setSelectionRange(0, textarea.value.length);
+
+    let copied = false;
+    try {
+      copied = document.execCommand('copy');
+    } catch (e) {
+      copied = false;
+    }
+
+    textarea.remove();
+    return copied;
+  }
+
+  async copyText(text, successMessage) {
+    const value = String(text || '');
+    if (!value) {
+      throw new Error('没有可复制的内容');
+    }
+
+    let clipboardError = null;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value);
+        this.showToast(successMessage, 'success');
+        return true;
+      }
+    } catch (e) {
+      clipboardError = e;
+    }
+
+    if (this.fallbackCopyText(value)) {
+      this.showToast(successMessage, 'success');
+      return true;
+    }
+
+    if (typeof window.prompt === 'function') {
+      window.prompt('当前页面不允许直接写入剪贴板，请手动复制下面内容：', value);
+      this.showToast('当前环境已切换为手动复制', 'error');
+      return false;
+    }
+
+    throw clipboardError || new Error('当前页面不允许写入剪贴板');
   }
 
   async copyGeneratedHtml() {
     if (!this.generatedHtmlCode) {
-      this.showToast('还没有可复制的 HTML 代码', 'error');
+      this.showToast('还没有可复制的代码文件', 'error');
       return;
     }
 
     try {
-      await navigator.clipboard.writeText(this.generatedHtmlCode);
-      this.showToast('HTML 代码已复制', 'success');
+      const currentFile = this.getSelectedGeneratedFile();
+      const name = currentFile?.name || '当前文件';
+      await this.copyText(this.generatedHtmlCode, `${name} 已复制`);
+    } catch (e) {
+      this.showToast('复制失败: ' + e.message, 'error');
+    }
+  }
+
+  async copyCurrentLink() {
+    const url = this.getCurrentLanhuUrl();
+    if (!url) {
+      this.showToast('当前没有可复制的蓝湖链接', 'error');
+      this.updateCopyLinkButtonState();
+      return;
+    }
+
+    try {
+      await this.copyText(url, '蓝湖链接已复制');
+    } catch (e) {
+      this.showToast('复制失败: ' + e.message, 'error');
+    }
+  }
+
+  async copySelectedDesignLink() {
+    const url = this.getSelectedDesignLink();
+    if (!url) {
+      this.showToast('当前设计图没有可复制的链接', 'error');
+      this.updateSelectedDesignCopyButtonState();
+      return;
+    }
+
+    try {
+      await this.copyText(url, '设计图链接已复制');
     } catch (e) {
       this.showToast('复制失败: ' + e.message, 'error');
     }
   }
 
   openGeneratedHtmlInNewTab() {
-    if (!this.generatedHtmlCode) {
-      this.showToast('请先生成 HTML', 'error');
+    if (!this.generatedPreviewHtml) {
+      this.showToast(`${this.getGeneratedFrameworkLabel(this.generatedCodeFramework || this.getSelectedGeneratedFramework())} 当前没有可直接预览的页面`, 'error');
       return;
     }
 
@@ -2318,7 +7628,7 @@ class LanhuViewer {
     }
 
     newTab.document.open();
-    newTab.document.write(this.generatedHtmlCode);
+    newTab.document.write(this.buildGeneratedPreviewFrameDocument({ includeDiagnostics: false }));
     newTab.document.close();
     this.showToast('已在新标签页打开', 'success');
   }
@@ -2336,14 +7646,13 @@ class LanhuViewer {
   }
 
   restoreOriginalPreviewImage() {
-    const design = this.designs?.find(d => d.id === this.selectedDesignId);
+    const design = this.getSelectedDesign();
     this.revokeAnnotationObjectUrl();
     this.isAnnotationPreview = false;
     this.updateAnnotationPreviewButton();
 
     if (design?.url) {
-      this.previewImage.src = this.getProxiedImageUrl(design.url);
-      this.previewImage.alt = design.name || '';
+      this.loadDesignPreviewImage(design, { resetAdaptiveState: false });
     }
   }
 
@@ -2414,23 +7723,36 @@ class LanhuViewer {
     }
   }
 
-  buildStaticHtmlFromLayers(design) {
-    const preferredWidth = Math.max(1, Math.round(
-      Number(design?.width) ||
-      Number(this.canvasInfo?.width) ||
+  buildStaticHtmlFromLayers(design, {
+    layers = this.layers,
+    canvasInfo = this.canvasInfo,
+    slices = null,
+    preferredWidth = 0,
+    preferredHeight = 0
+  } = {}) {
+    const resolvedLayers = Array.isArray(layers) ? layers : [];
+    const resolvedSlices = Array.isArray(slices) ? slices : this.getAvailableSlicesForHtml();
+    const preferredCanvasWidth = Math.max(1, Math.round(
+      Number(preferredWidth) ||
+      (Number(canvasInfo?.width) >= 320 ? Number(canvasInfo?.width) : 0) ||
+      (Number(design?.width) >= 320 ? Number(design?.width) : 0) ||
       Number(this.previewImage?.naturalWidth) ||
       1
     ));
-    const preferredHeight = Math.max(1, Math.round(
+    const preferredCanvasHeight = Math.max(1, Math.round(
+      Number(preferredHeight) ||
+      Number(canvasInfo?.height) ||
       Number(design?.height) ||
-      Number(this.canvasInfo?.height) ||
       Number(this.previewImage?.naturalHeight) ||
       1
     ));
     const backgroundImageUrl = design?.url ? this.getProxiedImageUrl(design.url) : '';
-    const availableSlices = this.getAvailableSlicesForHtml();
-    const renderableLayers = this.getRenderableLayersForHtml(this.layers || [], availableSlices);
-    const normalized = this.normalizeLayersForCanvas(renderableLayers, preferredWidth, preferredHeight);
+    const normalized = this.buildRenderableModuleLayers(resolvedLayers, {
+      slices: resolvedSlices,
+      targetWidth: preferredCanvasWidth,
+      targetHeight: preferredCanvasHeight,
+      useDirectLayerImages: true
+    });
     const layerHtml = normalized.layers
       .map((layer, index) => this.renderLayerToHtml(layer, index))
       .filter(Boolean)
@@ -2641,7 +7963,7 @@ class LanhuViewer {
     return [];
   }
 
-  getRenderableLayersForHtml(layers, slices = []) {
+  getRenderableLayersForHtml(layers, slices = [], { useDirectLayerImages = false } = {}) {
     const textDedup = new Set();
     const textLayers = layers
       .filter((layer) => {
@@ -2651,7 +7973,7 @@ class LanhuViewer {
         const height = Math.round(Number(layer.height) || 0);
         if (width <= 1 || height <= 1) return false;
 
-        const text = this.getLayerText(layer.text).trim();
+        const text = this.resolveLayerText(layer).trim();
         const hasText = text.length > 0;
 
         if (hasText) {
@@ -2673,10 +7995,43 @@ class LanhuViewer {
       });
 
     const dedupedTextLayers = this.deduplicateNearTextLayers(textLayers);
-    const sliceLayers = this.buildRenderableSliceLayers(layers, slices);
-    const visibleTextLayers = this.filterTextLayersCoveredBySlices(dedupedTextLayers, sliceLayers);
+    const imageLayers = useDirectLayerImages
+      ? this.buildRenderableDirectImageLayers(layers)
+      : this.buildRenderableSliceLayers(layers, slices);
+    const visibleTextLayers = useDirectLayerImages
+      ? dedupedTextLayers
+      : this.filterTextLayersCoveredBySlices(dedupedTextLayers, imageLayers);
 
-    return this.sortRenderableLayersForHtml([...sliceLayers, ...visibleTextLayers]);
+    return this.sortRenderableLayersForHtml([...imageLayers, ...visibleTextLayers]);
+  }
+
+  buildRenderableDirectImageLayers(layers) {
+    if (!Array.isArray(layers) || layers.length === 0) {
+      return [];
+    }
+
+    const seen = new Set();
+    return layers
+      .filter((layer) => {
+        if (!layer || layer.visible === false || !layer.has_image) return false;
+        const width = Number(layer.width) || 0;
+        const height = Number(layer.height) || 0;
+        return width > 1 && height > 1 && Boolean(layer.image);
+      })
+      .map((layer) => {
+        const layerKey = this.getLayerReuseKey(layer);
+        if (!layerKey || seen.has(layerKey)) {
+          return null;
+        }
+        seen.add(layerKey);
+        return {
+          ...layer,
+          _text: '',
+          text: '',
+          _imageUrl: this.getProxiedImageUrl(layer.image)
+        };
+      })
+      .filter(Boolean);
   }
 
   buildRenderableSliceLayers(layers, slices) {
@@ -3077,8 +8432,8 @@ class LanhuViewer {
 
   isNearDuplicateTextLayer(a, b) {
     if (!a || !b) return false;
-    const textA = (a._text || this.getLayerText(a.text)).trim();
-    const textB = (b._text || this.getLayerText(b.text)).trim();
+    const textA = this.resolveLayerText(a).trim();
+    const textB = this.resolveLayerText(b).trim();
     if (!textA || textA !== textB) return false;
 
     const ax = Number(a.x) || 0;
@@ -3361,7 +8716,7 @@ class LanhuViewer {
       styles.push(`border-radius:${Math.round(borderRadius * styleScale)}px`);
     }
 
-    const text = layer._text || this.getLayerText(layer.text);
+    const text = this.resolveLayerText(layer);
     if (text.trim()) {
       classNames.push('lh-text');
       const fontSize = Number(layerStyles.fontSize);
@@ -3443,6 +8798,24 @@ class LanhuViewer {
         if (text) return text;
       }
     }
+    return '';
+  }
+
+  resolveLayerText(layer) {
+    if (!layer || typeof layer !== 'object') return '';
+    const preferred = String(layer._text || '').trim();
+    if (preferred) return preferred;
+
+    const directText = this.getLayerText(layer.text).trim();
+    if (directText) return directText;
+
+    const previewText = String(layer.textPreview || '').trim();
+    if (previewText) return previewText;
+
+    if (String(layer.type || '').trim() === 'textLayer') {
+      return String(layer.name || '').trim();
+    }
+
     return '';
   }
 
@@ -3597,20 +8970,18 @@ class LanhuViewer {
 
   // 放大
   zoomIn() {
-    if (this.zoomLevel < this.maxZoom) {
-      this.zoomLevel = Math.min(this.zoomLevel + this.zoomStep, this.maxZoom);
-      this.applyTransform();
-      this.updateZoomLevel();
+    if (this.zoomLevel >= this.maxZoom) return;
+    const center = this.getPreviewCenterPoint();
+    if (this.zoomToPoint(this.zoomLevel + this.zoomStep, center.x, center.y)) {
       this.saveCurrentDesignState();
     }
   }
 
   // 缩小
   zoomOut() {
-    if (this.zoomLevel > this.minZoom) {
-      this.zoomLevel = Math.max(this.zoomLevel - this.zoomStep, this.minZoom);
-      this.applyTransform();
-      this.updateZoomLevel();
+    if (this.zoomLevel <= this.minZoom) return;
+    const center = this.getPreviewCenterPoint();
+    if (this.zoomToPoint(this.zoomLevel - this.zoomStep, center.x, center.y)) {
       this.saveCurrentDesignState();
     }
   }
@@ -3636,12 +9007,15 @@ class LanhuViewer {
 
   // 应用变换
   applyTransform() {
-    if (this.previewImage) {
+    if (this.panzoom) {
+      this.panzoom.zoom(this.zoomLevel, { animate: false, force: true, silent: true });
+      this.panzoom.pan(this.panX, this.panY, { animate: false, force: true, silent: true });
+    } else if (this.previewImage) {
       this.previewImage.style.transform = `scale(${this.zoomLevel}) translate(${this.panX}px, ${this.panY}px)`;
     }
 
     // 拖动时不渲染热点和图层，提升性能
-    if (!this.isDragging) {
+    if (!this.isPreviewTransforming()) {
       this.scheduleHotspotRender();
       if (this.isLayerMode && this.layers.length > 0) {
         this.scheduleLayerRender();
@@ -3656,7 +9030,7 @@ class LanhuViewer {
     }
     this.layerRenderTimer = setTimeout(() => {
       this.layerRenderTimer = null;
-      if (this.isLayerMode && !this.isDragging) {
+      if (this.isLayerMode && !this.isPreviewTransforming()) {
         this.showLayerAnnotations();
       }
     }, 100);
@@ -3664,48 +9038,50 @@ class LanhuViewer {
 
   // 鼠标滚轮处理
   handleWheel(e) {
-    e.preventDefault();
+    if (this.isMarkMode || this.isNoteMode) return;
 
-    const delta = e.deltaY > 0 ? -this.zoomStep : this.zoomStep;
-    const newZoom = Math.max(this.minZoom, Math.min(this.maxZoom, this.zoomLevel + delta));
+    if (this.isWheelZoomGesture(e)) {
+      e.preventDefault();
+      this.endWheelPan();
 
-    if (newZoom !== this.zoomLevel) {
-      this.zoomLevel = newZoom;
-      this.applyTransform();
-      this.updateZoomLevel();
+      const zoomFactor = Math.exp(-e.deltaY * this.wheelZoomIntensity);
+      const nextZoom = this.clampZoom(this.zoomLevel * zoomFactor);
 
-      // 防抖保存状态
-      clearTimeout(this.zoomSaveTimer);
-      this.zoomSaveTimer = setTimeout(() => this.saveCurrentDesignState(), 300);
+      if (this.zoomToPoint(nextZoom, e.clientX, e.clientY)) {
+        this.queueDesignStateSave();
+      }
+      return;
+    }
+
+    if (this.panByWheel(e.deltaX, e.deltaY)) {
+      e.preventDefault();
     }
   }
 
   // 开始拖动
   startDrag(e) {
     if (this.isMarkMode || this.isNoteMode) return;
-    if (e.button !== 0) return; // 只响应左键
+    if (this.isPinching) return;
+    if (!this.isPrimaryPointerEvent(e)) return;
     if (this.zoomLevel <= 1) return; // 只有放大时才允许拖动
 
-    this.isDragging = true;
-    this.dragStartX = e.clientX - this.panX * this.zoomLevel;
-    this.dragStartY = e.clientY - this.panY * this.zoomLevel;
-    this.previewContainer.classList.add('dragging');
+    const point = this.getPointerClientPoint(e);
+    if (!point) return;
 
-    // 拖动时隐藏标注层以提升性能
-    if (this.layerAnnotationLayer) {
-      this.layerAnnotationLayer.style.display = 'none';
-    }
-    if (this.hotspotLayer) {
-      this.hotspotLayer.style.display = 'none';
-    }
+    this.isDragging = true;
+    this.dragStartX = point.clientX - this.panX * this.zoomLevel;
+    this.dragStartY = point.clientY - this.panY * this.zoomLevel;
+    this.setPreviewInteractionActive();
   }
 
   // 执行拖动
   doDrag(e) {
     if (!this.isDragging) return;
+    const point = this.getPointerClientPoint(e);
+    if (!point) return;
 
-    this.panX = (e.clientX - this.dragStartX) / this.zoomLevel;
-    this.panY = (e.clientY - this.dragStartY) / this.zoomLevel;
+    this.panX = (point.clientX - this.dragStartX) / this.zoomLevel;
+    this.panY = (point.clientY - this.dragStartY) / this.zoomLevel;
     this.applyTransform();
   }
 
@@ -3713,19 +9089,9 @@ class LanhuViewer {
   endDrag() {
     if (!this.isDragging) return;
     this.isDragging = false;
-    if (this.previewContainer) {
-      this.previewContainer.classList.remove('dragging');
-    }
+    this.setPreviewInteractionActive();
     // 拖动结束后保存状态
     this.saveCurrentDesignState();
-
-    // 拖动结束后重新显示标注层
-    if (this.hotspotLayer) {
-      this.hotspotLayer.style.display = '';
-    }
-    if (this.isLayerMode && this.layerAnnotationLayer) {
-      this.layerAnnotationLayer.style.display = 'block';
-    }
 
     // 重新渲染
     this.scheduleHotspotRender();
@@ -3931,6 +9297,7 @@ class LanhuViewer {
       // 添加鼠标事件
       layerEl.addEventListener('mouseenter', (e) => this.showLayerTooltip(e, layer));
       layerEl.addEventListener('mouseleave', () => this.hideLayerTooltip());
+      layerEl.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
       layerEl.addEventListener('click', (e) => {
         e.stopPropagation();
         this.showLayerTooltip(e, layer, true);
@@ -3990,6 +9357,8 @@ class LanhuViewer {
     `;
 
     this.previewContainer.appendChild(panel);
+    panel.addEventListener('mousedown', (e) => e.stopPropagation());
+    panel.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
 
     // 绑定事件
     document.getElementById('layerPanelClose').addEventListener('click', () => {

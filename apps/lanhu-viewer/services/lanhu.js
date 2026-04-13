@@ -1,5 +1,37 @@
 const { chromium } = require('playwright');
 
+const DDS_FRAMEWORK_LABELS = {
+  h5: 'HTML',
+  html: 'HTML',
+  vue: 'Vue',
+  vue2: 'Vue',
+  react: 'React',
+  wxmp: '微信小程序',
+  weapp: '微信小程序',
+  mini_program: '微信小程序',
+  miniProgram: '微信小程序',
+  uniapp: 'uni-app',
+  'uni-app': 'uni-app'
+};
+
+const DDS_PRIMARY_FILE_NAMES = {
+  HTML: 'index.html',
+  Vue: 'index.vue',
+  React: 'index.jsx',
+  '微信小程序': 'index.wxml',
+  'uni-app': 'index.vue'
+};
+
+const DDS_FATAL_RUNTIME_PATTERNS = [
+  /Cannot read properties of undefined \(reading 'files'\)/i,
+  /getStructureCode/i,
+  /selectFrameValue/i
+];
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 class LanhuService {
   constructor() {
     this.browser = null;
@@ -8,12 +40,15 @@ class LanhuService {
     this.cookies = [];
     this.loginPromise = null;
     this.logs = [];
+    this.progressReporter = null;
   }
 
   // 添加日志
   log(message, type = 'info') {
     const time = new Date().toLocaleTimeString();
-    this.logs.push({ time, message, type });
+    const entry = { time, message, type };
+    this.logs.push(entry);
+    this.emitProgress({ type: 'log', log: entry });
     console.log(`[${type}] ${message}`);
   }
 
@@ -27,11 +62,76 @@ class LanhuService {
     return this.logs;
   }
 
+  setProgressReporter(reporter) {
+    this.progressReporter = typeof reporter === 'function' ? reporter : null;
+  }
+
+  emitProgress(event) {
+    if (typeof this.progressReporter !== 'function') {
+      return;
+    }
+
+    try {
+      this.progressReporter(event);
+    } catch (error) {
+      console.warn('Progress reporter error:', error.message);
+    }
+  }
+
+  updateGeneratedStep(stepKey, currentAction = '') {
+    this.emitProgress({
+      type: 'step',
+      stepKey,
+      currentAction
+    });
+  }
+
   /**
    * 设置 Cookie
    */
   setCookies(cookies) {
     this.cookies = cookies;
+  }
+
+  getValidCookies() {
+    return this.cookies.filter((cookie) => {
+      if (!cookie || !cookie.name || typeof cookie.value === 'undefined') {
+        return false;
+      }
+      if (cookie.expires === -1 || typeof cookie.expires !== 'number') {
+        return true;
+      }
+      return cookie.expires > (Date.now() / 1000);
+    });
+  }
+
+  buildCookieHeader() {
+    return this.getValidCookies()
+      .map((cookie) => `${cookie.name}=${cookie.value}`)
+      .join('; ');
+  }
+
+  buildRequestHeaders(extraHeaders = {}) {
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+      ...extraHeaders
+    };
+    const cookieHeader = this.buildCookieHeader();
+    if (cookieHeader) {
+      headers.Cookie = cookieHeader;
+    }
+    return headers;
+  }
+
+  async createAuthenticatedContext() {
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext();
+
+    if (this.cookies.length > 0) {
+      await context.addCookies(this.cookies);
+    }
+
+    return { browser, context };
   }
 
   /**
@@ -1246,6 +1346,610 @@ class LanhuService {
     }
   }
 
+  normalizeGeneratedFramework(framework) {
+    const normalized = String(framework || 'html').trim();
+    const lowerCased = normalized.toLowerCase();
+    return {
+      value: lowerCased,
+      label: DDS_FRAMEWORK_LABELS[normalized] || DDS_FRAMEWORK_LABELS[lowerCased] || DDS_FRAMEWORK_LABELS.html
+    };
+  }
+
+  async fetchDesignVersionInfo(requestContext, teamId, projectId, imageId) {
+    const requestUrl = new URL('https://lanhuapp.com/api/project/image');
+    requestUrl.searchParams.set('dds_status', '1');
+    requestUrl.searchParams.set('image_id', String(imageId));
+    requestUrl.searchParams.set('team_id', String(teamId));
+    requestUrl.searchParams.set('project_id', String(projectId));
+
+    const response = await requestContext.get(requestUrl.toString(), {
+      headers: this.buildRequestHeaders({
+        Accept: 'application/json, text/plain, */*',
+        Referer: 'https://lanhuapp.com/web/'
+      })
+    });
+
+    if (!response.ok()) {
+      throw new Error(`获取设计图版本失败: HTTP ${response.status()}`);
+    }
+
+    const data = await response.json();
+    if (data?.code !== '00000' || !data?.result) {
+      throw new Error(data?.msg || '获取设计图版本失败');
+    }
+
+    const result = data.result;
+    const versionId = result.latest_version || result.versions?.[0]?.id;
+    if (!versionId) {
+      throw new Error('未找到最新版本 ID');
+    }
+
+    return {
+      versionId: String(versionId),
+      designName: result.name || 'Untitled',
+      previewUrl: result.url || '',
+      ddsJumpStatus: Number(result.dds_jump_status) || 0,
+      projectId: String(projectId),
+      teamId: String(teamId),
+      imageId: String(imageId)
+    };
+  }
+
+  async checkDdsCodeAvailability(versionId) {
+    const response = await fetch(
+      `https://dds.lanhuapp.com/api/dds/image/store_schema_revise?version_id=${encodeURIComponent(versionId)}`,
+      {
+        headers: this.buildRequestHeaders({
+          Accept: 'application/json, text/plain, */*',
+          Referer: 'https://dds.lanhuapp.com/'
+        })
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(`校验 DDS 代码数据失败: HTTP ${response.status}`);
+    }
+
+    const data = await response.json();
+    return {
+      success: data?.code === '00000',
+      code: String(data?.code || ''),
+      message: data?.msg || '',
+      data: data?.data || null
+    };
+  }
+
+  async selectCascaderOption(page, dropdownIndex, optionLabel, timeout = 5000) {
+    const input = page.locator('.codetype .el-input__inner').nth(dropdownIndex);
+    if (await input.count() === 0) {
+      throw new Error(`未找到第 ${dropdownIndex + 1} 个代码下拉框`);
+    }
+
+    if ((await input.inputValue()).trim() === optionLabel) {
+      return;
+    }
+
+    const waitForVisiblePanel = async (maxTimeout) => {
+      await page.waitForFunction(
+        () => Array.from(document.querySelectorAll('.el-cascader-panel')).some((panel) => {
+          if (!(panel instanceof HTMLElement)) {
+            return false;
+          }
+          const style = window.getComputedStyle(panel);
+          const rect = panel.getBoundingClientRect();
+          return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+        }),
+        undefined,
+        { timeout: maxTimeout }
+      );
+    };
+
+    const deadline = Date.now() + timeout;
+    const clickTargets = [
+      page.locator('.codetype .el-cascader').nth(dropdownIndex),
+      page.locator('.codetype .el-input').nth(dropdownIndex),
+      input,
+      page.locator('.codetype .el-input__suffix').nth(dropdownIndex)
+    ];
+
+    let panelVisible = false;
+    for (const target of clickTargets) {
+      const remainingTime = deadline - Date.now();
+      if (remainingTime <= 0) break;
+      if (await target.count() === 0) continue;
+
+      try {
+        await target.click({ force: true, timeout: Math.min(1500, remainingTime) });
+      } catch (error) {}
+
+      try {
+        await waitForVisiblePanel(Math.min(1500, deadline - Date.now()));
+        panelVisible = true;
+        break;
+      } catch (error) {}
+    }
+
+    if (!panelVisible) {
+      try {
+        await input.focus();
+        await input.press('ArrowDown', { timeout: Math.min(1000, Math.max(500, deadline - Date.now())) });
+        await waitForVisiblePanel(Math.max(1000, deadline - Date.now()));
+        panelVisible = true;
+      } catch (error) {}
+    }
+
+    if (!panelVisible) {
+      throw new Error(`展开代码下拉框失败: 第 ${dropdownIndex + 1} 个下拉框未弹出选项面板`);
+    }
+
+    const optionPattern = new RegExp(`^\\s*${escapeRegExp(optionLabel)}\\s*$`);
+    const option = page
+      .locator('.el-cascader-panel:visible .el-cascader-node__label:visible')
+      .filter({ hasText: optionPattern })
+      .first();
+    await option.waitFor({ state: 'visible', timeout });
+    try {
+      await option.click({ force: true, timeout });
+    } catch (error) {
+      await option.evaluate((node) => node.click());
+    }
+    await page.waitForFunction(
+      ({ index, value }) => {
+        const inputs = document.querySelectorAll('.codetype .el-input__inner');
+        return Boolean(inputs[index] && inputs[index].value === value);
+      },
+      { index: dropdownIndex, value: optionLabel },
+      { timeout }
+    );
+  }
+
+  getPrimaryErrorLine(message) {
+    return String(message || '')
+      .split(/\r?\n/)
+      .map((line) => String(line || '').trim())
+      .find(Boolean) || '';
+  }
+
+  formatDdsRuntimeMessage(message) {
+    const primaryLine = this.getPrimaryErrorLine(message);
+    if (!primaryLine) {
+      return '蓝湖内部运行异常';
+    }
+
+    return primaryLine
+      .replace(/^Uncaught\s*\(in promise\)\s*/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  buildDdsFrameworkFailureMessage(targetFramework, runtimeMessage) {
+    const conciseMessage = this.formatDdsRuntimeMessage(runtimeMessage);
+    return `DDS 当前无法生成 ${targetFramework.label} 代码：${conciseMessage}`;
+  }
+
+  createDdsRuntimeTracker(page) {
+    const tracker = {
+      entries: [],
+      seen: new Set()
+    };
+
+    const pushEntry = (source, message, type = 'error') => {
+      const normalizedMessage = String(message || '').trim();
+      if (!normalizedMessage) {
+        return;
+      }
+
+      const key = `${source}:${type}:${normalizedMessage}`;
+      if (tracker.seen.has(key)) {
+        return;
+      }
+
+      tracker.seen.add(key);
+      tracker.entries.push({
+        source,
+        type,
+        message: normalizedMessage,
+        timestamp: Date.now()
+      });
+
+      const logType = type === 'warning' ? 'warn' : 'error';
+      this.log(`DDS${source}异常: ${normalizedMessage}`, logType);
+    };
+
+    page.on('console', (msg) => {
+      const type = msg.type();
+      if (!['error', 'warning'].includes(type)) {
+        return;
+      }
+      pushEntry('控制台', msg.text(), type);
+    });
+
+    page.on('pageerror', (error) => {
+      pushEntry('页面', error?.message || String(error || ''), 'error');
+    });
+
+    return tracker;
+  }
+
+  getLatestDdsFatalRuntimeMessage(runtimeTracker) {
+    const entries = Array.isArray(runtimeTracker?.entries) ? runtimeTracker.entries : [];
+    const matchedEntry = [...entries]
+      .reverse()
+      .find((entry) => DDS_FATAL_RUNTIME_PATTERNS.some((pattern) => pattern.test(entry.message || '')));
+
+    return matchedEntry?.message || '';
+  }
+
+  async readGeneratedInputValues(page) {
+    return page.locator('.codetype .el-input__inner').evaluateAll((nodes) => (
+      nodes.map((node) => String(node.value || '').trim()).filter(Boolean)
+    ));
+  }
+
+  async confirmGeneratedFrameworkExtraSelection(page, targetFramework, timeout = 15000) {
+    if (targetFramework.label === 'HTML') {
+      return;
+    }
+
+    const values = await this.readGeneratedInputValues(page);
+    if (values.length < 3) {
+      return;
+    }
+
+    const extraOption = String(values[1] || '').trim();
+    if (!extraOption || /\.(css|less|scss|sass|wxss|acss)$/i.test(extraOption)) {
+      return;
+    }
+
+    this.log(`检测到 ${targetFramework.label} 附加选项: ${extraOption}`);
+    await this.selectCascaderOption(page, 1, extraOption, timeout);
+    this.log(`已确认附加选项: ${extraOption}`, 'success');
+  }
+
+  async waitForNonHtmlFrameworkReady(page, targetFramework, runtimeTracker, timeout = 45000) {
+    const deadline = Date.now() + timeout;
+    let sawTargetFramework = false;
+    let lastValues = [];
+
+    while (Date.now() < deadline) {
+      const fatalRuntimeMessage = this.getLatestDdsFatalRuntimeMessage(runtimeTracker);
+      if (fatalRuntimeMessage) {
+        throw new Error(this.buildDdsFrameworkFailureMessage(targetFramework, fatalRuntimeMessage));
+      }
+
+      const values = await this.readGeneratedInputValues(page);
+      lastValues = values;
+      const currentFramework = String(values[0] || '').trim();
+      if (currentFramework === targetFramework.label) {
+        sawTargetFramework = true;
+      } else if (sawTargetFramework && currentFramework) {
+        const stateText = values.join(' / ');
+        throw new Error(`DDS 未能稳定切换到 ${targetFramework.label}，当前已回退为 ${stateText}`);
+      }
+
+      const editors = await this.readGeneratedEditors(page);
+      const primaryCode = String(editors[0] || '').replace(/\u200b/g, '').trim();
+      if (
+        currentFramework === targetFramework.label &&
+        primaryCode.length >= 60 &&
+        !/<!DOCTYPE html|<html|<body/i.test(primaryCode)
+      ) {
+        return;
+      }
+
+      await page.waitForTimeout(250);
+    }
+
+    const fatalRuntimeMessage = this.getLatestDdsFatalRuntimeMessage(runtimeTracker);
+    if (fatalRuntimeMessage) {
+      throw new Error(this.buildDdsFrameworkFailureMessage(targetFramework, fatalRuntimeMessage));
+    }
+
+    const stateText = lastValues.length ? `，当前下拉状态：${lastValues.join(' / ')}` : '';
+    throw new Error(`等待 ${targetFramework.label} 代码生成超时${stateText}`);
+  }
+
+  async waitForGeneratedEditorContent(page, {
+    minEditors = 1,
+    editorIndex = null,
+    minLength = 60,
+    expectedPatterns = [],
+    forbiddenPatterns = [],
+    timeout = 60000
+  } = {}) {
+    await page.waitForFunction(
+      ({
+        minEditors: minEditorCount,
+        editorIndex: targetIndex,
+        minLength: minCodeLength,
+        expectedPatterns: patterns,
+        forbiddenPatterns: blockedPatterns
+      }) => {
+        const hasText = (value) => typeof value === 'string' && value.replace(/\u200b/g, '').trim().length > 0;
+        const hasMeaningfulCode = (value) => {
+          if (!hasText(value)) {
+            return false;
+          }
+
+          const normalizedValue = value.replace(/\u200b/g, '').trim();
+          if (normalizedValue.length < minCodeLength) {
+            return false;
+          }
+
+          const containsPattern = (pattern) => {
+            try {
+              return new RegExp(pattern, 'i').test(normalizedValue);
+            } catch (error) {
+              return normalizedValue.includes(pattern);
+            }
+          };
+
+          const matchesExpectedPatterns = !Array.isArray(patterns) || patterns.length === 0
+            ? true
+            : patterns.some((pattern) => containsPattern(pattern));
+          if (!matchesExpectedPatterns) {
+            return false;
+          }
+
+          const matchesBlockedPatterns = Array.isArray(blockedPatterns) && blockedPatterns.length > 0
+            ? blockedPatterns.some((pattern) => containsPattern(pattern))
+            : false;
+
+          return !matchesBlockedPatterns;
+        };
+
+        const readEditor = (element) => {
+          if (!element) {
+            return '';
+          }
+
+          const linesText = Array.from(element.querySelectorAll('.CodeMirror-code pre'))
+            .map((node) => node.textContent || '')
+            .join('\n');
+
+          const candidates = [
+            element.CodeMirror?.getValue?.(),
+            element.CodeMirror?.doc?.getValue?.(),
+            linesText,
+            element.querySelector('.CodeMirror-code')?.textContent,
+            element.textContent
+          ];
+
+          return candidates.find(hasText) || '';
+        };
+
+        const inputs = document.querySelectorAll('.codetype .el-input__inner');
+        const editors = Array.from(document.querySelectorAll('.CodeMirror'));
+
+        if (!inputs.length || editors.length < minEditorCount) {
+          return false;
+        }
+
+        if (typeof targetIndex === 'number') {
+          return hasMeaningfulCode(readEditor(editors[targetIndex]));
+        }
+
+        return editors.some((element) => hasMeaningfulCode(readEditor(element)));
+      },
+      { minEditors, editorIndex, minLength, expectedPatterns, forbiddenPatterns },
+      { timeout }
+    );
+  }
+
+  async readGeneratedEditors(page) {
+    return page.evaluate(() => {
+      const hasText = (value) => typeof value === 'string' && value.replace(/\u200b/g, '').trim().length > 0;
+      const normalize = (value) => (typeof value === 'string' ? value.replace(/\u200b/g, '').replace(/\r\n/g, '\n') : '');
+      const readEditor = (element) => {
+        if (!element) {
+          return '';
+        }
+
+        const linesText = Array.from(element.querySelectorAll('.CodeMirror-code pre'))
+          .map((node) => node.textContent || '')
+          .join('\n');
+
+        const candidates = [
+          element.CodeMirror?.getValue?.(),
+          element.CodeMirror?.doc?.getValue?.(),
+          linesText,
+          element.querySelector('.CodeMirror-code')?.textContent,
+          element.textContent
+        ];
+
+        for (const candidate of candidates) {
+          if (hasText(candidate)) {
+            return normalize(candidate);
+          }
+        }
+
+        return '';
+      };
+
+      return Array.from(document.querySelectorAll('.CodeMirror')).map(readEditor);
+    });
+  }
+
+  async getGeneratedCode(teamId, projectId, imageId, framework = 'html') {
+    this.clearLogs();
+    const targetFramework = this.normalizeGeneratedFramework(framework);
+    this.updateGeneratedStep('prepare', '正在初始化蓝湖代码生成环境');
+    this.log(`开始获取蓝湖生成代码 (${targetFramework.label})...`);
+    this.log('正在启动无头浏览器并注入登录态...');
+
+    const { browser, context } = await this.createAuthenticatedContext();
+
+    try {
+      this.updateGeneratedStep('fetch-version', '正在读取设计图最新版本');
+      const designMeta = await this.fetchDesignVersionInfo(context.request, teamId, projectId, imageId);
+      this.log(`设计图版本: ${designMeta.versionId}`, 'success');
+      this.log('正在校验 DDS 代码数据...');
+      const ddsAvailability = await this.checkDdsCodeAvailability(designMeta.versionId);
+      if (!ddsAvailability.success) {
+        const ddsStatusText = designMeta.ddsJumpStatus ? `，dds_jump_status=${designMeta.ddsJumpStatus}` : '';
+        throw new Error(`当前设计图暂无蓝湖代码数据（${ddsAvailability.message || ddsAvailability.code || 'DDS 数据不可用'}${ddsStatusText}）`);
+      }
+      this.log('DDS 代码数据校验通过', 'success');
+
+      const ddsUrl = `https://dds.lanhuapp.com/#/?version_id=${encodeURIComponent(designMeta.versionId)}&source=detailDetachTab`;
+      const page = await context.newPage();
+      const runtimeTracker = this.createDdsRuntimeTracker(page);
+
+      this.updateGeneratedStep('open-dds', '正在打开 DDS 代码页并等待编辑器加载');
+      this.log('打开 DDS 代码页...');
+      await page.goto(ddsUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await page.locator('.codetype .el-input__inner').first().waitFor({ state: 'visible', timeout: 60000 });
+      this.log('DDS 页面已打开，正在等待代码编辑器初始化...');
+      await this.waitForGeneratedEditorContent(page, { minEditors: 1, minLength: 60, timeout: 60000 });
+
+      this.updateGeneratedStep('switch-framework', `正在切换代码框架到 ${targetFramework.label}`);
+      await this.selectCascaderOption(page, 0, targetFramework.label);
+      await this.confirmGeneratedFrameworkExtraSelection(page, targetFramework);
+      this.log(`已切换代码框架: ${targetFramework.label}`, 'success');
+      if (targetFramework.label === 'HTML') {
+        await this.waitForGeneratedEditorContent(page, {
+          minEditors: 1,
+          editorIndex: 0,
+          minLength: 200,
+          expectedPatterns: ['<!DOCTYPE html', '<html', '<body'],
+          timeout: 45000
+        });
+      } else {
+        await this.waitForNonHtmlFrameworkReady(page, targetFramework, runtimeTracker, 45000);
+      }
+
+      if (targetFramework.label === 'HTML') {
+        await page.waitForFunction(
+          (dropdownIndex) => {
+            const input = document.querySelectorAll('.codetype .el-input__inner')[dropdownIndex];
+            return Boolean(input && /\.css$/i.test((input.value || '').trim()));
+          },
+          1,
+          { timeout: 45000 }
+        );
+      }
+
+      this.updateGeneratedStep('read-files', '正在读取蓝湖生成代码文件');
+      const currentValues = await page.locator('.codetype .el-input__inner').evaluateAll((nodes) => (
+        nodes.map((node) => node.value).filter(Boolean)
+      ));
+      const editors = (await this.readGeneratedEditors(page)).filter((value) => typeof value === 'string');
+
+      if (!editors.length || !editors[0]) {
+        throw new Error('未读取到生成代码内容');
+      }
+
+      const files = [{
+        name: DDS_PRIMARY_FILE_NAMES[targetFramework.label] || 'index.txt',
+        content: editors[0],
+        language: targetFramework.label === 'HTML' ? 'html' : targetFramework.value,
+        isPrimary: true
+      }];
+
+      if (targetFramework.label === 'HTML') {
+        const cssInput = page.locator('.codetype .el-input__inner').nth(1);
+        if (await cssInput.count()) {
+          const queuedCssNames = [];
+          const queuedCssNameSet = new Set();
+          const pushCssName = (name) => {
+            const normalizedName = String(name || '').trim();
+            if (!/\.css$/i.test(normalizedName) || queuedCssNameSet.has(normalizedName)) {
+              return;
+            }
+            queuedCssNameSet.add(normalizedName);
+            queuedCssNames.push(normalizedName);
+          };
+
+          currentValues.forEach(pushCssName);
+          Array.from(files[0].content.matchAll(/<link\b[^>]*href=["']\.\/([^"']+\.css)["'][^>]*>/gi))
+            .forEach((match) => pushCssName(match[1]));
+
+          await cssInput.click();
+          await page.locator('.el-cascader-panel:visible').first().waitFor({ state: 'visible', timeout: 5000 });
+          const cssOptions = await page.locator('.el-cascader-panel:visible .el-cascader-node__label:visible').evaluateAll((nodes) => (
+            Array.from(new Set(
+              nodes
+                .map((node) => (node.textContent || '').trim())
+                .filter((text) => /\.css$/i.test(text))
+            ))
+          ));
+          await page.keyboard.press('Escape').catch(() => {});
+
+          cssOptions.forEach(pushCssName);
+          this.log(`检测到 ${queuedCssNames.length} 个 CSS 文件候选`);
+
+          const currentCssName = currentValues.find((value) => /\.css$/i.test(String(value || '').trim())) || '';
+          if (currentCssName && editors[1]) {
+            files.push({
+              name: currentCssName,
+              content: editors[1],
+              language: 'css',
+              isPrimary: false
+            });
+          }
+
+          for (const cssName of queuedCssNames) {
+            if (cssName === currentCssName) {
+              continue;
+            }
+
+            this.log(`正在读取样式文件: ${cssName}`);
+            await this.selectCascaderOption(page, 1, cssName, 15000);
+            await this.waitForGeneratedEditorContent(page, { minEditors: 2, editorIndex: 1, minLength: 40, timeout: 45000 });
+            const cssEditors = await this.readGeneratedEditors(page);
+            const cssContent = cssEditors[1] || '';
+            if (cssContent) {
+              files.push({
+                name: cssName,
+                content: cssContent,
+                language: 'css',
+                isPrimary: false
+              });
+            }
+          }
+        }
+      } else if (editors[1]) {
+        const extraFileName = currentValues[currentValues.length - 1] || 'style.css';
+        files.push({
+          name: extraFileName,
+          content: editors[1],
+          language: /\.wxss$/i.test(extraFileName) ? 'css' : 'css',
+          isPrimary: false
+        });
+      }
+
+      this.log(`成功读取 ${files.length} 个代码文件`, 'success');
+      this.updateGeneratedStep(
+        'build-preview',
+        targetFramework.label === 'HTML' ? '正在组装 HTML 预览结果' : '正在整理代码生成结果'
+      );
+      if (targetFramework.label === 'HTML') {
+        this.log('正在组装 HTML 预览结果...');
+      }
+
+      return {
+        success: true,
+        framework: {
+          value: targetFramework.value,
+          label: targetFramework.label
+        },
+        design: {
+          id: designMeta.imageId,
+          name: designMeta.designName,
+          previewUrl: designMeta.previewUrl
+        },
+        versionId: designMeta.versionId,
+        ddsUrl,
+        files,
+        previewHtml: targetFramework.label === 'HTML'
+          ? this.buildPreviewHtml(files[0].content, files.slice(1))
+          : ''
+      };
+    } finally {
+      await browser.close();
+    }
+  }
+
   /**
    * 下载图片
    */
@@ -1385,6 +2089,79 @@ class LanhuService {
     } finally {
       await browser.close();
     }
+  }
+
+  buildPreviewHtml(htmlCode, extraFiles = []) {
+    const fileMap = new Map(
+      extraFiles
+        .filter((file) => file && file.name && typeof file.content === 'string')
+        .map((file) => [file.name, file.content])
+    );
+
+    const assetBaseUrl = 'https://dds.lanhuapp.com/';
+    const ignoredProtocolRegex = /^(?:data:|https?:|\/\/|#|mailto:|tel:|javascript:)/i;
+
+    const normalizeAssetUrl = (rawUrl, baseHref = assetBaseUrl) => {
+      const value = String(rawUrl || '').trim();
+      if (!value || ignoredProtocolRegex.test(value)) {
+        return value;
+      }
+      try {
+        return new URL(value, baseHref).toString();
+      } catch (error) {
+        return value;
+      }
+    };
+
+    const rewriteCssUrls = (content, filePath) => {
+      const directory = filePath ? filePath.slice(0, filePath.lastIndexOf('/') + 1) : '';
+      const cssBase = new URL(directory || '.', assetBaseUrl).toString();
+      return String(content).replace(/url\(\s*(['"]?)([^'"\)]+)\1\s*\)/gi, (_, quote, ref) => {
+        const normalized = normalizeAssetUrl(ref, cssBase);
+        const preservedQuote = quote || '';
+        return `url(${preservedQuote}${normalized}${preservedQuote})`;
+      });
+    };
+
+    const inlineStyleFromLink = (html = '') => {
+      const cssLinkRegex = /<link\b(?=[^>]*\brel\s*=\s*["']?stylesheet\b)[^>]*href=["']\.\/([^"']+)["'][^>]*>/gi;
+      return html.replace(cssLinkRegex, (_, fileName) => {
+        const content = fileMap.get(fileName);
+        if (typeof content !== 'string') {
+          return '';
+        }
+        const rewrittenCss = rewriteCssUrls(content, fileName);
+        return `<style data-generated-file="${fileName}">\n${rewrittenCss}\n</style>`;
+      });
+    };
+
+    const rewriteAttributes = (html = '') => {
+      const attrRegex = /\b(src|href|poster|data-src|data-href|xlink:href)\s*=\s*(['"])(.*?)\2/gi;
+      return html.replace(attrRegex, (match, attrName, quote, value) => (
+        `${attrName}=${quote}${normalizeAssetUrl(value)}${quote}`
+      ));
+    };
+
+    const rewriteSrcset = (html = '') => {
+      const srcsetRegex = /\bsrcset\s*=\s*(['"])(.*?)\1/gi;
+      return html.replace(srcsetRegex, (match, quote, value) => {
+        const rewritten = value.replace(/(^|,)\s*([^,\s]+)([^,]*)/g, (segmentMatch, prefix, urlPart, suffix) => (
+          `${prefix}${normalizeAssetUrl(urlPart)}${suffix}`
+        ));
+        return `srcset=${quote}${rewritten}${quote}`;
+      });
+    };
+
+    const rewriteGlobalCssUrls = (html = '') => html.replace(/url\(\s*(['"]?)([^'"\)]+)\1\s*\)/gi, (match, quote, value) => {
+      const normalized = normalizeAssetUrl(value);
+      const preservedQuote = quote || '';
+      return `url(${preservedQuote}${normalized}${preservedQuote})`;
+    });
+
+    const htmlWithInlineCss = inlineStyleFromLink(String(htmlCode || ''));
+    const withRewrittenAttrs = rewriteAttributes(htmlWithInlineCss);
+    const withSrcset = rewriteSrcset(withRewrittenAttrs);
+    return rewriteGlobalCssUrls(withSrcset);
   }
 }
 

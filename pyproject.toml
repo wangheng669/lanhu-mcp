@@ -45,6 +45,7 @@ dependencies = [
     "beautifulsoup4>=4.12.0",
     "playwright>=1.48.0",
     "lxml>=5.0.0",
+    "Pillow>=10.0.0",
 ]
 
 [project.optional-dependencies]
@@ -156,4 +157,3 @@ exclude = [
     "logs",
 ]
 max-complexity = 10
-
