@@ -36,7 +36,22 @@ class LanhuViewer {
     this.cache = this.loadCache();
     this.generatedCodeCache = this.loadGeneratedCodeCache();
     this.generatedCodeJobCache = this.loadGeneratedCodeJobCache();
+    this.structuredPreviewRecipeCache = this.loadStructuredPreviewRecipeCache();
     this.currentPageState = this.loadPageState();
+    this.previewDesignGroupAssignmentsByUrl = this.loadPreviewDesignGroupAssignmentsByUrl();
+    this.previewDesignGroupAssignments = {};
+    this.previewCustomGroupsByUrl = this.loadPreviewCustomGroupsByUrl();
+    this.previewCustomGroups = [];
+    this.previewFixedGroupStateByUrl = this.loadPreviewFixedGroupStateByUrl();
+    this.previewLowPriorityDockStateByUrl = this.loadPreviewLowPriorityDockStateByUrl();
+    this.previewLowPriorityDockInteraction = null;
+    this.previewCustomGroupInteraction = null;
+    this.isPreviewDesignDragging = false;
+    this.previewDraggedDesignId = '';
+    this.isPreviewLowPriorityDropActive = false;
+    this.isBootRestorePending = Boolean(this.getRestorablePageState()?.url);
+    this.selectedDesignIds = [];
+    this.pendingDesignIds = [];
     this.hotspots = [];
     this.notes = [];
     this.hotspotApiMeta = new Map();
@@ -94,8 +109,16 @@ class LanhuViewer {
     this.generatedPreviewLoadTimers = [];
     this.generatedPreviewDiagnostics = this.createInitialGeneratedPreviewDiagnostics();
     this.generatedPreviewRepairState = this.createInitialGeneratedPreviewRepairState();
+    this.generatedPreviewRepairContextRequests = new Map();
+    this.isGeneratingStructuredRecipeDraft = false;
+    this.structuredRecipeDraftRequests = new Map();
+    this.previewDesignStripLayout = '';
+    this.previewPresentationMode = '';
+    this.previewDragMoved = false;
+    this.suppressPreviewItemClickUntil = 0;
 
     this.initElements();
+    this.applyBootRestoreState();
     window.__lanhuViewerReceiveGeneratedPreviewDiagnostics = (payload) => this.handleGeneratedPreviewDiagnostics(payload);
     this.initPanzoom();
     this.initEvents();
@@ -105,6 +128,7 @@ class LanhuViewer {
     this.updateGeneratedCodeMeta();
     this.renderGeneratedPreviewDiagnostics();
     this.renderHistory();
+    this.bootstrapPageState();
     this.notifyParentReady();
     this.checkSession(); // 异步检查，完成后会调用 restorePageState
   }
@@ -142,13 +166,26 @@ class LanhuViewer {
       reason: '',
       missingModules: [],
       overlayModules: [],
+      draftType: '',
+      draftProvider: '',
+      draftStrategy: '',
+      draftFamilyName: '',
+      draftDurationMs: 0,
+      draftRecipeId: '',
+      draftApplied: false,
+      previewHtml: '',
+      outputFiles: [],
       updatedAt: 0
     };
   }
 
+  escapeRegexPattern(value) {
+    return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
   getGeneratedPreviewRepairMode() {
     const mode = String(this.generatedPreviewRepairState?.mode || '').trim();
-    return ['module', 'layer'].includes(mode) ? mode : 'dds';
+    return ['module', 'layer', 'structured'].includes(mode) ? mode : 'dds';
   }
 
   getGeneratedPreviewSourceDesign() {
@@ -194,6 +231,95 @@ class LanhuViewer {
       canvasInfo,
       slices
     };
+  }
+
+  async ensureGeneratedPreviewLayerContext(design = this.getGeneratedPreviewSourceDesign(), { forceReload = false } = {}) {
+    const resolvedDesign = this.resolveDesignEntity(design);
+    const designId = String(resolvedDesign?.id || '').trim();
+    if (!designId || !this.currentTeamId || !this.currentProjectId || !this.sessionId) {
+      return this.getGeneratedPreviewLayerContext(resolvedDesign);
+    }
+
+    const cachedContext = this.getGeneratedPreviewLayerContext(resolvedDesign);
+    if (cachedContext && !forceReload) {
+      return cachedContext;
+    }
+
+    const requestKey = `${designId}:${forceReload ? 'force' : 'cached'}`;
+    if (this.generatedPreviewRepairContextRequests.has(requestKey)) {
+      return this.generatedPreviewRepairContextRequests.get(requestKey);
+    }
+
+    const requestPromise = (async () => {
+      try {
+        const response = await fetch('/api/layers', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Session-Id': this.sessionId
+          },
+          body: JSON.stringify({
+            teamId: this.currentTeamId,
+            projectId: this.currentProjectId,
+            imageId: designId
+          })
+        });
+
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data?.success === false) {
+          return null;
+        }
+
+        const nextLayers = Array.isArray(data?.layers) ? data.layers : [];
+        const nextCanvasInfo = data?.canvas && typeof data.canvas === 'object' ? data.canvas : {};
+        if (!nextLayers.length) {
+          return null;
+        }
+
+        this.layerCache.set(designId, {
+          layers: nextLayers,
+          canvasInfo: nextCanvasInfo
+        });
+        this.saveLayerCache();
+
+        if (this.selectedDesignId === designId) {
+          this.layers = nextLayers;
+          this.canvasInfo = nextCanvasInfo;
+          this.currentLayerDesignId = designId;
+
+          if (this.isLayerMode) {
+            this.showLayerAnnotations();
+          }
+        }
+
+        return this.getGeneratedPreviewLayerContext(resolvedDesign);
+      } catch (error) {
+        return null;
+      } finally {
+        this.generatedPreviewRepairContextRequests.delete(requestKey);
+      }
+    })();
+
+    this.generatedPreviewRepairContextRequests.set(requestKey, requestPromise);
+    return requestPromise;
+  }
+
+  async primeGeneratedPreviewRepairContext(design = this.getGeneratedPreviewSourceDesign()) {
+    if (!this.generatedPreviewHtml || this.getGeneratedPreviewRepairMode() !== 'dds') {
+      return null;
+    }
+
+    const context = await this.ensureGeneratedPreviewLayerContext(design);
+    if (!context || !this.generatedPreviewHtml || this.getGeneratedPreviewRepairMode() !== 'dds') {
+      return context;
+    }
+
+    const report = this.generatedPreviewDiagnostics?.report || null;
+    if (report) {
+      this.maybeSwitchGeneratedPreviewRepairMode(report);
+    }
+
+    return context;
   }
 
   getGeneratedPreviewFrameMetrics() {
@@ -316,19 +442,30 @@ class LanhuViewer {
       slices = [],
       targetWidth = 0,
       targetHeight = 0,
-      useDirectLayerImages = false
+      originX = null,
+      originY = null,
+      sourceWidth = 0,
+      sourceHeight = 0,
+      useDirectLayerImages = false,
+      sceneProfile = null
     } = {}
   ) {
     const renderableLayers = this.getRenderableLayersForHtml(
       Array.isArray(moduleLayers) ? moduleLayers : [],
       Array.isArray(slices) ? slices : [],
-      { useDirectLayerImages }
+      { useDirectLayerImages, sceneProfile }
     );
 
     return this.normalizeLayersForCanvas(
       renderableLayers,
       Math.max(0, Number(targetWidth) || 0),
-      Math.max(0, Number(targetHeight) || 0)
+      Math.max(0, Number(targetHeight) || 0),
+      {
+        originX,
+        originY,
+        sourceWidth,
+        sourceHeight
+      }
     );
   }
 
@@ -482,6 +619,1763 @@ class LanhuViewer {
   syncInputSectionVisibility() {
     if (!this.inputSection) return;
     this.inputSection.hidden = this.shouldHideInputSection();
+  }
+
+  getRestorablePageState() {
+    let urlFromParams = '';
+    try {
+      const urlParams = new URLSearchParams(window.location.search);
+      urlFromParams = String(urlParams.get('url') || '').trim();
+    } catch (e) {}
+
+    const savedState = this.currentPageState && typeof this.currentPageState === 'object'
+      ? this.currentPageState
+      : null;
+    const savedUrl = String(savedState?.url || '').trim();
+    const savedSelectedDesignId = String(savedState?.selectedDesignId || '').trim();
+    const savedSelectedDesignIds = this.getPersistedSelectedDesignIds(savedState);
+    const savedTimestamp = Number(savedState?.timestamp) || 0;
+    const isSavedStateFresh = savedUrl && savedTimestamp > 0 && (Date.now() - savedTimestamp <= 2 * 24 * 60 * 60 * 1000);
+
+    if (urlFromParams) {
+      return {
+        url: urlFromParams,
+        selectedDesignId: isSavedStateFresh && savedUrl === urlFromParams ? savedSelectedDesignId : '',
+        selectedDesignIds: isSavedStateFresh && savedUrl === urlFromParams ? savedSelectedDesignIds : []
+      };
+    }
+
+    if (!isSavedStateFresh) {
+      return null;
+    }
+
+    return {
+      url: savedUrl,
+      selectedDesignId: savedSelectedDesignId,
+      selectedDesignIds: savedSelectedDesignIds
+    };
+  }
+
+  bootstrapPageState() {
+    const restorableState = this.getRestorablePageState();
+    const restoreUrl = String(restorableState?.url || '').trim();
+    if (!restoreUrl) {
+      return;
+    }
+
+    if (this.urlInput) {
+      this.urlInput.value = restoreUrl;
+    }
+    if (this.parseBtn) {
+      this.parseBtn.disabled = false;
+    }
+
+    const selectedDesignId = String(restorableState?.selectedDesignId || '').trim();
+    const selectedDesignIds = this.getPersistedSelectedDesignIds(restorableState);
+    if (selectedDesignId) {
+      this.pendingDesignId = selectedDesignId;
+    }
+    if (selectedDesignIds.length > 0) {
+      this.pendingDesignIds = selectedDesignIds;
+    }
+
+    const cached = this.getCache(restoreUrl);
+    if (!cached) {
+      return;
+    }
+
+    this.renderResult(cached);
+    if (this.refreshBtn) {
+      this.refreshBtn.style.display = 'inline-flex';
+    }
+  }
+
+  applyBootRestoreState() {
+    if (!this.isBootRestorePending) {
+      return;
+    }
+
+    this.appShell?.classList.add('boot-restoring', 'preview-layout-active');
+    if (this.contentEmpty) {
+      this.contentEmpty.style.display = 'none';
+    }
+  }
+
+  finishBootRestore() {
+    if (!this.isBootRestorePending) {
+      return;
+    }
+
+    this.isBootRestorePending = false;
+    this.appShell?.classList.remove('boot-restoring');
+    this.syncWorkspaceLayout();
+
+    const isShowingPrimaryView = (
+      this.loading?.style.display === 'flex' ||
+      this.previewSection?.style.display === 'flex' ||
+      this.errorBox?.style.display === 'flex'
+    );
+
+    if (!isShowingPrimaryView && this.contentEmpty) {
+      this.contentEmpty.style.display = 'flex';
+    }
+  }
+
+  syncWorkspaceLayout() {
+    const hasDesignWorkspace = this.isBootRestorePending || (
+      Boolean(this.designsSection) && this.designsSection.style.display !== 'none'
+    );
+    this.appShell?.classList.toggle('preview-layout-active', hasDesignWorkspace);
+  }
+
+  syncPreviewDesignStripLayout() {
+    if (!this.designsSection || !this.previewContainerShell || !this.previewContainer) {
+      return;
+    }
+    const resetDesignStripPosition = () => {
+      this.designsSection.style.removeProperty('--preview-designs-top');
+      this.designsSection.style.removeProperty('--preview-designs-left');
+      this.designsSection.style.removeProperty('--preview-designs-width');
+      this.designsSection.style.removeProperty('--preview-designs-height');
+    };
+    if (
+      this.previewSection?.style.display === 'none' ||
+      this.designsSection.style.display === 'none'
+    ) {
+      resetDesignStripPosition();
+      this.previewContainerShell.classList.remove('preview-designs-vertical');
+      this.previewContainerShell.classList.remove('preview-designs-multi-sidebar');
+      this.previewDesignStripLayout = 'horizontal';
+      return;
+    }
+
+    const shellRect = this.previewContainerShell.getBoundingClientRect();
+    const useSidebar = shellRect.width >= 640 && shellRect.height >= 320;
+    if (useSidebar) {
+      resetDesignStripPosition();
+      this.previewContainerShell.classList.remove('preview-designs-vertical');
+      this.previewContainerShell.classList.add('preview-designs-multi-sidebar');
+      this.previewDesignStripLayout = 'multi-sidebar';
+      return;
+    }
+
+    const containerRect = this.previewContainer.getBoundingClientRect();
+    if (
+      shellRect.width <= 1 ||
+      shellRect.height <= 1 ||
+      containerRect.width <= 1 ||
+      containerRect.height <= 1
+    ) {
+      return;
+    }
+
+    const imageRect = this.previewImage?.getBoundingClientRect?.() || null;
+    const hasImageRect = Boolean(
+      imageRect &&
+      imageRect.width > 1 &&
+      imageRect.height > 1 &&
+      this.previewImage?.naturalWidth > 0
+    );
+    const leftGap = hasImageRect ? Math.max(0, imageRect.left - containerRect.left) : 0;
+    const availableHeight = Math.max(0, containerRect.height - 32);
+    const useVertical = hasImageRect && leftGap >= 220 && availableHeight >= 320;
+
+    if (useVertical) {
+      const stripTop = Math.max(14, Math.round(containerRect.top - shellRect.top + 16));
+      const stripLeft = Math.max(14, Math.round(containerRect.left - shellRect.left + 16));
+      const stripWidth = Math.max(180, Math.min(240, Math.round(leftGap - 28)));
+      const stripHeight = Math.max(220, Math.round(containerRect.height - 32));
+
+      this.designsSection.style.setProperty('--preview-designs-top', `${stripTop}px`);
+      this.designsSection.style.setProperty('--preview-designs-left', `${stripLeft}px`);
+      this.designsSection.style.setProperty('--preview-designs-width', `${stripWidth}px`);
+      this.designsSection.style.setProperty('--preview-designs-height', `${stripHeight}px`);
+    } else {
+      resetDesignStripPosition();
+    }
+
+    const nextLayout = useVertical ? 'vertical' : 'horizontal';
+    if (this.previewDesignStripLayout !== nextLayout) {
+      this.previewDesignStripLayout = nextLayout;
+      this.previewContainerShell.classList.remove('preview-designs-multi-sidebar');
+      this.previewContainerShell.classList.toggle('preview-designs-vertical', useVertical);
+    }
+  }
+
+  getSelectedDesignIds() {
+    if (Array.isArray(this.selectedDesignIds) && this.selectedDesignIds.length > 0) {
+      return this.selectedDesignIds.filter((id, index, list) => id && list.indexOf(id) === index);
+    }
+    return this.selectedDesignId ? [this.selectedDesignId] : [];
+  }
+
+  normalizeSelectedDesignIds(designIds, activeDesignId = '') {
+    const availableIds = new Set(Array.isArray(this.designs) ? this.designs.map((item) => String(item?.id || '').trim()).filter(Boolean) : []);
+    const normalized = [];
+    (Array.isArray(designIds) ? designIds : []).forEach((id) => {
+      const value = String(id || '').trim();
+      if (!value || !availableIds.has(value) || normalized.includes(value)) return;
+      normalized.push(value);
+    });
+
+    const preferredActiveId = String(activeDesignId || '').trim();
+    if (preferredActiveId && availableIds.has(preferredActiveId) && !normalized.includes(preferredActiveId)) {
+      normalized.unshift(preferredActiveId);
+    }
+    const nextActiveId = normalized.includes(preferredActiveId)
+      ? preferredActiveId
+      : (normalized[0] || '');
+
+    return {
+      ids: normalized,
+      activeId: nextActiveId
+    };
+  }
+
+  getPersistedSelectedDesignIds(state = this.currentPageState) {
+    const savedIds = Array.isArray(state?.selectedDesignIds)
+      ? state.selectedDesignIds.map((id) => String(id || '').trim()).filter(Boolean)
+      : [];
+    if (savedIds.length > 0) {
+      return savedIds;
+    }
+
+    const savedSelectedDesignId = String(state?.selectedDesignId || '').trim();
+    return savedSelectedDesignId ? [savedSelectedDesignId] : [];
+  }
+
+  isMultiPreviewMode() {
+    return this.getSelectedDesignIds().length > 1;
+  }
+
+  getPreviewTransformTarget() {
+    if (this.isMultiPreviewMode()) {
+      if (!this.previewGallery || this.previewGallery.hidden || this.previewGallery.childElementCount === 0) {
+        return null;
+      }
+      return this.previewGallery;
+    }
+
+    if (!this.previewImage || !this.previewImage.src) {
+      return null;
+    }
+    if (!this.previewImage.complete || this.previewImage.naturalWidth <= 0) {
+      return null;
+    }
+    return this.previewImage;
+  }
+
+  getPreviewDesignGroupOrder() {
+    return ['活动礼物入口', '活动通知', '热门话题', '话题详情', '画板', '奖励', '弹窗'];
+  }
+
+  getPreviewDesignLowPriorityKey() {
+    return '__low_priority__';
+  }
+
+  getPreviewCustomGroupPrefix() {
+    return '__custom_group__:';
+  }
+
+  isPreviewCustomGroupKey(groupKey = '') {
+    return String(groupKey || '').startsWith(this.getPreviewCustomGroupPrefix());
+  }
+
+  createPreviewCustomGroupKey() {
+    return `${this.getPreviewCustomGroupPrefix()}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+  }
+
+  getPreviewFixedGroupStateKey() {
+    return String(this.urlInput?.value || this.currentPageState?.url || '').trim() || '__default__';
+  }
+
+  loadPreviewFixedGroupStateByUrl() {
+    try {
+      const data = JSON.parse(localStorage.getItem('lanhuPreviewFixedGroupState') || '{}');
+      return data && typeof data === 'object' ? data : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  savePreviewFixedGroupStateByUrl() {
+    try {
+      localStorage.setItem(
+        'lanhuPreviewFixedGroupState',
+        JSON.stringify(this.previewFixedGroupStateByUrl || {})
+      );
+    } catch (e) {}
+  }
+
+  getPreviewFixedGroupState(groupKey = '') {
+    const stateKey = this.getPreviewFixedGroupStateKey();
+    const rawState = this.previewFixedGroupStateByUrl?.[stateKey]?.[groupKey] || {};
+    const defaultTitleMap = {
+      main: '初始分组',
+      secondary: '已有功能'
+    };
+    const savedTitle = String(rawState.title || '').trim().slice(0, 24);
+    const normalizedTitle = groupKey === 'main' && savedTitle === '未分组'
+      ? defaultTitleMap.main
+      : savedTitle;
+    return {
+      title: normalizedTitle || defaultTitleMap[groupKey] || '分组',
+      rect: this.sanitizePreviewLowPriorityDockRect(rawState.rect)
+    };
+  }
+
+  updatePreviewFixedGroupTitle(groupKey = '', title = '') {
+    const stateKey = this.getPreviewFixedGroupStateKey();
+    const fixedKey = String(groupKey || '').trim();
+    const nextTitle = String(title || '').trim().slice(0, 24);
+    if (!stateKey || !fixedKey || !nextTitle) return null;
+    const currentState = this.getPreviewFixedGroupState(fixedKey);
+    this.previewFixedGroupStateByUrl = {
+      ...(this.previewFixedGroupStateByUrl || {}),
+      [stateKey]: {
+        ...(this.previewFixedGroupStateByUrl?.[stateKey] || {}),
+        [fixedKey]: {
+          ...currentState,
+          title: nextTitle
+        }
+      }
+    };
+    this.savePreviewFixedGroupStateByUrl();
+    return { title: nextTitle };
+  }
+
+  updatePreviewFixedGroupRect(groupKey = '', rect = null) {
+    const stateKey = this.getPreviewFixedGroupStateKey();
+    const fixedKey = String(groupKey || '').trim();
+    const nextRect = this.clampPreviewLowPriorityDockRect(rect);
+    if (!stateKey || !fixedKey || !nextRect) return null;
+    const currentState = this.getPreviewFixedGroupState(fixedKey);
+    this.previewFixedGroupStateByUrl = {
+      ...(this.previewFixedGroupStateByUrl || {}),
+      [stateKey]: {
+        ...(this.previewFixedGroupStateByUrl?.[stateKey] || {}),
+        [fixedKey]: {
+          ...currentState,
+          rect: {
+            x: Math.round(nextRect.x),
+            y: Math.round(nextRect.y),
+            width: Math.round(nextRect.width),
+            height: Math.round(nextRect.height)
+          }
+        }
+      }
+    };
+    this.savePreviewFixedGroupStateByUrl();
+    return nextRect;
+  }
+
+  getPreviewCustomGroupStateKey() {
+    return String(this.urlInput?.value || this.currentPageState?.url || '').trim() || '__default__';
+  }
+
+  loadPreviewCustomGroupsByUrl() {
+    try {
+      const data = JSON.parse(localStorage.getItem('lanhuPreviewCustomGroups') || '{}');
+      return data && typeof data === 'object' ? data : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  savePreviewCustomGroupsByUrl() {
+    try {
+      localStorage.setItem(
+        'lanhuPreviewCustomGroups',
+        JSON.stringify(this.previewCustomGroupsByUrl || {})
+      );
+    } catch (e) {}
+  }
+
+  sanitizePreviewCustomGroups(groups = []) {
+    const seenIds = new Set();
+    return (Array.isArray(groups) ? groups : [])
+      .map((group, index) => {
+        const rawId = String(group?.id || '').trim();
+        const id = this.isPreviewCustomGroupKey(rawId) ? rawId : this.createPreviewCustomGroupKey();
+        if (!id || seenIds.has(id)) return null;
+        seenIds.add(id);
+
+        const title = String(group?.title || '').trim() || `新分组 ${index + 1}`;
+        const rect = this.sanitizePreviewLowPriorityDockRect(group?.rect);
+        if (!rect) return null;
+
+        return {
+          id,
+          title: title.slice(0, 24),
+          rect: {
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height)
+          }
+        };
+      })
+      .filter(Boolean);
+  }
+
+  hydratePreviewCustomGroups() {
+    const key = this.getPreviewCustomGroupStateKey();
+    const groups = key ? this.sanitizePreviewCustomGroups(this.previewCustomGroupsByUrl?.[key]) : [];
+    this.previewCustomGroups = groups;
+    if (key) {
+      if (groups.length > 0) {
+        this.previewCustomGroupsByUrl[key] = groups;
+      } else {
+        delete this.previewCustomGroupsByUrl[key];
+      }
+      this.savePreviewCustomGroupsByUrl();
+    }
+    return groups;
+  }
+
+  persistPreviewCustomGroups(groups = this.previewCustomGroups) {
+    const key = this.getPreviewCustomGroupStateKey();
+    this.previewCustomGroups = this.sanitizePreviewCustomGroups(groups);
+    if (!key) return;
+    if (this.previewCustomGroups.length > 0) {
+      this.previewCustomGroupsByUrl[key] = this.previewCustomGroups;
+    } else {
+      delete this.previewCustomGroupsByUrl[key];
+    }
+    this.savePreviewCustomGroupsByUrl();
+  }
+
+  getPreviewCustomGroupById(groupId = '') {
+    const normalizedId = String(groupId || '').trim();
+    return this.previewCustomGroups.find((group) => group.id === normalizedId) || null;
+  }
+
+  updatePreviewCustomGroupRect(groupId = '', rect = null) {
+    const nextRect = this.clampPreviewLowPriorityDockRect(rect);
+    if (!groupId || !nextRect) return null;
+    this.previewCustomGroups = this.previewCustomGroups.map((group) => (
+      group.id === groupId
+        ? {
+            ...group,
+            rect: {
+              x: Math.round(nextRect.x),
+              y: Math.round(nextRect.y),
+              width: Math.round(nextRect.width),
+              height: Math.round(nextRect.height)
+            }
+          }
+        : group
+    ));
+    this.persistPreviewCustomGroups(this.previewCustomGroups);
+    return nextRect;
+  }
+
+  updatePreviewCustomGroupTitle(groupId = '', title = '') {
+    const normalizedId = String(groupId || '').trim();
+    const nextTitle = String(title || '').trim().slice(0, 24);
+    if (!normalizedId || !nextTitle) return null;
+
+    let updatedGroup = null;
+    this.previewCustomGroups = this.previewCustomGroups.map((group) => {
+      if (group.id !== normalizedId) return group;
+      updatedGroup = {
+        ...group,
+        title: nextTitle
+      };
+      return updatedGroup;
+    });
+    if (!updatedGroup) return null;
+
+    this.persistPreviewCustomGroups(this.previewCustomGroups);
+    return updatedGroup;
+  }
+
+  syncPreviewCustomGroupLayout() {
+    if (!this.designCustomGroupLayer || this.designCustomGroupLayer.hidden || this.previewCustomGroupInteraction) return;
+    this.designCustomGroupLayer.querySelectorAll('.design-custom-group-slot').forEach((slot) => {
+      const groupId = String(slot.dataset.groupId || '').trim();
+      const currentRect = this.getPreviewCustomGroupSlotRect(slot);
+      if (!groupId || !currentRect) return;
+      this.applyPreviewCustomGroupSlotRect(slot, currentRect);
+      this.updatePreviewCustomGroupRect(groupId, currentRect);
+    });
+  }
+
+  getPreviewLowPriorityDockStateKey() {
+    return String(this.urlInput?.value || this.currentPageState?.url || '').trim() || '__default__';
+  }
+
+  getPreviewLowPriorityDefaultTitle() {
+    return '不重要分组';
+  }
+
+  loadPreviewLowPriorityDockStateByUrl() {
+    try {
+      const data = JSON.parse(localStorage.getItem('lanhuPreviewLowPriorityDockState') || '{}');
+      return data && typeof data === 'object' ? data : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  savePreviewLowPriorityDockStateByUrl() {
+    try {
+      localStorage.setItem(
+        'lanhuPreviewLowPriorityDockState',
+        JSON.stringify(this.previewLowPriorityDockStateByUrl || {})
+      );
+    } catch (e) {}
+  }
+
+  sanitizePreviewLowPriorityDockRect(rect = null) {
+    if (!rect || typeof rect !== 'object') return null;
+    const x = Number(rect.x);
+    const y = Number(rect.y);
+    const width = Number(rect.width);
+    const height = Number(rect.height);
+    if (![x, y, width, height].every(Number.isFinite)) return null;
+    return { x, y, width, height };
+  }
+
+  getPreviewLowPriorityDockSavedState() {
+    const key = this.getPreviewLowPriorityDockStateKey();
+    const rawState = this.previewLowPriorityDockStateByUrl?.[key];
+    const rawRect = rawState?.rect && typeof rawState.rect === 'object' ? rawState.rect : rawState;
+    return {
+      rect: this.sanitizePreviewLowPriorityDockRect(rawRect),
+      title: String(rawState?.title || '').trim().slice(0, 24) || this.getPreviewLowPriorityDefaultTitle()
+    };
+  }
+
+  getPreviewLowPriorityDockSavedRect() {
+    return this.getPreviewLowPriorityDockSavedState().rect;
+  }
+
+  getPreviewLowPriorityDockTitle() {
+    return this.getPreviewLowPriorityDockSavedState().title;
+  }
+
+  persistPreviewLowPriorityDockRect(rect = null) {
+    const nextRect = this.sanitizePreviewLowPriorityDockRect(rect);
+    const key = this.getPreviewLowPriorityDockStateKey();
+    if (!key || !nextRect) return;
+    const currentState = this.getPreviewLowPriorityDockSavedState();
+
+    this.previewLowPriorityDockStateByUrl = {
+      ...(this.previewLowPriorityDockStateByUrl || {}),
+      [key]: {
+        title: currentState.title,
+        rect: {
+          x: Math.round(nextRect.x),
+          y: Math.round(nextRect.y),
+          width: Math.round(nextRect.width),
+          height: Math.round(nextRect.height)
+        }
+      }
+    };
+    this.savePreviewLowPriorityDockStateByUrl();
+  }
+
+  updatePreviewLowPriorityDockTitle(title = '') {
+    const key = this.getPreviewLowPriorityDockStateKey();
+    const nextTitle = String(title || '').trim().slice(0, 24);
+    if (!key || !nextTitle) return null;
+    const currentState = this.getPreviewLowPriorityDockSavedState();
+    const rect = currentState.rect || this.getPreviewLowPriorityDockCurrentRect() || this.getPreviewLowPriorityDockDefaultRect();
+
+    this.previewLowPriorityDockStateByUrl = {
+      ...(this.previewLowPriorityDockStateByUrl || {}),
+      [key]: {
+        title: nextTitle,
+        ...(rect ? {
+          rect: {
+            x: Math.round(rect.x),
+            y: Math.round(rect.y),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height)
+          }
+        } : {})
+      }
+    };
+    this.savePreviewLowPriorityDockStateByUrl();
+    return { title: nextTitle };
+  }
+
+  getPreviewLowPriorityDockBounds() {
+    if (!this.previewContainerShell) return null;
+    const shellRect = this.previewContainerShell.getBoundingClientRect();
+    if (shellRect.width <= 1 || shellRect.height <= 1) return null;
+    return {
+      width: shellRect.width,
+      height: shellRect.height
+    };
+  }
+
+  getPreviewLowPriorityDockDefaultRect() {
+    const bounds = this.getPreviewLowPriorityDockBounds();
+    if (!bounds) return null;
+    const width = Math.max(220, Math.min(272, bounds.width - 44));
+    const height = Math.max(220, Math.min(280, bounds.height - 36));
+    return {
+      x: Math.max(12, bounds.width - width - 18),
+      y: Math.max(12, (bounds.height - height) / 2),
+      width,
+      height
+    };
+  }
+
+  clampPreviewLowPriorityDockRect(rect = null) {
+    const bounds = this.getPreviewLowPriorityDockBounds();
+    const nextRect = this.sanitizePreviewLowPriorityDockRect(rect);
+    if (!bounds || !nextRect) return null;
+
+    const minWidth = Math.min(220, Math.max(120, bounds.width - 24));
+    const minHeight = Math.min(180, Math.max(120, bounds.height - 24));
+    const maxWidth = Math.max(minWidth, bounds.width - 24);
+    const maxHeight = Math.max(minHeight, bounds.height - 24);
+    const width = Math.max(minWidth, Math.min(maxWidth, nextRect.width));
+    const height = Math.max(minHeight, Math.min(maxHeight, nextRect.height));
+    return {
+      x: Math.max(12, Math.min(bounds.width - width - 12, nextRect.x)),
+      y: Math.max(12, Math.min(bounds.height - height - 12, nextRect.y)),
+      width,
+      height
+    };
+  }
+
+  getPreviewLowPriorityDockCurrentRect() {
+    if (!this.designLowPrioritySlot || !this.previewContainerShell) return null;
+    const slotRect = this.designLowPrioritySlot.getBoundingClientRect();
+    const shellRect = this.previewContainerShell.getBoundingClientRect();
+    if (slotRect.width <= 1 || slotRect.height <= 1 || shellRect.width <= 1 || shellRect.height <= 1) {
+      return null;
+    }
+    return this.clampPreviewLowPriorityDockRect({
+      x: slotRect.left - shellRect.left,
+      y: slotRect.top - shellRect.top,
+      width: slotRect.width,
+      height: slotRect.height
+    });
+  }
+
+  applyPreviewLowPriorityDockRect(rect = null, { custom = true } = {}) {
+    if (!this.designLowPrioritySlot) return null;
+    const nextRect = this.clampPreviewLowPriorityDockRect(rect);
+    if (!nextRect) return null;
+
+    this.designLowPrioritySlot.classList.toggle('has-custom-layout', custom);
+    this.designLowPrioritySlot.style.setProperty('--low-priority-left', `${Math.round(nextRect.x)}px`);
+    this.designLowPrioritySlot.style.setProperty('--low-priority-top', `${Math.round(nextRect.y)}px`);
+    this.designLowPrioritySlot.style.setProperty('--low-priority-width', `${Math.round(nextRect.width)}px`);
+    this.designLowPrioritySlot.style.setProperty('--low-priority-height', `${Math.round(nextRect.height)}px`);
+    return nextRect;
+  }
+
+  resetPreviewLowPriorityDockLayout() {
+    if (!this.designLowPrioritySlot) return;
+    this.designLowPrioritySlot.classList.remove('has-custom-layout');
+    this.designLowPrioritySlot.style.removeProperty('--low-priority-left');
+    this.designLowPrioritySlot.style.removeProperty('--low-priority-top');
+    this.designLowPrioritySlot.style.removeProperty('--low-priority-width');
+    this.designLowPrioritySlot.style.removeProperty('--low-priority-height');
+  }
+
+  syncPreviewLowPriorityDockLayout({ forceDefault = false } = {}) {
+    if (!this.designLowPrioritySlot || this.designLowPrioritySlot.hidden) return;
+    if (this.previewLowPriorityDockInteraction) return;
+    const savedRect = forceDefault ? null : this.getPreviewLowPriorityDockSavedRect();
+    if (savedRect) {
+      this.applyPreviewLowPriorityDockRect(savedRect, { custom: true });
+      return;
+    }
+    this.resetPreviewLowPriorityDockLayout();
+  }
+
+  loadPreviewDesignGroupAssignmentsByUrl() {
+    try {
+      const data = JSON.parse(localStorage.getItem('lanhuPreviewDesignGroups') || '{}');
+      return data && typeof data === 'object' ? data : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  savePreviewDesignGroupAssignmentsByUrl() {
+    try {
+      localStorage.setItem(
+        'lanhuPreviewDesignGroups',
+        JSON.stringify(this.previewDesignGroupAssignmentsByUrl || {})
+      );
+    } catch (e) {}
+  }
+
+  sanitizePreviewDesignGroupAssignments(assignments = {}, designs = this.designs) {
+    const normalized = {};
+    const allowedGroups = new Set([
+      this.getPreviewDesignLowPriorityKey(),
+      ...this.previewCustomGroups.map((group) => group.id)
+    ]);
+    const availableIds = new Set(
+      (Array.isArray(designs) ? designs : [])
+        .map((design) => String(design?.id || '').trim())
+        .filter(Boolean)
+    );
+
+    if (!assignments || typeof assignments !== 'object') {
+      return normalized;
+    }
+
+    Object.entries(assignments).forEach(([rawDesignId, rawGroupKey]) => {
+      const designId = String(rawDesignId || '').trim();
+      const groupKey = String(rawGroupKey || '').trim();
+      if (!designId || !groupKey) return;
+      if (!availableIds.has(designId) || !allowedGroups.has(groupKey)) return;
+      normalized[designId] = groupKey;
+    });
+
+    return normalized;
+  }
+
+  hydratePreviewDesignGroupAssignments(designs = this.designs) {
+    this.hydratePreviewCustomGroups();
+    const currentUrl = String(this.urlInput?.value || '').trim();
+    const nextAssignments = currentUrl
+      ? this.sanitizePreviewDesignGroupAssignments(
+          this.previewDesignGroupAssignmentsByUrl?.[currentUrl],
+          designs
+        )
+      : {};
+
+    this.previewDesignGroupAssignments = nextAssignments;
+
+    if (!currentUrl) {
+      return;
+    }
+
+    if (Object.keys(nextAssignments).length > 0) {
+      this.previewDesignGroupAssignmentsByUrl[currentUrl] = nextAssignments;
+    } else {
+      delete this.previewDesignGroupAssignmentsByUrl[currentUrl];
+    }
+
+    this.savePreviewDesignGroupAssignmentsByUrl();
+  }
+
+  persistPreviewDesignGroupAssignments(designs = this.designs) {
+    const currentUrl = String(this.urlInput?.value || '').trim();
+    const nextAssignments = this.sanitizePreviewDesignGroupAssignments(
+      this.previewDesignGroupAssignments,
+      designs
+    );
+
+    this.previewDesignGroupAssignments = nextAssignments;
+
+    if (!currentUrl) {
+      return;
+    }
+
+    if (Object.keys(nextAssignments).length > 0) {
+      this.previewDesignGroupAssignmentsByUrl[currentUrl] = nextAssignments;
+    } else {
+      delete this.previewDesignGroupAssignmentsByUrl[currentUrl];
+    }
+
+    this.savePreviewDesignGroupAssignmentsByUrl();
+  }
+
+  getPreviewDesignGroupKey(name) {
+    const normalized = String(name || '').trim();
+    if (!normalized) return '';
+    for (const label of this.getPreviewDesignGroupOrder()) {
+      if (label === '奖励' && normalized.includes('活动奖励')) {
+        continue;
+      }
+      if (normalized.includes(label)) {
+        return label;
+      }
+    }
+    return '';
+  }
+
+  isPreviewDesignInLowPriorityGroup(design) {
+    const designId = String(design?.id || '').trim();
+    return String(this.previewDesignGroupAssignments?.[designId] || '').trim() === this.getPreviewDesignLowPriorityKey();
+  }
+
+  buildPreviewDesignCardMarkup(design, index, {
+    groupKey = '',
+    draggable = false,
+    zone = 'regular'
+  } = {}) {
+    const designName = this.decodeHtmlEntities(design.name) || `设计图 ${index + 1}`;
+    const safeName = this.escapeHtml(designName);
+    const safeAttrName = this.escapeAttr(designName);
+    const designId = this.escapeAttr(design.id || '');
+    const designRawUrl = this.escapeAttr(design.url || '');
+    const designLink = this.getDesignLink(design);
+    const safeDesignLink = this.escapeAttr(designLink);
+    const previewUrl = design.url ? this.getProxiedImageUrl(design.url) : '';
+    const viewportTag = this.getDesignViewportTag(design);
+    const codeStatus = this.getDesignCodeStatus(design);
+    const cardTitle = this.escapeAttr(designName);
+
+    return `
+      <div
+        class="design-card"
+        draggable="${draggable ? 'true' : 'false'}"
+        data-index="${index}"
+        data-id="${designId}"
+        data-url="${designRawUrl}"
+        data-link="${safeDesignLink}"
+        data-group-key="${this.escapeAttr(groupKey)}"
+        data-design-zone="${this.escapeAttr(zone)}"
+        title="${cardTitle}"
+      >
+        <div class="design-preview">
+          ${previewUrl ? `<img src="${this.escapeAttr(previewUrl)}" alt="${safeAttrName}" loading="lazy">` : '<span>FRAME</span>'}
+        </div>
+        <div class="design-info">
+          <div class="design-card-head">
+            <span class="design-index">${String(index + 1).padStart(2, '0')}</span>
+            <span class="design-tag">${this.escapeHtml(viewportTag)}</span>
+            <span class="design-code-badge ${this.escapeAttr(codeStatus.code)}" title="${this.escapeAttr(codeStatus.title)}">${this.escapeHtml(codeStatus.label)}</span>
+          </div>
+          <div class="design-name" title="${safeAttrName}">${safeName}</div>
+        </div>
+        <div class="design-arrow">></div>
+      </div>
+    `;
+  }
+
+  buildPreviewFloatingGroupDockMarkup({
+    kind = '',
+    count = 0,
+    title = '新分组',
+    emptyText = '拖到这里，把设计图归到这个分组',
+    cards = []
+  } = {}) {
+    const safeKind = this.escapeAttr(kind);
+    const safeTitle = this.escapeHtml(title || '新分组');
+    const safeTitleAttr = this.escapeAttr(title || '新分组');
+    const safeEmptyText = this.escapeHtml(emptyText || '');
+    return `
+      <div class="design-floating-group-dock ${safeKind}-dock${count > 0 ? ' has-items' : ''}">
+        <div class="design-floating-group-head ${safeKind}-head">
+          <div class="design-floating-group-copy ${safeKind}-copy">
+            <span class="design-floating-group-kicker ${safeKind}-kicker">New Group</span>
+            <span class="design-floating-group-title ${safeKind}-title" title="${safeTitleAttr}">${safeTitle}</span>
+          </div>
+          <span class="design-floating-group-count ${safeKind}-count">${count}</span>
+        </div>
+        <div class="design-floating-group-body ${safeKind}-body">
+          ${cards.join('')}
+          <div class="design-floating-group-empty ${safeKind}-empty">${safeEmptyText}</div>
+        </div>
+        <div class="design-floating-group-resize-handle ${safeKind}-resize-handle" data-resize-dir="se" title="调整大小" aria-label="调整大小"></div>
+      </div>
+    `;
+  }
+
+  buildPreviewLowPriorityDockMarkup(cards = []) {
+    const count = Array.isArray(cards) ? cards.length : 0;
+    return this.buildPreviewFloatingGroupDockMarkup({
+      kind: 'design-low-priority',
+      count,
+      title: this.getPreviewLowPriorityDockTitle(),
+      emptyText: '拖到这里，把设计图临时归到不重要分组',
+      cards
+    });
+  }
+
+  buildPreviewCustomGroupMarkup(group, cards = []) {
+    const rect = this.clampPreviewLowPriorityDockRect(group?.rect) || group?.rect || {};
+    const count = Array.isArray(cards) ? cards.length : 0;
+    const safeGroupId = this.escapeAttr(group?.id || '');
+    return `
+      <div
+        class="design-floating-group-slot design-custom-group-slot is-visible${count > 0 ? ' has-items' : ''}"
+        data-group-id="${safeGroupId}"
+        style="--custom-group-left: ${Math.round(Number(rect.x) || 12)}px; --custom-group-top: ${Math.round(Number(rect.y) || 12)}px; --custom-group-width: ${Math.round(Number(rect.width) || 272)}px; --custom-group-height: ${Math.round(Number(rect.height) || 220)}px;"
+      >
+        ${this.buildPreviewFloatingGroupDockMarkup({
+          kind: 'design-custom-group',
+          count,
+          title: group?.title || '新分组',
+          emptyText: '拖到这里，把设计图归到这个分组',
+          cards
+        })}
+      </div>
+    `;
+  }
+
+  buildPreviewSecondaryGroupMarkup(cards = []) {
+    const count = Array.isArray(cards) ? cards.length : 0;
+    const state = this.getPreviewFixedGroupState('secondary');
+    const rect = this.clampPreviewLowPriorityDockRect(state.rect) || state.rect || {};
+    const style = state.rect
+      ? ` style="--secondary-group-left: ${Math.round(Number(rect.x) || 12)}px; --secondary-group-top: ${Math.round(Number(rect.y) || 12)}px; --secondary-group-width: ${Math.round(Number(rect.width) || 220)}px; --secondary-group-height: ${Math.round(Number(rect.height) || 320)}px;"`
+      : '';
+    return `
+      <div class="design-floating-group-slot design-secondary-group-slot is-visible${count > 0 ? ' has-items' : ''}${state.rect ? ' has-custom-layout' : ''}" data-fixed-group="secondary"${style}>
+        ${this.buildPreviewFloatingGroupDockMarkup({
+          kind: 'design-secondary-group',
+          count,
+          title: state.title,
+          emptyText: '拖到这里，把设计图归到这个分组',
+          cards
+        })}
+      </div>
+    `;
+  }
+
+  syncPreviewMainGroupTitle(count = null) {
+    const titleEl = this.designsSection?.querySelector('.design-floating-group-title');
+    const state = this.getPreviewFixedGroupState('main');
+    if (titleEl) {
+      titleEl.textContent = state.title;
+      titleEl.title = state.title;
+    }
+    const countEl = this.designsSection?.querySelector('.design-main-group-count');
+    if (countEl && Number.isFinite(count)) {
+      countEl.textContent = String(Math.max(0, Number(count) || 0));
+    }
+  }
+
+  renderPreviewDesignCards(projectData = this.currentProjectData) {
+    const designs = Array.isArray(projectData?.designs) ? projectData.designs : [];
+    if (!this.designGrid) return;
+
+    if (designs.length === 0) {
+      this.designGrid.innerHTML = '';
+      this.setPreviewSecondaryDesignMarkup('');
+      this.setPreviewCustomGroupMarkup('');
+      this.setPreviewLowPriorityDesignMarkup('');
+      return;
+    }
+
+    this.hydratePreviewDesignGroupAssignments(designs);
+
+    const groupedDesignBuckets = new Map(
+      this.getPreviewDesignGroupOrder().map((label) => [label, []])
+    );
+    const regularDesignMarkup = [];
+    const lowPriorityDesignMarkup = [];
+    const customGroupMarkupById = new Map(this.previewCustomGroups.map((group) => [group.id, []]));
+
+    designs.forEach((design, index) => {
+      const designGroupKey = this.getPreviewDesignGroupKey(this.decodeHtmlEntities(design.name) || '');
+      const assignedGroupKey = String(this.previewDesignGroupAssignments?.[String(design?.id || '').trim()] || '').trim();
+      const isLowPriority = assignedGroupKey === this.getPreviewDesignLowPriorityKey();
+      const isCustomGrouped = this.isPreviewCustomGroupKey(assignedGroupKey) && customGroupMarkupById.has(assignedGroupKey);
+      const isFixedGrouped = !isLowPriority && !isCustomGrouped && Boolean(designGroupKey);
+      const cardMarkup = this.buildPreviewDesignCardMarkup(design, index, {
+        groupKey: isLowPriority ? this.getPreviewDesignLowPriorityKey() : (isCustomGrouped ? assignedGroupKey : designGroupKey),
+        draggable: !isFixedGrouped,
+        zone: isLowPriority ? 'low-priority' : (isCustomGrouped ? 'custom-group' : (isFixedGrouped ? 'fixed-group' : 'regular'))
+      });
+
+      if (isLowPriority) {
+        lowPriorityDesignMarkup.push(cardMarkup);
+        return;
+      }
+
+      if (isCustomGrouped) {
+        customGroupMarkupById.get(assignedGroupKey)?.push(cardMarkup);
+        return;
+      }
+
+      if (isFixedGrouped) {
+        groupedDesignBuckets.get(designGroupKey)?.push(cardMarkup);
+        return;
+      }
+
+      regularDesignMarkup.push(cardMarkup);
+    });
+
+    const fixedGroupedDesignMarkup = this.getPreviewDesignGroupOrder()
+      .flatMap((label) => groupedDesignBuckets.get(label) || []);
+
+    this.designGrid.innerHTML = regularDesignMarkup.join('');
+    this.syncPreviewMainGroupTitle(regularDesignMarkup.length);
+    this.setPreviewSecondaryDesignMarkup(
+      fixedGroupedDesignMarkup.length > 0
+        ? this.buildPreviewSecondaryGroupMarkup(fixedGroupedDesignMarkup)
+        : ''
+    );
+    this.setPreviewCustomGroupMarkup(
+      this.previewCustomGroups.map((group) => this.buildPreviewCustomGroupMarkup(
+        group,
+        customGroupMarkupById.get(group.id) || []
+      )).join('')
+    );
+    this.setPreviewLowPriorityDesignMarkup(
+      this.buildPreviewLowPriorityDockMarkup(lowPriorityDesignMarkup)
+    );
+    this.bindPreviewDesignCardEvents(projectData);
+    this.updateDesignCardSelectionUi();
+    this.syncPreviewLowPriorityDockVisibility(lowPriorityDesignMarkup.length);
+    this.syncPreviewLowPriorityDockLayout();
+    this.setPreviewLowPriorityDropActive(this.isPreviewLowPriorityDropActive);
+  }
+
+  bindPreviewDesignCardEvents(projectData = this.currentProjectData) {
+    this.getAllPreviewDesignCards().forEach((card) => {
+      card.addEventListener('click', (event) => {
+        if (this.isPreviewDesignDragging) return;
+        this.selectDesign(card, projectData, { event });
+      });
+      if (card.getAttribute('draggable') === 'true') {
+        card.addEventListener('dragstart', (event) => this.handlePreviewDesignCardDragStart(event, card));
+        card.addEventListener('dragend', () => this.handlePreviewDesignCardDragEnd());
+      }
+    });
+  }
+
+  getPreviewLowPriorityDesignCount(count = null) {
+    if (Number.isFinite(count)) {
+      return Math.max(0, Number(count) || 0);
+    }
+
+    return Array.from(this.designLowPrioritySlot?.querySelectorAll('.design-card') || []).length;
+  }
+
+  syncPreviewLowPriorityDockVisibility(count = null) {
+    const hasDockMarkup = Boolean(
+      this.designLowPrioritySlot &&
+      !this.designLowPrioritySlot.hidden &&
+      this.designLowPrioritySlot.childElementCount > 0
+    );
+    const lowPriorityCount = this.getPreviewLowPriorityDesignCount(count);
+    const hasItems = lowPriorityCount > 0;
+    const isVisible = hasDockMarkup && (this.isPreviewDesignDragging || hasItems);
+
+    if (!this.designLowPrioritySlot) return;
+
+    this.designLowPrioritySlot.classList.toggle('is-visible', isVisible);
+    this.designLowPrioritySlot.classList.toggle('has-items', hasItems);
+    this.designLowPrioritySlot.classList.toggle('is-drag-active', this.isPreviewDesignDragging);
+  }
+
+  setPreviewLowPriorityDropActive(active = false) {
+    this.isPreviewLowPriorityDropActive = Boolean(active);
+    this.designLowPrioritySlot?.classList.toggle('is-drop-target', this.isPreviewLowPriorityDropActive);
+  }
+
+  startPreviewLowPriorityDockInteraction(event) {
+    if (!this.designLowPrioritySlot || event.button !== 0) return;
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+    if (target.closest('.design-floating-group-title')) return;
+
+    const resizeHandle = target.closest('.design-floating-group-resize-handle');
+    const dockHead = target.closest('.design-floating-group-head');
+    const mode = resizeHandle ? 'resize' : (dockHead ? 'move' : '');
+    if (!mode || !this.designLowPrioritySlot.contains(target)) return;
+
+    const currentRect = this.getPreviewLowPriorityDockCurrentRect() || this.getPreviewLowPriorityDockDefaultRect();
+    const appliedRect = this.applyPreviewLowPriorityDockRect(currentRect, { custom: true });
+    if (!appliedRect) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.pointerId != null && typeof this.designLowPrioritySlot.setPointerCapture === 'function') {
+      try {
+        this.designLowPrioritySlot.setPointerCapture(event.pointerId);
+      } catch (e) {}
+    }
+
+    this.previewLowPriorityDockInteraction = {
+      mode,
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      startRect: appliedRect
+    };
+    this.designLowPrioritySlot.classList.add('is-interacting');
+    document.body.classList.add('low-priority-dock-interacting');
+    document.body.classList.toggle('low-priority-dock-resizing', mode === 'resize');
+  }
+
+  updatePreviewLowPriorityDockInteraction(event) {
+    const interaction = this.previewLowPriorityDockInteraction;
+    if (!interaction || !this.designLowPrioritySlot) return;
+    if (interaction.pointerId != null && event.pointerId != null && interaction.pointerId !== event.pointerId) return;
+
+    event.preventDefault();
+    const dx = event.clientX - interaction.startClientX;
+    const dy = event.clientY - interaction.startClientY;
+    const startRect = interaction.startRect;
+    const nextRect = interaction.mode === 'resize'
+      ? {
+          ...startRect,
+          width: startRect.width + dx,
+          height: startRect.height + dy
+        }
+      : {
+          ...startRect,
+          x: startRect.x + dx,
+          y: startRect.y + dy
+        };
+
+    this.applyPreviewLowPriorityDockRect(nextRect, { custom: true });
+  }
+
+  finishPreviewLowPriorityDockInteraction(event = null) {
+    const interaction = this.previewLowPriorityDockInteraction;
+    if (!interaction) return;
+
+    if (
+      event?.pointerId != null &&
+      interaction.pointerId != null &&
+      event.pointerId !== interaction.pointerId
+    ) {
+      return;
+    }
+
+    if (this.designLowPrioritySlot && interaction.pointerId != null && typeof this.designLowPrioritySlot.releasePointerCapture === 'function') {
+      try {
+        this.designLowPrioritySlot.releasePointerCapture(interaction.pointerId);
+      } catch (e) {}
+    }
+
+    const nextRect = this.getPreviewLowPriorityDockCurrentRect();
+    if (nextRect) {
+      this.persistPreviewLowPriorityDockRect(nextRect);
+    }
+    this.previewLowPriorityDockInteraction = null;
+    this.designLowPrioritySlot?.classList.remove('is-interacting');
+    document.body.classList.remove('low-priority-dock-interacting', 'low-priority-dock-resizing');
+  }
+
+  getPreviewCustomGroupSlotRect(slot = null) {
+    if (!slot || !this.previewContainerShell) return null;
+    const slotRect = slot.getBoundingClientRect();
+    const shellRect = this.previewContainerShell.getBoundingClientRect();
+    if (slotRect.width <= 1 || slotRect.height <= 1 || shellRect.width <= 1 || shellRect.height <= 1) {
+      return null;
+    }
+    return this.clampPreviewLowPriorityDockRect({
+      x: slotRect.left - shellRect.left,
+      y: slotRect.top - shellRect.top,
+      width: slotRect.width,
+      height: slotRect.height
+    });
+  }
+
+  applyPreviewCustomGroupSlotRect(slot = null, rect = null) {
+    const nextRect = this.clampPreviewLowPriorityDockRect(rect);
+    if (!slot || !nextRect) return null;
+    const prefix = slot.classList.contains('design-secondary-group-slot') ? 'secondary-group' : 'custom-group';
+    slot.classList.add('has-custom-layout');
+    slot.style.setProperty(`--${prefix}-left`, `${Math.round(nextRect.x)}px`);
+    slot.style.setProperty(`--${prefix}-top`, `${Math.round(nextRect.y)}px`);
+    slot.style.setProperty(`--${prefix}-width`, `${Math.round(nextRect.width)}px`);
+    slot.style.setProperty(`--${prefix}-height`, `${Math.round(nextRect.height)}px`);
+    return nextRect;
+  }
+
+  startPreviewCustomGroupInteraction(event) {
+    if ((!this.designCustomGroupLayer && !this.designSecondarySlot) || event.button !== 0) return;
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+
+    const slot = target.closest('.design-custom-group-slot, .design-secondary-group-slot');
+    const isSecondaryGroup = Boolean(slot?.classList.contains('design-secondary-group-slot'));
+    const isKnownSlot = Boolean(
+      slot &&
+      (
+        this.designCustomGroupLayer?.contains(slot) ||
+        this.designSecondarySlot?.contains(slot)
+      )
+    );
+    if (!slot || !isKnownSlot) return;
+    if (target.closest('.design-floating-group-title')) return;
+
+    const resizeHandle = target.closest('.design-floating-group-resize-handle');
+    const dockHead = target.closest('.design-floating-group-head');
+    const mode = resizeHandle ? 'resize' : (dockHead ? 'move' : '');
+    if (!mode) return;
+
+    const groupId = isSecondaryGroup ? 'secondary' : String(slot.dataset.groupId || '').trim();
+    const currentRect = this.getPreviewCustomGroupSlotRect(slot);
+    const appliedRect = this.applyPreviewCustomGroupSlotRect(slot, currentRect);
+    if (!groupId || !appliedRect) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.pointerId != null && typeof slot.setPointerCapture === 'function') {
+      try {
+        slot.setPointerCapture(event.pointerId);
+      } catch (e) {}
+    }
+
+    this.previewCustomGroupInteraction = {
+      mode,
+      pointerId: event.pointerId,
+      groupId,
+      fixedGroup: isSecondaryGroup ? 'secondary' : '',
+      slot,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      startRect: appliedRect
+    };
+    slot.classList.add('is-interacting');
+    document.body.classList.add('custom-group-interacting');
+    document.body.classList.toggle('custom-group-resizing', mode === 'resize');
+  }
+
+  updatePreviewCustomGroupInteraction(event) {
+    const interaction = this.previewCustomGroupInteraction;
+    if (!interaction || !interaction.slot) return;
+    if (interaction.pointerId != null && event.pointerId != null && interaction.pointerId !== event.pointerId) return;
+
+    event.preventDefault();
+    const dx = event.clientX - interaction.startClientX;
+    const dy = event.clientY - interaction.startClientY;
+    const startRect = interaction.startRect;
+    const nextRect = interaction.mode === 'resize'
+      ? {
+          ...startRect,
+          width: startRect.width + dx,
+          height: startRect.height + dy
+        }
+      : {
+          ...startRect,
+          x: startRect.x + dx,
+          y: startRect.y + dy
+        };
+
+    this.applyPreviewCustomGroupSlotRect(interaction.slot, nextRect);
+  }
+
+  finishPreviewCustomGroupInteraction(event = null) {
+    const interaction = this.previewCustomGroupInteraction;
+    if (!interaction) return;
+
+    if (
+      event?.pointerId != null &&
+      interaction.pointerId != null &&
+      event.pointerId !== interaction.pointerId
+    ) {
+      return;
+    }
+
+    if (interaction.slot && interaction.pointerId != null && typeof interaction.slot.releasePointerCapture === 'function') {
+      try {
+        interaction.slot.releasePointerCapture(interaction.pointerId);
+      } catch (e) {}
+    }
+
+    const nextRect = this.getPreviewCustomGroupSlotRect(interaction.slot);
+    if (nextRect) {
+      if (interaction.fixedGroup) {
+        this.updatePreviewFixedGroupRect(interaction.fixedGroup, nextRect);
+      } else {
+        this.updatePreviewCustomGroupRect(interaction.groupId, nextRect);
+      }
+    }
+    interaction.slot?.classList.remove('is-interacting');
+    this.previewCustomGroupInteraction = null;
+    document.body.classList.remove('custom-group-interacting', 'custom-group-resizing');
+  }
+
+  startPreviewFloatingGroupRename(event) {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+
+    const titleEl = target.closest('.design-floating-group-title');
+    const slot = target.closest('.design-floating-group-slot');
+    if (!titleEl || !slot || !this.previewContainerShell?.contains(slot)) return;
+
+    const groupId = String(slot.dataset.groupId || '').trim();
+    const fixedGroup = String(slot.dataset.fixedGroup || '').trim();
+    const isLowPriorityGroup = slot === this.designLowPrioritySlot || slot.classList.contains('design-low-priority-slot');
+    const isCustomGroup = slot.classList.contains('design-custom-group-slot');
+    const isFixedGroup = ['main', 'secondary'].includes(fixedGroup);
+    if ((!isLowPriorityGroup && !isFixedGroup && (!isCustomGroup || !groupId)) || titleEl.isContentEditable) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    const originalTitle = titleEl.textContent || '新分组';
+    titleEl.dataset.originalTitle = originalTitle;
+    titleEl.contentEditable = 'true';
+    titleEl.classList.add('is-editing');
+    titleEl.focus();
+
+    const range = document.createRange();
+    range.selectNodeContents(titleEl);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+
+    const finishEditing = (commit = true) => {
+      const fallbackTitle = titleEl.dataset.originalTitle || originalTitle;
+      const nextTitle = commit ? String(titleEl.textContent || '').trim() : fallbackTitle;
+      titleEl.contentEditable = 'false';
+      titleEl.classList.remove('is-editing');
+      titleEl.removeEventListener('blur', handleBlur);
+      titleEl.removeEventListener('keydown', handleKeydown);
+
+      if (!commit) {
+        titleEl.textContent = fallbackTitle;
+        return;
+      }
+
+      const updatedGroup = isLowPriorityGroup
+        ? this.updatePreviewLowPriorityDockTitle(nextTitle || fallbackTitle)
+        : (isFixedGroup
+          ? this.updatePreviewFixedGroupTitle(fixedGroup, nextTitle || fallbackTitle)
+          : this.updatePreviewCustomGroupTitle(groupId, nextTitle || fallbackTitle));
+      titleEl.textContent = updatedGroup?.title || fallbackTitle;
+      titleEl.title = titleEl.textContent || '';
+      this.renderPreviewDesignCards(this.currentProjectData);
+    };
+
+    const handleBlur = () => finishEditing(true);
+    const handleKeydown = (keyboardEvent) => {
+      if (keyboardEvent.key === 'Enter') {
+        keyboardEvent.preventDefault();
+        finishEditing(true);
+      } else if (keyboardEvent.key === 'Escape') {
+        keyboardEvent.preventDefault();
+        finishEditing(false);
+      }
+    };
+
+    titleEl.addEventListener('blur', handleBlur);
+    titleEl.addEventListener('keydown', handleKeydown);
+  }
+
+  handlePreviewCustomGroupDragOver(event) {
+    if (!this.isPreviewDesignDragging || !this.designCustomGroupLayer) return;
+    const slot = event.target.closest('.design-custom-group-slot');
+    if (!slot || !this.designCustomGroupLayer.contains(slot)) return;
+
+    event.preventDefault();
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = 'move';
+    }
+    slot.classList.add('is-drop-target');
+  }
+
+  handlePreviewCustomGroupDragLeave(event) {
+    if (!this.isPreviewDesignDragging || !this.designCustomGroupLayer) return;
+    const slot = event.target.closest('.design-custom-group-slot');
+    if (!slot || !this.designCustomGroupLayer.contains(slot)) return;
+    const relatedTarget = event.relatedTarget;
+    if (relatedTarget && slot.contains(relatedTarget)) return;
+    slot.classList.remove('is-drop-target');
+  }
+
+  handlePreviewCustomGroupDrop(event) {
+    if (!this.designCustomGroupLayer) return;
+    const slot = event.target.closest('.design-custom-group-slot');
+    if (!slot || !this.designCustomGroupLayer.contains(slot)) return;
+    event.preventDefault();
+
+    const groupId = String(slot.dataset.groupId || '').trim();
+    const designId = this.getDraggedPreviewDesignId(event);
+    const design = Array.isArray(this.designs)
+      ? this.designs.find((item) => String(item?.id || '').trim() === designId)
+      : null;
+    if (!groupId || !this.getPreviewCustomGroupById(groupId) || !designId || !design) {
+      this.clearPreviewDesignDragState();
+      return;
+    }
+
+    this.previewDesignGroupAssignments = {
+      ...(this.previewDesignGroupAssignments || {}),
+      [designId]: groupId
+    };
+    this.persistPreviewDesignGroupAssignments(this.designs);
+    slot.classList.remove('is-drop-target');
+    this.clearPreviewDesignDragState();
+    this.renderPreviewDesignCards(this.currentProjectData);
+    this.showToast('已加入新分组', 'success');
+  }
+
+  getPreviewShellLocalPoint(event) {
+    if (!this.previewContainerShell) return null;
+    const shellRect = this.previewContainerShell.getBoundingClientRect();
+    if (shellRect.width <= 1 || shellRect.height <= 1) return null;
+    return {
+      x: event.clientX - shellRect.left,
+      y: event.clientY - shellRect.top
+    };
+  }
+
+  isPreviewBlankDoubleClickTarget(target = null) {
+    if (!(target instanceof Element) || !this.previewContainerShell?.contains(target)) return false;
+    return !target.closest([
+      '.design-card',
+      '.preview-designs-section',
+      '.design-secondary-slot',
+      '.design-low-priority-slot',
+      '.design-custom-group-slot',
+      '.preview-stage-zoom',
+      '.preview-image-large',
+      '.preview-gallery',
+      'button',
+      'input',
+      'select',
+      'textarea',
+      'a'
+    ].join(','));
+  }
+
+  handlePreviewBlankDoubleClick(event) {
+    if (!this.isPreviewBlankDoubleClickTarget(event.target)) return;
+    if (!this.currentProjectData || !Array.isArray(this.currentProjectData.designs)) return;
+    const point = this.getPreviewShellLocalPoint(event);
+    if (!point) return;
+
+    const width = 272;
+    const height = 220;
+    const rect = this.clampPreviewLowPriorityDockRect({
+      x: point.x - width / 2,
+      y: point.y - 24,
+      width,
+      height
+    });
+    if (!rect) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    this.hydratePreviewCustomGroups();
+    const group = {
+      id: this.createPreviewCustomGroupKey(),
+      title: `新分组 ${this.previewCustomGroups.length + 1}`,
+      rect
+    };
+    this.previewCustomGroups = [...this.previewCustomGroups, group];
+    this.persistPreviewCustomGroups(this.previewCustomGroups);
+    this.renderPreviewDesignCards(this.currentProjectData);
+    this.showToast('已添加新分组', 'success');
+  }
+
+  getDraggedPreviewDesignId(event = null) {
+    const currentId = String(this.previewDraggedDesignId || '').trim();
+    if (currentId) {
+      return currentId;
+    }
+
+    const transfer = event?.dataTransfer;
+    return String(
+      transfer?.getData('application/x-lanhu-design-id') ||
+      transfer?.getData('text/plain') ||
+      ''
+    ).trim();
+  }
+
+  clearPreviewDesignDragState() {
+    this.isPreviewDesignDragging = false;
+    this.previewDraggedDesignId = '';
+    this.setPreviewLowPriorityDropActive(false);
+    this.getAllPreviewDesignCards().forEach((card) => card.classList.remove('is-dragging'));
+    this.designCustomGroupLayer?.querySelectorAll('.is-drop-target').forEach((slot) => slot.classList.remove('is-drop-target'));
+    this.syncPreviewLowPriorityDockVisibility();
+  }
+
+  handlePreviewDesignCardDragStart(event, card) {
+    const designId = String(card?.dataset?.id || '').trim();
+    if (!designId || card?.getAttribute('draggable') !== 'true') {
+      event.preventDefault();
+      return;
+    }
+
+    this.previewDraggedDesignId = designId;
+    this.isPreviewDesignDragging = true;
+    card.classList.add('is-dragging');
+
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = 'move';
+      event.dataTransfer.dropEffect = 'move';
+      event.dataTransfer.setData('application/x-lanhu-design-id', designId);
+      event.dataTransfer.setData('text/plain', designId);
+    }
+
+    this.syncPreviewLowPriorityDockVisibility();
+  }
+
+  handlePreviewDesignCardDragEnd() {
+    this.clearPreviewDesignDragState();
+  }
+
+  handlePreviewLowPriorityDockDragOver(event) {
+    if (!this.isPreviewDesignDragging || !this.designLowPrioritySlot) return;
+
+    const dockEl = event.target.closest('.design-low-priority-dock');
+    if (!dockEl || !this.designLowPrioritySlot.contains(dockEl)) return;
+
+    event.preventDefault();
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = 'move';
+    }
+
+    this.setPreviewLowPriorityDropActive(true);
+  }
+
+  handlePreviewLowPriorityDockDragLeave(event) {
+    if (!this.isPreviewDesignDragging || !this.designLowPrioritySlot) return;
+
+    const relatedTarget = event.relatedTarget;
+    if (relatedTarget && this.designLowPrioritySlot.contains(relatedTarget)) {
+      return;
+    }
+
+    this.setPreviewLowPriorityDropActive(false);
+  }
+
+  handlePreviewLowPriorityDockDrop(event) {
+    if (!this.designLowPrioritySlot) return;
+
+    const dockEl = event.target.closest('.design-low-priority-dock');
+    if (!dockEl || !this.designLowPrioritySlot.contains(dockEl)) return;
+
+    event.preventDefault();
+
+    const designId = this.getDraggedPreviewDesignId(event);
+    const design = Array.isArray(this.designs)
+      ? this.designs.find((item) => String(item?.id || '').trim() === designId)
+      : null;
+
+    if (!designId || !design) {
+      this.clearPreviewDesignDragState();
+      return;
+    }
+
+    if (this.isPreviewDesignInLowPriorityGroup(design)) {
+      this.clearPreviewDesignDragState();
+      return;
+    }
+
+    this.previewDesignGroupAssignments = {
+      ...(this.previewDesignGroupAssignments || {}),
+      [designId]: this.getPreviewDesignLowPriorityKey()
+    };
+    this.persistPreviewDesignGroupAssignments(this.designs);
+    this.clearPreviewDesignDragState();
+    this.renderPreviewDesignCards(this.currentProjectData);
+    this.showToast('已加入不重要分组', 'success');
+  }
+
+  setPreviewSecondaryDesignMarkup(markup = '') {
+    if (!this.designSecondarySlot) return;
+    const nextMarkup = String(markup || '').trim();
+    this.designSecondarySlot.innerHTML = nextMarkup;
+    this.designSecondarySlot.hidden = !nextMarkup;
+    if (!nextMarkup) {
+      this.finishPreviewCustomGroupInteraction();
+    }
+  }
+
+  setPreviewCustomGroupMarkup(markup = '') {
+    if (!this.designCustomGroupLayer) return;
+    const nextMarkup = String(markup || '').trim();
+    this.designCustomGroupLayer.innerHTML = nextMarkup;
+    this.designCustomGroupLayer.hidden = !nextMarkup;
+    if (!nextMarkup) {
+      this.finishPreviewCustomGroupInteraction();
+    }
+  }
+
+  setPreviewLowPriorityDesignMarkup(markup = '') {
+    if (!this.designLowPrioritySlot) return;
+    const nextMarkup = String(markup || '').trim();
+    this.designLowPrioritySlot.innerHTML = nextMarkup;
+    this.designLowPrioritySlot.hidden = !nextMarkup;
+    if (!nextMarkup) {
+      this.finishPreviewLowPriorityDockInteraction();
+      this.designLowPrioritySlot.classList.remove('is-visible', 'has-items', 'is-drag-active', 'is-drop-target', 'is-interacting');
+      this.resetPreviewLowPriorityDockLayout();
+    }
+  }
+
+  getAllPreviewDesignCards() {
+    return Array.from(this.previewContainerShell?.querySelectorAll('.design-card') || []);
+  }
+
+  findPreviewDesignCardById(designId) {
+    const normalizedId = String(designId || '').trim();
+    if (!normalizedId || !this.previewContainerShell) return null;
+    return this.previewContainerShell.querySelector(`.design-card[data-id="${normalizedId}"]`);
+  }
+
+  updateDesignCardSelectionUi() {
+    const selectedIds = new Set(this.getSelectedDesignIds());
+    const activeDesignId = String(this.selectedDesignId || '').trim();
+    this.getAllPreviewDesignCards().forEach((card) => {
+      const designId = String(card.dataset.id || '').trim();
+      const isSelected = selectedIds.has(designId);
+      const isActive = Boolean(designId) && designId === activeDesignId;
+      card.classList.toggle('selected', isSelected);
+      card.classList.toggle('active-design', isActive);
+      card.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
+    });
+  }
+
+  resolveDesignSelection(designId, {
+    event = null,
+    selectedIds = null,
+    activeDesignId = ''
+  } = {}) {
+    const normalizedId = String(designId || '').trim();
+    if (!normalizedId) {
+      return { ids: [], activeId: '' };
+    }
+
+    if (Array.isArray(selectedIds) && selectedIds.length > 0) {
+      return this.normalizeSelectedDesignIds(selectedIds, activeDesignId || normalizedId);
+    }
+
+    const currentIds = this.getSelectedDesignIds();
+    const hasModifier = Boolean(event?.metaKey || event?.ctrlKey);
+    const isAlreadySelected = currentIds.includes(normalizedId);
+
+    if (!hasModifier) {
+      if (currentIds.length > 1 && isAlreadySelected) {
+        return {
+          ids: currentIds,
+          activeId: normalizedId
+        };
+      }
+      return {
+        ids: [normalizedId],
+        activeId: normalizedId
+      };
+    }
+
+    if (!isAlreadySelected) {
+      return this.normalizeSelectedDesignIds([...currentIds, normalizedId], normalizedId);
+    }
+
+    const nextIds = currentIds.filter((id) => id !== normalizedId);
+    if (nextIds.length === 0) {
+      return {
+        ids: [normalizedId],
+        activeId: normalizedId
+      };
+    }
+
+    const currentActiveId = String(this.selectedDesignId || '').trim();
+    const nextActiveId = currentActiveId === normalizedId
+      ? nextIds[nextIds.length - 1]
+      : (nextIds.includes(currentActiveId) ? currentActiveId : nextIds[0]);
+
+    return {
+      ids: nextIds,
+      activeId: nextActiveId
+    };
+  }
+
+  syncLayerModeButton() {
+    if (!this.layerModeBtn) return;
+    const multiPreview = this.isMultiPreviewMode();
+    this.layerModeBtn.classList.toggle('active', !multiPreview && this.isLayerMode);
+    this.layerModeBtn.textContent = (!multiPreview && this.isLayerMode) ? '隐藏图层' : '图层解析';
+    this.layerModeBtn.disabled = multiPreview;
+    this.layerModeBtn.title = multiPreview ? '多选预览时不可用，请先单选一张设计图' : '显示/隐藏图层标注';
+  }
+
+  disableSinglePreviewModesForGallery() {
+    this.exitMarkModes();
+    if (this.isLayerMode) {
+      this.isLayerMode = false;
+      this.hideLayerAnnotations();
+    }
+    this.revokeAnnotationObjectUrl();
+    this.isAnnotationPreview = false;
+  }
+
+  syncPreviewInteractionButtons() {
+    const multiPreview = this.isMultiPreviewMode();
+    if (multiPreview) {
+      this.disableSinglePreviewModesForGallery();
+    }
+
+    this.syncMarkModeButtons();
+    this.syncLayerModeButton();
+    this.updateAnnotationPreviewButton();
+  }
+
+  renderPreviewGallery() {
+    if (!this.previewGallery) return;
+    const selectedIds = this.getSelectedDesignIds();
+    const selectedDesigns = selectedIds
+      .map((designId) => this.designs?.find((item) => String(item?.id || '').trim() === designId) || null)
+      .filter(Boolean);
+
+    this.previewGallery.innerHTML = selectedDesigns.map((design, index) => {
+      const designId = this.escapeAttr(design.id || '');
+      const designName = this.decodeHtmlEntities(design.name) || `设计图 ${index + 1}`;
+      const safeName = this.escapeHtml(designName);
+      const safeAttrName = this.escapeAttr(designName);
+      const previewUrl = this.getGalleryPreviewSrc(design);
+      const itemClassName = `preview-gallery-item${String(this.selectedDesignId || '') === String(design.id || '') ? ' active-design' : ''}`;
+      return `
+        <button class="${itemClassName}" type="button" data-design-id="${designId}" title="${safeAttrName}">
+          <span class="preview-gallery-frame">
+            ${previewUrl ? `<img class="preview-gallery-image" src="${this.escapeAttr(previewUrl)}" alt="${safeAttrName}" loading="${index < 2 ? 'eager' : 'lazy'}">` : '<span class="preview-gallery-empty">FRAME</span>'}
+          </span>
+          <span class="preview-gallery-name">${safeName}</span>
+        </button>
+      `;
+    }).join('');
+
+      this.previewGallery.querySelectorAll('.preview-gallery-item').forEach((item) => {
+        item.addEventListener('click', () => {
+          if (Date.now() < this.suppressPreviewItemClickUntil) {
+            return;
+          }
+          const designId = String(item.dataset.designId || '').trim();
+          const card = this.findPreviewDesignCardById(designId);
+          if (!card || !this.currentProjectData) return;
+        this.selectDesign(card, this.currentProjectData, {
+          selectedIds,
+          activeDesignId: designId
+        });
+      });
+    });
+  }
+
+  syncPreviewPresentation(design = this.getSelectedDesign()) {
+    if (!this.previewContainer || !this.previewImage || !this.previewGallery) return;
+
+    const multiPreview = this.isMultiPreviewMode();
+    const nextMode = multiPreview ? 'gallery' : 'single';
+    this.previewContainer.classList.toggle('multi-preview-mode', multiPreview);
+    this.previewGallery.hidden = !multiPreview;
+    this.previewImage.hidden = multiPreview;
+
+    if (this.previewPresentationMode !== nextMode) {
+      this.previewPresentationMode = nextMode;
+      this.zoomLevel = 1;
+      this.panX = 0;
+      this.panY = 0;
+      this.updateZoomLevel();
+    }
+
+    if (multiPreview) {
+      this.renderPreviewGallery();
+      this.hidePreviewOverlays();
+      this.applyTransform();
+      const selectedCount = this.getSelectedDesignIds().length;
+      const activeDesignName = this.decodeHtmlEntities(design?.name || '') || '当前设计图';
+      if (this.previewName) {
+        this.previewName.textContent = `${activeDesignName} 等 ${selectedCount} 张`;
+      }
+      if (this.previewSize) {
+        this.previewSize.textContent = `${selectedCount} 张设计图`;
+      }
+      this.updateDesignPreviewFrameLabel(`${activeDesignName} 等 ${selectedCount} 张`);
+      return;
+    }
+
+    this.previewGallery.innerHTML = '';
+    this.restorePreviewOverlays();
+    this.applyTransform();
   }
 
   getCurrentLanhuUrl() {
@@ -808,6 +2702,25 @@ class LanhuViewer {
     }
   }
 
+  loadStructuredPreviewRecipeCache() {
+    try {
+      const data = localStorage.getItem('lanhuStructuredPreviewRecipeCache');
+      if (!data) return {};
+
+      const parsed = JSON.parse(data);
+      const cache = parsed && typeof parsed === 'object' ? parsed : {};
+      const { cache: nextCache, changed } = this.pruneStructuredPreviewRecipeCacheEntries(cache);
+
+      if (changed) {
+        localStorage.setItem('lanhuStructuredPreviewRecipeCache', JSON.stringify(nextCache));
+      }
+
+      return nextCache;
+    } catch (e) {
+      return {};
+    }
+  }
+
   pruneGeneratedCodeCacheEntries(cache = this.generatedCodeCache) {
     const nextCache = cache && typeof cache === 'object' ? { ...cache } : {};
     const now = Date.now();
@@ -880,6 +2793,44 @@ class LanhuViewer {
     return { cache: nextCache, changed };
   }
 
+  pruneStructuredPreviewRecipeCacheEntries(cache = this.structuredPreviewRecipeCache) {
+    const nextCache = cache && typeof cache === 'object' ? { ...cache } : {};
+    const now = Date.now();
+    let changed = false;
+
+    Object.keys(nextCache).forEach((key) => {
+      const item = nextCache[key];
+      const normalizedRecipe = this.normalizeStructuredPreviewRuntimeRecipe(item?.recipe || item, {
+        fallbackId: key
+      });
+
+      if (!item || item.expire < now || !normalizedRecipe) {
+        delete nextCache[key];
+        changed = true;
+        return;
+      }
+
+      nextCache[key] = {
+        ...item,
+        recipe: normalizedRecipe,
+        updatedAt: Number(item.updatedAt) || now,
+        expire: Number(item.expire) || (now + 14 * 24 * 60 * 60 * 1000)
+      };
+    });
+
+    const maxEntries = 24;
+    const keysByRecency = Object.keys(nextCache).sort(
+      (a, b) => Number(nextCache[b]?.updatedAt || 0) - Number(nextCache[a]?.updatedAt || 0)
+    );
+
+    keysByRecency.slice(maxEntries).forEach((key) => {
+      delete nextCache[key];
+      changed = true;
+    });
+
+    return { cache: nextCache, changed };
+  }
+
   saveGeneratedCodeCache() {
     try {
       const { cache } = this.pruneGeneratedCodeCacheEntries(this.generatedCodeCache);
@@ -918,6 +2869,29 @@ class LanhuViewer {
         delete this.generatedCodeJobCache[keysByAge.shift()];
         try {
           localStorage.setItem('lanhuGeneratedCodeJobCache', JSON.stringify(this.generatedCodeJobCache));
+          return true;
+        } catch (saveError) {}
+      }
+
+      return false;
+    }
+  }
+
+  saveStructuredPreviewRecipeCache() {
+    try {
+      const { cache } = this.pruneStructuredPreviewRecipeCacheEntries(this.structuredPreviewRecipeCache);
+      this.structuredPreviewRecipeCache = cache;
+      localStorage.setItem('lanhuStructuredPreviewRecipeCache', JSON.stringify(this.structuredPreviewRecipeCache));
+      return true;
+    } catch (e) {
+      const keysByAge = Object.keys(this.structuredPreviewRecipeCache).sort(
+        (a, b) => Number(this.structuredPreviewRecipeCache[a]?.updatedAt || 0) - Number(this.structuredPreviewRecipeCache[b]?.updatedAt || 0)
+      );
+
+      while (keysByAge.length > 0) {
+        delete this.structuredPreviewRecipeCache[keysByAge.shift()];
+        try {
+          localStorage.setItem('lanhuStructuredPreviewRecipeCache', JSON.stringify(this.structuredPreviewRecipeCache));
           return true;
         } catch (saveError) {}
       }
@@ -1252,6 +3226,7 @@ class LanhuViewer {
   clearCache() {
     const currentUrl = this.urlInput?.value?.trim() || '';
     const currentDesignId = this.selectedDesignId || this.pendingDesignId || null;
+    const currentDesignIds = this.getSelectedDesignIds();
 
     this.cache = {};
     this.generatedCodeCache = {};
@@ -1267,15 +3242,13 @@ class LanhuViewer {
 
     if (this.isLayerMode) {
       this.isLayerMode = false;
-      if (this.layerModeBtn) {
-        this.layerModeBtn.classList.remove('active');
-        this.layerModeBtn.textContent = '图层解析';
-      }
+      this.syncLayerModeButton();
       this.hideLayerAnnotations();
     }
 
     if (currentUrl && this.isLoggedIn) {
       this.pendingDesignId = currentDesignId;
+      this.pendingDesignIds = currentDesignIds;
       this.refreshBtn.style.display = 'none';
       this.log('缓存已清空，正在刷新当前项目...', 'info');
       this.showToast('缓存已清空，正在刷新当前项目');
@@ -1301,9 +3274,11 @@ class LanhuViewer {
   savePageState() {
     try {
       const url = this.urlInput?.value?.trim() || '';
+      const selectedDesignIds = this.getSelectedDesignIds();
       const state = {
         url,
         selectedDesignId: this.selectedDesignId || null,
+        selectedDesignIds,
         timestamp: Date.now()
       };
       this.currentPageState = state;
@@ -1365,7 +3340,10 @@ class LanhuViewer {
   // 恢复页面状态
   restorePageState() {
     // 未登录时不恢复
-    if (!this.isLoggedIn) return;
+    if (!this.isLoggedIn) {
+      this.finishBootRestore();
+      return;
+    }
 
     // 优先从 URL 参数获取链接（用于 iframe 嵌入场景）
     const urlParams = new URLSearchParams(window.location.search);
@@ -1381,6 +3359,7 @@ class LanhuViewer {
         if (this.currentPageState.selectedDesignId) {
           this.pendingDesignId = this.currentPageState.selectedDesignId;
         }
+        this.pendingDesignIds = this.getPersistedSelectedDesignIds(this.currentPageState);
         console.log('URL参数场景恢复状态:', this.pendingDesignId);
       }
 
@@ -1389,13 +3368,17 @@ class LanhuViewer {
       return;
     }
 
-    if (!this.currentPageState || !this.currentPageState.url) return;
+    if (!this.currentPageState || !this.currentPageState.url) {
+      this.finishBootRestore();
+      return;
+    }
 
     const { url, selectedDesignId, timestamp } = this.currentPageState;
 
     // 检查状态是否过期（2天内有效）
     if (Date.now() - timestamp > 2 * 24 * 60 * 60 * 1000) {
       this.clearPageState();
+      this.finishBootRestore();
       return;
     }
 
@@ -1405,6 +3388,7 @@ class LanhuViewer {
 
     // 记住要选中的设计图
     this.pendingDesignId = selectedDesignId;
+    this.pendingDesignIds = this.getPersistedSelectedDesignIds(this.currentPageState);
     console.log('恢复页面状态, pendingDesignId:', selectedDesignId);
 
     // 检查是否有缓存，如果有则直接恢复
@@ -1413,6 +3397,7 @@ class LanhuViewer {
       this.log('恢复上次浏览位置', 'success');
       this.renderResult(cached);
       this.refreshBtn.style.display = 'inline-flex';
+      this.finishBootRestore();
     } else {
       // 没有缓存时，自动重新解析
       this.log('自动恢复页面...', 'info');
@@ -1426,11 +3411,13 @@ class LanhuViewer {
     if (url) {
       // 保存当前选中的设计图ID
       const currentDesignId = this.selectedDesignId;
+      const currentDesignIds = this.getSelectedDesignIds();
       delete this.cache[url];
       this.saveCache();
       this.refreshBtn.style.display = 'none';
       // 刷新后恢复选中状态
       this.pendingDesignId = currentDesignId;
+      this.pendingDesignIds = currentDesignIds;
       this.parseUrl();
     }
   }
@@ -1693,6 +3680,7 @@ class LanhuViewer {
     this.designCount = document.getElementById('designCount');
     this.designGrid = document.getElementById('designGrid');
     this.historySection = document.getElementById('historySection');
+    this.appShell = document.querySelector('.app-shell');
 
     // 中间预览区
     this.loading = document.getElementById('loading');
@@ -1704,6 +3692,7 @@ class LanhuViewer {
     this.previewSize = document.getElementById('previewSize');
     this.copyDesignLinkBtn = document.getElementById('copyDesignLinkBtn');
     this.previewImage = document.getElementById('previewImage');
+    this.previewGallery = document.getElementById('previewGallery');
     this.hotspotModeBtn = document.getElementById('hotspotModeBtn');
     this.noteModeBtn = document.getElementById('noteModeBtn');
     this.layerModeBtn = document.getElementById('layerModeBtn');
@@ -1712,6 +3701,10 @@ class LanhuViewer {
     this.generateHtmlBtn = document.getElementById('generateHtmlBtn');
     this.toggleCodePanelBtn = document.getElementById('toggleCodePanelBtn');
     this.previewBody = document.getElementById('previewBody');
+    this.previewContainerShell = document.getElementById('previewContainerShell');
+    this.designSecondarySlot = document.getElementById('designSecondarySlot');
+    this.designCustomGroupLayer = document.getElementById('designCustomGroupLayer');
+    this.designLowPrioritySlot = document.getElementById('designLowPrioritySlot');
     this.designPreviewFrameLabel = document.getElementById('designPreviewFrameLabel');
     this.generatedPreviewSite = document.getElementById('generatedPreviewSite');
     this.htmlPreviewModal = document.getElementById('htmlPreviewModal');
@@ -1731,6 +3724,8 @@ class LanhuViewer {
     this.generatedCodeProgressBar = document.getElementById('generatedCodeProgressBar');
     this.generatedCodeCurrentAction = document.getElementById('generatedCodeCurrentAction');
     this.generatedCodePrimaryBtn = document.getElementById('generatedCodePrimaryBtn');
+    this.generatedCodeDraftBtn = document.getElementById('generatedCodeDraftBtn');
+    this.draftRecipeBtn = document.getElementById('draftRecipeBtn');
     this.generatedCodeLogList = document.getElementById('generatedCodeLogList');
     this.openHtmlInNewTabBtn = document.getElementById('openHtmlInNewTabBtn');
     this.runDiagnosticsBtn = document.getElementById('runDiagnosticsBtn');
@@ -1975,6 +3970,12 @@ class LanhuViewer {
     if (this.openHtmlInNewTabBtn) {
       this.openHtmlInNewTabBtn.addEventListener('click', () => this.openGeneratedHtmlInNewTab());
     }
+    if (this.draftRecipeBtn) {
+      this.draftRecipeBtn.addEventListener('click', () => this.generateStructuredPreviewRecipeDraft());
+    }
+    if (this.generatedCodeDraftBtn) {
+      this.generatedCodeDraftBtn.addEventListener('click', () => this.generateStructuredPreviewRecipeDraft());
+    }
     if (this.runDiagnosticsBtn) {
       this.runDiagnosticsBtn.addEventListener('click', () => this.runGeneratedPreviewDiagnostics());
     }
@@ -2005,6 +4006,34 @@ class LanhuViewer {
     if (this.closeHtmlPreviewBtn) {
       this.closeHtmlPreviewBtn.addEventListener('click', () => this.setCodePanelVisibility(false));
     }
+    if (this.designLowPrioritySlot) {
+      this.designLowPrioritySlot.addEventListener('dragover', (event) => this.handlePreviewLowPriorityDockDragOver(event));
+      this.designLowPrioritySlot.addEventListener('dragleave', (event) => this.handlePreviewLowPriorityDockDragLeave(event));
+      this.designLowPrioritySlot.addEventListener('drop', (event) => this.handlePreviewLowPriorityDockDrop(event));
+      this.designLowPrioritySlot.addEventListener('pointerdown', (event) => this.startPreviewLowPriorityDockInteraction(event));
+    }
+    if (this.designSecondarySlot) {
+      this.designSecondarySlot.addEventListener('pointerdown', (event) => this.startPreviewCustomGroupInteraction(event));
+    }
+    if (this.designCustomGroupLayer) {
+      this.designCustomGroupLayer.addEventListener('dragover', (event) => this.handlePreviewCustomGroupDragOver(event));
+      this.designCustomGroupLayer.addEventListener('dragleave', (event) => this.handlePreviewCustomGroupDragLeave(event));
+      this.designCustomGroupLayer.addEventListener('drop', (event) => this.handlePreviewCustomGroupDrop(event));
+      this.designCustomGroupLayer.addEventListener('pointerdown', (event) => this.startPreviewCustomGroupInteraction(event));
+      this.designCustomGroupLayer.addEventListener('dblclick', (event) => this.startPreviewFloatingGroupRename(event));
+    }
+    if (this.previewContainerShell) {
+      this.previewContainerShell.addEventListener('dblclick', (event) => {
+        this.startPreviewFloatingGroupRename(event);
+        this.handlePreviewBlankDoubleClick(event);
+      });
+    }
+    document.addEventListener('pointermove', (event) => this.updatePreviewLowPriorityDockInteraction(event), { passive: false });
+    document.addEventListener('pointermove', (event) => this.updatePreviewCustomGroupInteraction(event), { passive: false });
+    document.addEventListener('pointerup', (event) => this.finishPreviewLowPriorityDockInteraction(event));
+    document.addEventListener('pointerup', (event) => this.finishPreviewCustomGroupInteraction(event));
+    document.addEventListener('pointercancel', (event) => this.finishPreviewLowPriorityDockInteraction(event));
+    document.addEventListener('pointercancel', (event) => this.finishPreviewCustomGroupInteraction(event));
 
     // 更新设计图按钮
     this.refreshDesignBtn = document.getElementById('refreshDesignBtn');
@@ -2016,6 +4045,7 @@ class LanhuViewer {
       this.previewImage.addEventListener('load', () => {
         this.applyTransform();
         this.ensurePreviewImageVisible({ save: true });
+        this.syncPreviewDesignStripLayout();
         this.scheduleHotspotRender();
         this.scheduleHotspotRender(140);
         this.scheduleHotspotRender(280);
@@ -2034,6 +4064,9 @@ class LanhuViewer {
 
     window.addEventListener('message', (event) => this.handleParentMessage(event));
     window.addEventListener('resize', () => {
+      this.syncPreviewDesignStripLayout();
+      this.syncPreviewLowPriorityDockLayout();
+      this.syncPreviewCustomGroupLayout();
       this.scheduleHotspotRender();
       this.queuePreviewImageRefresh(180);
       this.queueGeneratedPreviewFit(120);
@@ -2041,6 +4074,9 @@ class LanhuViewer {
 
     if (this.previewContainer && 'ResizeObserver' in window) {
       this.resizeObserver = new ResizeObserver(() => {
+        this.syncPreviewDesignStripLayout();
+        this.syncPreviewLowPriorityDockLayout();
+        this.syncPreviewCustomGroupLayout();
         this.scheduleHotspotRender();
         this.queuePreviewImageRefresh(180);
         this.queueGeneratedPreviewFit(120);
@@ -2070,7 +4106,7 @@ class LanhuViewer {
           this.startNoteDraw(e);
           return;
         }
-        if (this.panzoom) return;
+        if (this.panzoom && this.isPanzoomBound) return;
         this.startDrag(e);
       });
       document.addEventListener('mousemove', (e) => {
@@ -2082,7 +4118,7 @@ class LanhuViewer {
           this.updateNoteDraw(e);
           return;
         }
-        if (this.panzoom) return;
+        if (this.panzoom && this.isPanzoomBound) return;
         this.doDrag(e);
       });
       document.addEventListener('mouseup', (e) => {
@@ -2094,7 +4130,7 @@ class LanhuViewer {
           this.finishNoteDraw(e);
           return;
         }
-        if (this.panzoom) return;
+        if (this.panzoom && this.isPanzoomBound) return;
         this.endDrag();
       });
     }
@@ -2160,6 +4196,23 @@ class LanhuViewer {
     } catch (e) {
       return String(originalUrl || '');
     }
+  }
+
+  getGalleryPreviewRequestWidth(design = null) {
+    const baseWidth = Math.max(0, Number(design?.width) || 0);
+    const scaledWidth = Math.round(baseWidth * Math.max(6, (Number(this.zoomLevel) || 1) * 4));
+    return this.getAdaptiveCoverBucket(Math.max(2000, scaledWidth));
+  }
+
+  getGalleryPreviewSrc(design = null) {
+    const originalUrl = String(design?.url || '').trim();
+    if (!originalUrl) return '';
+    if (!this.isAdaptiveCoverPreviewUrl(originalUrl)) {
+      return this.getProxiedImageUrl(originalUrl);
+    }
+    const requestWidth = this.getGalleryPreviewRequestWidth(design);
+    const optimizedUrl = this.buildAdaptiveCoverPreviewUrl(originalUrl, requestWidth);
+    return this.getProxiedImageUrl(optimizedUrl);
   }
 
   queuePreviewImageRefresh(delay = 160) {
@@ -2435,6 +4488,7 @@ class LanhuViewer {
   }
 
   toggleHotspotMode() {
+    if (this.isMultiPreviewMode()) return;
     this.isMarkMode = !this.isMarkMode;
     if (this.isMarkMode) {
       this.isNoteMode = false;
@@ -2451,6 +4505,7 @@ class LanhuViewer {
   }
 
   toggleNoteMode() {
+    if (this.isMultiPreviewMode()) return;
     this.isNoteMode = !this.isNoteMode;
     if (this.isNoteMode) {
       this.isMarkMode = false;
@@ -2467,16 +4522,21 @@ class LanhuViewer {
   }
 
   syncMarkModeButtons() {
+    const multiPreview = this.isMultiPreviewMode();
     if (this.hotspotModeBtn) {
-      this.hotspotModeBtn.classList.toggle('active', this.isMarkMode);
-      this.hotspotModeBtn.textContent = this.isMarkMode ? '退出热点' : '标记热点';
+      this.hotspotModeBtn.classList.toggle('active', !multiPreview && this.isMarkMode);
+      this.hotspotModeBtn.textContent = (!multiPreview && this.isMarkMode) ? '退出热点' : '标记热点';
+      this.hotspotModeBtn.disabled = multiPreview;
+      this.hotspotModeBtn.title = multiPreview ? '多选预览时不可用，请先单选一张设计图' : '标记热点区域';
     }
     if (this.noteModeBtn) {
-      this.noteModeBtn.classList.toggle('active', this.isNoteMode);
-      this.noteModeBtn.textContent = this.isNoteMode ? '退出备注' : '标记备注';
+      this.noteModeBtn.classList.toggle('active', !multiPreview && this.isNoteMode);
+      this.noteModeBtn.textContent = (!multiPreview && this.isNoteMode) ? '退出备注' : '标记备注';
+      this.noteModeBtn.disabled = multiPreview;
+      this.noteModeBtn.title = multiPreview ? '多选预览时不可用，请先单选一张设计图' : '标记备注区域';
     }
     if (this.previewContainer) {
-      this.previewContainer.classList.toggle('mark-mode', this.isMarkMode || this.isNoteMode);
+      this.previewContainer.classList.toggle('mark-mode', !multiPreview && (this.isMarkMode || this.isNoteMode));
     }
     this.syncPanzoomBinding();
   }
@@ -2498,13 +4558,13 @@ class LanhuViewer {
   }
 
   getImageViewportRect() {
-    if (!this.previewImage || !this.previewContainer) return null;
-    if (!this.previewImage.src) return null;
-    if (!this.previewImage.complete || this.previewImage.naturalWidth <= 0) return null;
-    const imageRect = this.previewImage.getBoundingClientRect();
+    if (!this.previewContainer) return null;
+    const target = this.getPreviewTransformTarget();
+    if (!target) return null;
+    const imageRect = target.getBoundingClientRect();
     const containerRect = this.previewContainer.getBoundingClientRect();
     if (imageRect.width <= 1 || imageRect.height <= 1) return null;
-    return { imageRect, containerRect };
+    return { imageRect, containerRect, target };
   }
 
   getRectIntersection(rectA, rectB) {
@@ -2619,6 +4679,10 @@ class LanhuViewer {
   }
 
   restorePreviewOverlays() {
+    if (this.isMultiPreviewMode()) {
+      this.hidePreviewOverlays();
+      return;
+    }
     if (this.hotspotLayer) {
       this.hotspotLayer.style.display = '';
     }
@@ -2680,7 +4744,7 @@ class LanhuViewer {
 
   syncPanzoomBinding() {
     if (!this.panzoom) return;
-    const shouldBind = !this.isMarkMode && !this.isNoteMode;
+    const shouldBind = !this.isMarkMode && !this.isNoteMode && !this.isMultiPreviewMode();
 
     if (shouldBind && !this.isPanzoomBound) {
       this.panzoom.bind();
@@ -2890,7 +4954,7 @@ class LanhuViewer {
   }
 
   handleTouchStart(event) {
-    if (this.panzoom && !this.isMarkMode && !this.isNoteMode) return;
+    if (this.panzoom && this.isPanzoomBound && !this.isMarkMode && !this.isNoteMode) return;
     if (event.touches.length >= 2) {
       event.preventDefault();
       this.startPinchZoom(event);
@@ -2915,7 +4979,7 @@ class LanhuViewer {
   }
 
   handleTouchMove(event) {
-    if (this.panzoom && !this.isMarkMode && !this.isNoteMode) return;
+    if (this.panzoom && this.isPanzoomBound && !this.isMarkMode && !this.isNoteMode) return;
     if (this.isPinching) {
       if (event.touches.length >= 2) {
         event.preventDefault();
@@ -2947,7 +5011,7 @@ class LanhuViewer {
   }
 
   handleTouchEnd(event) {
-    if (this.panzoom && !this.isMarkMode && !this.isNoteMode) return;
+    if (this.panzoom && this.isPanzoomBound && !this.isMarkMode && !this.isNoteMode) return;
     if (this.isPinching) {
       if (event.touches.length >= 2) {
         this.startPinchZoom(event);
@@ -2976,7 +5040,7 @@ class LanhuViewer {
   }
 
   handleTouchCancel(event) {
-    if (this.panzoom && !this.isMarkMode && !this.isNoteMode) return;
+    if (this.panzoom && this.isPanzoomBound && !this.isMarkMode && !this.isNoteMode) return;
     if (this.isPinching) {
       this.endPinchZoom();
     }
@@ -3194,6 +5258,7 @@ class LanhuViewer {
   renderHotspots() {
     if (!this.hotspotLayer) return;
     this.hotspotLayer.innerHTML = '';
+    if (this.isMultiPreviewMode()) return;
 
     const viewport = this.getImageViewportRect();
     if (!viewport) return;
@@ -3467,9 +5532,12 @@ class LanhuViewer {
     this.cookies = [];
     this.clearPageState();
     this.selectedDesignId = null;
+    this.selectedDesignIds = [];
+    this.pendingDesignIds = [];
     this.updateCopyLinkButtonState();
     this.updateSelectedDesignCopyButtonState();
     this.updateGenerateHtmlButtonState();
+    this.syncPreviewInteractionButtons();
 
     this.userInfoEl.innerHTML = `
       <button class="btn btn-primary" id="loginBtn">连接蓝湖</button>
@@ -3523,7 +5591,9 @@ class LanhuViewer {
 
     // 新解析时清除之前的选中状态（但保留 pendingDesignId 用于恢复）
     this.selectedDesignId = null;
+    this.selectedDesignIds = [];
     this.updateGenerateHtmlButtonState();
+    this.syncPreviewInteractionButtons();
     this.refreshBtn.style.display = 'none';
 
     // 注意：不要清除 pendingDesignId，因为它用于恢复之前选中的设计图
@@ -3536,7 +5606,12 @@ class LanhuViewer {
     this.emptyState.style.display = 'flex';
     this.historySection.style.display = 'flex';
     this.projectInfo.style.display = 'none';
+    this.setPreviewSecondaryDesignMarkup('');
+    this.setPreviewCustomGroupMarkup('');
+    this.setPreviewLowPriorityDesignMarkup('');
     this.designsSection.style.display = 'none';
+    this.syncPreviewDesignStripLayout();
+    this.syncWorkspaceLayout();
 
     try {
       this.log('发送解析请求...', 'info');
@@ -3580,6 +5655,7 @@ class LanhuViewer {
     // 保存项目ID和团队ID，供图层解析等功能使用
     this.currentTeamId = data.teamId;
     this.currentProjectId = data.projectId;
+    this.currentProjectData = data;
     this.designs = data.designs || [];
 
     // 保存到历史记录
@@ -3619,53 +5695,9 @@ class LanhuViewer {
       this.historySection.style.display = 'none';
       this.designsSection.style.display = 'flex';
       this.designCount.textContent = `${data.designs.length} 张`;
-
-      this.designGrid.innerHTML = data.designs.map((design, index) => {
-        const designName = this.decodeHtmlEntities(design.name) || `设计图 ${index + 1}`;
-        const safeName = this.escapeHtml(designName);
-        const safeAttrName = this.escapeAttr(designName);
-        const designId = this.escapeAttr(design.id || '');
-        const designRawUrl = this.escapeAttr(design.url || '');
-        const designLink = this.getDesignLink(design);
-        const safeDesignLink = this.escapeAttr(designLink);
-        const previewUrl = design.url ? this.getProxiedImageUrl(design.url) : '';
-        const viewportTag = this.getDesignViewportTag(design);
-        const width = Number(design.width) || 0;
-        const height = Number(design.height) || 0;
-        const hasSize = width > 0 && height > 0;
-        const orientation = hasSize ? (width >= height ? '横向' : '纵向') : '方向待定';
-        const ratio = hasSize ? this.getDesignRatio(width, height) : '';
-        const sizeText = hasSize ? `${width} × ${height}` : '尺寸待同步';
-        const metaText = ratio ? `${orientation} · ${ratio}` : orientation;
-        const codeStatus = this.getDesignCodeStatus(design);
-        const cardTitle = this.escapeAttr(`${designName}${hasSize ? ` (${width}×${height})` : ''} · ${codeStatus.title}`);
-
-        return `
-          <div class="design-card" data-index="${index}" data-id="${designId}" data-url="${designRawUrl}" data-link="${safeDesignLink}" title="${cardTitle}">
-            <div class="design-preview">
-              ${previewUrl ? `<img src="${this.escapeAttr(previewUrl)}" alt="${safeAttrName}" loading="lazy">` : '<span>FRAME</span>'}
-            </div>
-            <div class="design-info">
-              <div class="design-card-head">
-                <span class="design-index">${String(index + 1).padStart(2, '0')}</span>
-                <span class="design-tag">${this.escapeHtml(viewportTag)}</span>
-                <span class="design-code-badge ${this.escapeAttr(codeStatus.code)}" title="${this.escapeAttr(codeStatus.title)}">${this.escapeHtml(codeStatus.label)}</span>
-              </div>
-              <div class="design-name" title="${safeAttrName}">${safeName}</div>
-              <div class="design-meta-row">
-                <span class="design-size">${this.escapeHtml(sizeText)}</span>
-                <span class="design-size">${this.escapeHtml(metaText)}</span>
-              </div>
-            </div>
-            <div class="design-arrow">></div>
-          </div>
-        `;
-      }).join('');
-
-      // 绑定点击事件
-      this.designGrid.querySelectorAll('.design-card').forEach(card => {
-        card.addEventListener('click', () => this.selectDesign(card, data));
-      });
+      this.syncPreviewDesignStripLayout();
+      this.syncWorkspaceLayout();
+      this.renderPreviewDesignCards(data);
 
       // 右侧初始状态（在自动选中之前设置，让 selectDesign 可以覆盖）
       this.contentEmpty.style.display = 'flex';
@@ -3674,41 +5706,80 @@ class LanhuViewer {
 
       // 恢复之前选中的设计图，或默认选中第一个
       let targetCard = null;
+      const pendingSelectionIds = this.pendingDesignIds.length > 0
+        ? this.pendingDesignIds
+        : (this.pendingDesignId ? [this.pendingDesignId] : []);
       if (this.pendingDesignId) {
-        targetCard = this.designGrid.querySelector(`.design-card[data-id="${this.pendingDesignId}"]`);
+        targetCard = this.findPreviewDesignCardById(this.pendingDesignId);
         console.log('尝试恢复设计图:', this.pendingDesignId, '找到:', !!targetCard);
-        this.pendingDesignId = null; // 清除待恢复的ID
       }
       if (!targetCard) {
-        targetCard = this.designGrid.querySelector('.design-card');
+        targetCard = this.getAllPreviewDesignCards()[0] || null;
       }
       if (targetCard) {
-        targetCard.click();
+        this.selectDesign(targetCard, data, {
+          selectedIds: pendingSelectionIds,
+          activeDesignId: this.pendingDesignId || String(targetCard.dataset.id || '').trim()
+        });
       }
+      this.pendingDesignId = null;
+      this.pendingDesignIds = [];
     } else {
+      this.currentProjectData = data;
+      this.previewDesignGroupAssignments = {};
+      this.clearPreviewDesignDragState();
+      this.setPreviewSecondaryDesignMarkup('');
+      this.setPreviewCustomGroupMarkup('');
+      this.setPreviewLowPriorityDesignMarkup('');
       this.designsSection.style.display = 'none';
+      this.syncPreviewDesignStripLayout();
+      this.syncWorkspaceLayout();
       // 没有设计图时显示空状态
       this.selectedDesignId = null;
+      this.selectedDesignIds = [];
       this.updateDesignPreviewFrameLabel('');
       this.updateSelectedDesignCopyButtonState();
       this.updateGenerateHtmlButtonState();
+      this.syncPreviewInteractionButtons();
       this.contentEmpty.style.display = 'flex';
       this.previewSection.style.display = 'none';
       this.sidebarRight.style.display = 'none';
       this.renderHotspots();
     }
+
+    this.finishBootRestore();
   }
 
   // 选择设计图
-  async selectDesign(card, projectData) {
-    // 更新选中状态
-    this.designGrid.querySelectorAll('.design-card').forEach(c => c.classList.remove('selected'));
-    card.classList.add('selected');
+  async selectDesign(card, projectData, options = {}) {
+    const clickedDesignId = String(card?.dataset?.id || '').trim();
+    if (!clickedDesignId) return;
 
-    const designId = card.dataset.id;
-    const designUrl = card.dataset.url;
-    const design = projectData.designs.find(d => d.id === designId);
-    const isDesignSwitched = !!this.selectedDesignId && this.selectedDesignId !== designId;
+    const previousActiveDesignId = String(this.selectedDesignId || '').trim();
+    const previousMultiPreview = this.isMultiPreviewMode();
+    const {
+      ids: nextSelectedDesignIds,
+      activeId: nextActiveDesignId
+    } = this.resolveDesignSelection(clickedDesignId, options);
+
+    if (!nextSelectedDesignIds.length || !nextActiveDesignId) {
+      return;
+    }
+
+    const activeCard = this.findPreviewDesignCardById(nextActiveDesignId) || card;
+    const design = projectData.designs.find((item) => String(item?.id || '').trim() === nextActiveDesignId);
+    const designUrl = String(activeCard?.dataset?.url || design?.url || '').trim();
+    const isDesignSwitched = Boolean(previousActiveDesignId) && previousActiveDesignId !== nextActiveDesignId;
+
+    this.selectedDesignIds = nextSelectedDesignIds;
+    this.selectedDesignId = nextActiveDesignId;
+    this.updateDesignCardSelectionUi();
+
+    activeCard?.scrollIntoView({
+      block: 'nearest',
+      inline: 'nearest',
+      behavior: 'smooth'
+    });
 
     // 先保存旧设计图的位置（如果有）
     if (isDesignSwitched) {
@@ -3722,30 +5793,16 @@ class LanhuViewer {
       this.currentLayerDesignId = null;
       if (this.isLayerMode) {
         this.isLayerMode = false;
-        if (this.layerModeBtn) {
-          this.layerModeBtn.classList.remove('active');
-          this.layerModeBtn.textContent = '图层解析';
-        }
         this.hideLayerAnnotations();
       }
     }
 
-    // 更新当前选中的设计图
-    this.selectedDesignId = designId;
     this.updateSelectedDesignCopyButtonState();
     this.updateGenerateHtmlButtonState();
     this.currentProjectData = projectData;
     this.closeNoteModal();
     if (!isDesignSwitched) {
-      if (this.isAnnotationPreview) {
-        this.restoreOriginalPreviewImage();
-      } else {
-        this.updateAnnotationPreviewButton();
-      }
-    }
-    if (!isDesignSwitched) {
       this.clearDrawingDrafts();
-      this.syncMarkModeButtons();
     }
 
     // 保存页面状态（只保存选中的设计图ID）
@@ -3756,34 +5813,39 @@ class LanhuViewer {
     // 隐藏空状态，显示预览区
     this.contentEmpty.style.display = 'none';
     this.previewSection.style.display = 'flex';
-    this.syncMarkModeButtons();
+    this.syncWorkspaceLayout();
+    this.syncPreviewInteractionButtons();
+    this.syncPreviewPresentation(design);
+    requestAnimationFrame(() => this.syncPreviewDesignStripLayout());
     this.renderHotspots();
 
     // 显示设计图预览
     if (designUrl) {
-      const designName = this.decodeHtmlEntities(design.name) || '未命名设计图';
-      this.previewName.textContent = designName;
-      this.updateDesignPreviewFrameLabel(designName);
-      this.previewSize.textContent = `${design.width} × ${design.height}`;
-      this.loadDesignPreviewImage(design, { resetAdaptiveState: true });
+      if (!this.isMultiPreviewMode()) {
+        const designName = this.decodeHtmlEntities(design.name) || '未命名设计图';
+        this.previewName.textContent = designName;
+        this.updateDesignPreviewFrameLabel(designName);
+        this.previewSize.textContent = `${design.width} × ${design.height}`;
+        this.loadDesignPreviewImage(design, { resetAdaptiveState: true });
 
-      // 恢复该设计图的缩放状态（每个设计图独立记忆）
-      const savedState = this.getDesignState(designId);
-      if (savedState) {
-        this.zoomLevel = savedState.zoom || 1;
-        this.panX = savedState.panX || 0;
-        this.panY = savedState.panY || 0;
-        this.applyTransform();
-        this.updateZoomLevel();
-      } else {
-        this.resetZoom(false); // 不保存，因为是初始化
-      }
+        // 恢复该设计图的缩放状态（每个设计图独立记忆）
+        const savedState = this.getDesignState(nextActiveDesignId);
+        if (savedState) {
+          this.zoomLevel = savedState.zoom || 1;
+          this.panX = savedState.panX || 0;
+          this.panY = savedState.panY || 0;
+          this.applyTransform();
+          this.updateZoomLevel();
+        } else {
+          this.resetZoom(false); // 不保存，因为是初始化
+        }
 
-      this.scheduleHotspotRender();
-      this.scheduleHotspotRender(80);
-      this.scheduleHotspotRender(220);
-      if (this.previewImage.complete && this.previewImage.naturalWidth > 0) {
-        this.scheduleHotspotRender(0);
+        this.scheduleHotspotRender();
+        this.scheduleHotspotRender(80);
+        this.scheduleHotspotRender(220);
+        if (this.previewImage.complete && this.previewImage.naturalWidth > 0) {
+          this.scheduleHotspotRender(0);
+        }
       }
 
       const targetFramework = this.getSelectedGeneratedFramework();
@@ -3807,7 +5869,7 @@ class LanhuViewer {
     this.sidebarRight.style.display = 'none';
 
     // 先检查切图缓存
-    const cachedSlices = this.getSliceCache(designId);
+    const cachedSlices = this.getSliceCache(nextActiveDesignId);
     if (cachedSlices) {
       this.renderSlices(cachedSlices);
       this.log('使用切图缓存', 'success');
@@ -3828,7 +5890,7 @@ class LanhuViewer {
         body: JSON.stringify({
           teamId: projectData.teamId,
           projectId: projectData.projectId,
-          imageId: designId
+          imageId: nextActiveDesignId
         })
       });
 
@@ -3841,7 +5903,7 @@ class LanhuViewer {
 
       // 缓存切图数据
       if (data.slices) {
-        this.setSliceCache(designId, data);
+        this.setSliceCache(nextActiveDesignId, data);
       }
 
       this.renderSlices(data);
@@ -4096,7 +6158,7 @@ class LanhuViewer {
     this.showToast('正在更新...');
 
     // 找到当前选中的设计图卡片
-    const card = this.designGrid.querySelector(`.design-card[data-id="${this.selectedDesignId}"]`);
+    const card = this.findPreviewDesignCardById(this.selectedDesignId);
     if (card) {
       // 重新加载切图数据
       await this.loadSlicesForDesign(card, this.currentProjectData);
@@ -4156,7 +6218,7 @@ class LanhuViewer {
   }
 
   // 读取蓝湖生成代码并展示在右侧预览
-  async generateHtmlPreview() {
+  async generateHtmlPreview({ forceReload = false } = {}) {
     if (this.isGeneratingHtmlPreview) {
       this.showToast(`${this.getGeneratedFrameworkLabel()} 代码正在加载中...`);
       return;
@@ -4177,7 +6239,7 @@ class LanhuViewer {
     const targetFramework = this.getSelectedGeneratedFramework();
     const frameworkLabel = this.getGeneratedFrameworkLabel(targetFramework);
 
-    if (this.hasGeneratedCodeForCurrentDesign()) {
+    if (!forceReload && this.hasGeneratedCodeForCurrentDesign()) {
       this.showHtmlPreview({
         revealCodePanel: true
       });
@@ -4185,13 +6247,17 @@ class LanhuViewer {
       return;
     }
 
-    if (this.restoreGeneratedCodeCache(design, {
+    if (!forceReload && this.restoreGeneratedCodeCache(design, {
       autoShow: true,
       revealCodePanel: true,
       framework: targetFramework
     })) {
       this.showToast(`已从缓存恢复 ${frameworkLabel} 代码`, 'success');
       return;
+    }
+
+    if (forceReload) {
+      this.clearGeneratedCodeJobCacheEntry(design, targetFramework);
     }
 
     this.generatedCodePollToken += 1;
@@ -4208,8 +6274,8 @@ class LanhuViewer {
       progressPercent: 2
     };
     this.generatedCodeFramework = '';
-    this.log(`开始读取蓝湖 ${frameworkLabel} 代码...`, 'info');
-    this.showToast(`正在读取 ${frameworkLabel} 代码...`);
+    this.log(`${forceReload ? '重新读取' : '开始读取'}蓝湖 ${frameworkLabel} 代码...`, 'info');
+    this.showToast(`${forceReload ? '正在重新读取' : '正在读取'} ${frameworkLabel} 代码...`);
     this.prepareGeneratedCodeTaskWorkspace(initialTask, { showCodePanel: true, autoShow: true });
 
     try {
@@ -4580,6 +6646,10 @@ class LanhuViewer {
       this.generatedCodeTask = this.createGeneratedCodeCachedTaskState(payload);
       this.renderGeneratedCodeTask();
       this.updateGeneratedCodeMeta();
+    }
+
+    if (this.generatedPreviewHtml && !this.getGeneratedPreviewLayerContext(this.resolveDesignEntity(designId))) {
+      void this.primeGeneratedPreviewRepairContext(this.resolveDesignEntity(designId));
     }
   }
 
@@ -5063,7 +7133,10 @@ class LanhuViewer {
     };
     this.renderGeneratedPreviewDiagnostics();
     if (this.getGeneratedPreviewRepairMode() === 'dds') {
-      this.maybeSwitchGeneratedPreviewRepairMode(report);
+      const repairSwitched = this.maybeSwitchGeneratedPreviewRepairMode(report);
+      if (!repairSwitched && !this.getGeneratedPreviewLayerContext(this.getGeneratedPreviewSourceDesign())) {
+        void this.primeGeneratedPreviewRepairContext();
+      }
     }
   }
 
@@ -5416,6 +7489,2432 @@ class LanhuViewer {
       .filter(Boolean);
   }
 
+  normalizeStructuredPreviewRuntimeRecipe(recipe, {
+    design = null,
+    fallbackId = ''
+  } = {}) {
+    if (!recipe || typeof recipe !== 'object') {
+      return null;
+    }
+
+    const resolvedDesign = this.resolveDesignEntity(design);
+    const rawMatch = recipe.match && typeof recipe.match === 'object' ? recipe.match : {};
+    const rawDesignIds = Array.isArray(rawMatch.designIds) ? rawMatch.designIds : [];
+    const designIds = Array.from(new Set(
+      rawDesignIds
+        .concat(resolvedDesign?.id ? [resolvedDesign.id] : [])
+        .map((value) => String(value || '').trim())
+        .filter(Boolean)
+    ));
+    const designNamePattern = String(rawMatch.designNamePattern || '').trim() ||
+      (resolvedDesign?.name ? `^${this.escapeRegexPattern(String(resolvedDesign.name).trim())}$` : '');
+    const recipeId = String(recipe.id || fallbackId || resolvedDesign?.id || '').trim();
+    if (!recipeId) {
+      return null;
+    }
+
+    const options = recipe.options && typeof recipe.options === 'object'
+      ? { ...recipe.options }
+      : {};
+    const sourceBuilders = Array.isArray(recipe.builders) ? recipe.builders : [];
+    const normalizedRecipe = {
+      ...recipe,
+      id: recipeId,
+      label: String(recipe.label || resolvedDesign?.name || recipeId).trim() || recipeId,
+      match: {
+        designIds,
+        designNamePattern
+      },
+      builders: [{ method: 'buildDraftRecipeStructuredGeneratedPreviewHtml' }],
+      options: {
+        ...options,
+        runtimeRenderer: String(options.runtimeRenderer || 'static-layer-html').trim() || 'static-layer-html',
+        sourceBuilders
+      }
+    };
+
+    return normalizedRecipe;
+  }
+
+  getStructuredPreviewRuntimeRecipes() {
+    const cache = this.structuredPreviewRecipeCache && typeof this.structuredPreviewRecipeCache === 'object'
+      ? this.structuredPreviewRecipeCache
+      : {};
+    return Object.values(cache)
+      .sort((left, right) => Number(right?.updatedAt || 0) - Number(left?.updatedAt || 0))
+      .map((entry) => this.normalizeStructuredPreviewRuntimeRecipe(entry?.recipe || entry, {
+        fallbackId: String(entry?.recipe?.id || entry?.id || '').trim()
+      }))
+      .filter(Boolean);
+  }
+
+  persistStructuredPreviewRuntimeRecipe(recipe, {
+    design = null,
+    provider = '',
+    familyName = '',
+    strategy = ''
+  } = {}) {
+    const normalizedRecipe = this.normalizeStructuredPreviewRuntimeRecipe(recipe, { design });
+    if (!normalizedRecipe?.id) {
+      return null;
+    }
+
+    this.structuredPreviewRecipeCache[normalizedRecipe.id] = {
+      recipe: normalizedRecipe,
+      provider: String(provider || '').trim(),
+      familyName: String(familyName || '').trim(),
+      strategy: String(strategy || '').trim(),
+      updatedAt: Date.now(),
+      expire: Date.now() + 14 * 24 * 60 * 60 * 1000
+    };
+    this.saveStructuredPreviewRecipeCache();
+    return normalizedRecipe;
+  }
+
+  getStructuredGeneratedPreviewRecipes() {
+    const staticRecipes = Array.isArray(window.LANHU_STRUCTURED_PREVIEW_RECIPES)
+      ? window.LANHU_STRUCTURED_PREVIEW_RECIPES.filter((recipe) => recipe && typeof recipe === 'object')
+      : [];
+    return staticRecipes.concat(this.getStructuredPreviewRuntimeRecipes());
+  }
+
+  doesStructuredGeneratedPreviewRecipeMatch(recipe, design = this.getGeneratedPreviewSourceDesign()) {
+    if (!recipe || !design) {
+      return false;
+    }
+
+    const designId = String(design?.id || '').trim();
+    const designName = String(design?.name || '').trim();
+    const match = recipe?.match && typeof recipe.match === 'object' ? recipe.match : {};
+    const designIds = Array.isArray(match.designIds) ? match.designIds.map((value) => String(value || '').trim()).filter(Boolean) : [];
+    let namePattern = null;
+    if (match.designNamePattern instanceof RegExp) {
+      namePattern = match.designNamePattern;
+    } else if (typeof match.designNamePattern === 'string' && match.designNamePattern.trim()) {
+      try {
+        namePattern = new RegExp(match.designNamePattern);
+      } catch (error) {
+        namePattern = null;
+      }
+    }
+
+    if (designIds.length > 0 && designId && designIds.includes(designId)) {
+      return true;
+    }
+
+    if (namePattern && designName) {
+      return namePattern.test(designName);
+    }
+
+    return false;
+  }
+
+  getStructuredGeneratedPreviewRecipe(design = this.getGeneratedPreviewSourceDesign()) {
+    const resolvedDesign = this.resolveDesignEntity(design);
+    return this.getStructuredGeneratedPreviewRecipes()
+      .find((recipe) => this.doesStructuredGeneratedPreviewRecipeMatch(recipe, resolvedDesign)) || null;
+  }
+
+  getStructuredGeneratedPreviewLayerRoot(design = this.getGeneratedPreviewSourceDesign(), recipe = this.getStructuredGeneratedPreviewRecipe(design)) {
+    const options = recipe?.options && typeof recipe.options === 'object' ? recipe.options : {};
+    const explicitRoot = String(options.layerRoot || '').trim();
+    if (explicitRoot) {
+      return explicitRoot;
+    }
+
+    return String(design?.name || '').trim();
+  }
+
+  getStructuredGeneratedPreviewLampKey(design = this.getGeneratedPreviewSourceDesign(), recipe = this.getStructuredGeneratedPreviewRecipe(design)) {
+    const options = recipe?.options && typeof recipe.options === 'object' ? recipe.options : {};
+    const explicitLampKey = String(options.lampKey || '').trim();
+    if (explicitLampKey) {
+      return explicitLampKey;
+    }
+
+    const layerRoot = this.getStructuredGeneratedPreviewLayerRoot(design, recipe);
+    const matchedLampKey = layerRoot.match(/【([^】]+)】/);
+    return String(matchedLampKey?.[1] || '5').trim() || '5';
+  }
+
+  remapStructuredGeneratedPreviewPath(path, design = this.getGeneratedPreviewSourceDesign(), recipe = this.getStructuredGeneratedPreviewRecipe(design)) {
+    let resolvedPath = String(path || '').trim();
+    if (!resolvedPath) {
+      return '';
+    }
+
+    const layerRoot = this.getStructuredGeneratedPreviewLayerRoot(design, recipe);
+    const lampKey = this.getStructuredGeneratedPreviewLampKey(design, recipe);
+
+    if (layerRoot) {
+      resolvedPath = resolvedPath.replace(/^520灯牌【[^】]+】/, layerRoot);
+    }
+
+    if (lampKey && lampKey !== '5') {
+      resolvedPath = resolvedPath
+        .replace(/(^|\/)5字背景(?=\/|$)/g, `$1${lampKey}字背景`)
+        .replace(/(^|\/)5背景(?=\/|$)/g, `$1${lampKey}背景`);
+    }
+
+    return resolvedPath;
+  }
+
+  getStructuredGeneratedPreviewLayerQueries(path, design = this.getGeneratedPreviewSourceDesign(), recipe = this.getStructuredGeneratedPreviewRecipe(design), index = 0) {
+    const resolvedPath = this.remapStructuredGeneratedPreviewPath(path, design, recipe);
+    if (!resolvedPath) {
+      return [];
+    }
+
+    const queries = [];
+    const seen = new Set();
+    const appendQuery = (queryPath, queryIndex = index) => {
+      const normalizedPath = String(queryPath || '').trim();
+      if (!normalizedPath) {
+        return;
+      }
+      const normalizedIndex = Math.max(0, Math.round(Number(queryIndex) || 0));
+      const key = `${normalizedPath}::${normalizedIndex}`;
+      if (seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      queries.push({
+        path: normalizedPath,
+        index: normalizedIndex
+      });
+    };
+
+    appendQuery(resolvedPath, index);
+
+    const layerRoot = this.getStructuredGeneratedPreviewLayerRoot(design, recipe);
+    if (!layerRoot) {
+      return queries;
+    }
+
+    const aliasEntries = {
+      [`${layerRoot}/Group 427319939/Frame 1000004929/Frame 1000004927`]: { path: `${layerRoot}/Group 427319939/Frame 1000004929`, index: 0 },
+      [`${layerRoot}/Group 427319939/Frame 1000004929/Frame 1000004928`]: { path: `${layerRoot}/Group 427319939/Frame 1000004929`, index: 1 },
+      [`${layerRoot}/Group 427319939/Frame 1000004929/Frame 1000004929`]: { path: `${layerRoot}/Group 427319939/Frame 1000004929`, index: 2 },
+      [`${layerRoot}/Group 427319939/Frame 1000004931/Frame 1000004928`]: { path: `${layerRoot}/Group 427319939/Frame 1000004931`, index: 1 }
+    };
+    const aliasEntry = aliasEntries[resolvedPath];
+    if (aliasEntry) {
+      appendQuery(aliasEntry.path, aliasEntry.index);
+    }
+
+    return queries;
+  }
+
+  isSupportedStructuredGeneratedPreviewDesign(design = this.getGeneratedPreviewSourceDesign()) {
+    return Boolean(this.getStructuredGeneratedPreviewRecipe(design));
+  }
+
+  buildStructuredGeneratedPreviewHtml(design = this.getGeneratedPreviewSourceDesign(), layerContext = this.getGeneratedPreviewLayerContext(design)) {
+    const resolvedDesign = this.resolveDesignEntity(design);
+    const recipe = this.getStructuredGeneratedPreviewRecipe(resolvedDesign);
+    if (!recipe || !layerContext?.layers?.length) {
+      return '';
+    }
+
+    const builders = Array.isArray(recipe.builders) ? recipe.builders : [];
+    for (const builderEntry of builders) {
+      const methodName = typeof builderEntry === 'string'
+        ? builderEntry
+        : String(builderEntry?.method || '').trim();
+      if (!methodName || typeof this[methodName] !== 'function') {
+        continue;
+      }
+      const html = this[methodName](resolvedDesign, layerContext, recipe);
+      if (html) {
+        return html;
+      }
+    }
+
+    return '';
+  }
+
+  buildDraftRecipeStructuredGeneratedPreviewHtml(design = this.getGeneratedPreviewSourceDesign(), layerContext = this.getGeneratedPreviewLayerContext(design), recipe = this.getStructuredGeneratedPreviewRecipe(design)) {
+    if (!layerContext?.layers?.length) {
+      return '';
+    }
+
+    const resolvedDesign = this.resolveDesignEntity(design);
+    const options = recipe?.options && typeof recipe.options === 'object' ? recipe.options : {};
+    const canvasSize = options.canvasSize && typeof options.canvasSize === 'object' ? options.canvasSize : {};
+    const sourceBuilders = Array.isArray(options.sourceBuilders) ? options.sourceBuilders : [];
+    const shouldForceCanvasSize = Boolean(
+      options.fixedCanvasPreset ||
+      (options.fixedCanvas && typeof options.fixedCanvas === 'object' && Object.keys(options.fixedCanvas).length > 0) ||
+      sourceBuilders.some((entry) => {
+        const methodName = typeof entry === 'string'
+          ? entry
+          : String(entry?.method || '').trim();
+        return /fixedcanvas|520lamp/i.test(methodName);
+      })
+    );
+    return this.buildStaticHtmlFromLayers(resolvedDesign, {
+      layers: layerContext.layers,
+      canvasInfo: layerContext.canvasInfo,
+      slices: layerContext.slices,
+      preferredWidth: shouldForceCanvasSize ? (Number(canvasSize.width) || 0) : 0,
+      preferredHeight: shouldForceCanvasSize ? (Number(canvasSize.height) || 0) : 0,
+      enableInspector: false,
+      recipe
+    });
+  }
+
+  getStructuredGeneratedPreviewFixedCanvasConfig(design = this.getGeneratedPreviewSourceDesign(), recipe = this.getStructuredGeneratedPreviewRecipe(design)) {
+    const options = recipe?.options && typeof recipe.options === 'object' ? recipe.options : {};
+    const fixedCanvas = options?.fixedCanvas && typeof options.fixedCanvas === 'object'
+      ? options.fixedCanvas
+      : {};
+    const presetName = String(fixedCanvas.preset || options.fixedCanvasPreset || '').trim();
+
+    if (presetName === 'lanhu-520-lamp') {
+      return this.create520LampFixedCanvasConfig(design, recipe, fixedCanvas);
+    }
+
+    if (Object.keys(fixedCanvas).length > 0) {
+      return fixedCanvas;
+    }
+
+    return null;
+  }
+
+  create520LampFixedCanvasConfig(design, recipe = this.getStructuredGeneratedPreviewRecipe(design), fixedCanvas = {}) {
+    const defaultCoverCrops = Array.isArray(recipe?.options?.coverCrops) ? recipe.options.coverCrops : [];
+    return {
+      canvasSize: {
+        width: 750,
+        height: 5240
+      },
+      bodyBackground: '#f5ebff',
+      pageBackground: 'linear-gradient(180deg, #ffffff 0 176px, #f4e9ff 176px 100%)',
+      baseTextColor: '#6e55c8',
+      fontFamily: '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif',
+      extraCss: `
+    .nav-title {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+    }
+    .cp-name {
+      text-shadow: 0 2px 6px rgba(134, 88, 208, 0.32);
+    }
+    .tab-text,
+    .finish-text,
+    .dice-count {
+      text-shadow: 0 2px 6px rgba(112, 74, 198, 0.28);
+    }
+    .rule-copy,
+    .rule-table-cell,
+    .rule-table-head {
+      letter-spacing: 0;
+    }
+    .rule-table-cell-right {
+      text-align: left;
+    }
+    .reward-copy,
+    .reward-tail {
+      line-height: 45px;
+    }
+    .avatar-fill {
+      position: absolute;
+      border-radius: 50%;
+      background:
+        radial-gradient(circle at 40% 28%, rgba(255,255,255,0.98), rgba(255, 218, 236, 0.9) 28%, rgba(217, 177, 255, 0.94) 56%, rgba(148, 112, 255, 0.96) 100%);
+      box-shadow: inset 0 0 0 8px rgba(255,255,255,0.62);
+    }
+    .avatar-crop {
+      border-radius: 50%;
+    }`,
+      assetSpecs: [
+        { path: '520灯牌【5】/导航栏/白色-返回键', z: 20, className: 'nav-back', alt: '返回' },
+        { path: '520灯牌【5】/头图', z: 2, className: 'hero-art', alt: '主视觉' },
+        { path: '520灯牌【5】/我要告白', z: 12, className: 'entry entry-confess', alt: '我要告白' },
+        { path: '520灯牌【5】/告白信箱', z: 12, className: 'entry entry-mailbox', alt: '告白信箱' },
+        { path: '520灯牌【5】/Group 427319821', z: 12, className: 'entry entry-rule', alt: '奖励规则' },
+        { path: '520灯牌【5】/登顶CP/登顶CP背景', z: 4, className: 'cp-background', alt: '登顶CP背景' },
+        { path: '520灯牌【5】/登顶CP/信息/头像/头像框', x: 169, y: 634, width: 172, height: 172, z: 10, className: 'cp-frame cp-frame-left', alt: '左头像框', index: 0 },
+        { path: '520灯牌【5】/登顶CP/信息/头像/头像框', x: 411, y: 634, width: 172, height: 172, z: 10, className: 'cp-frame cp-frame-right', alt: '右头像框', index: 1 },
+        { path: '520灯牌【5】/登顶CP/信息/Group 427319820', z: 11, className: 'cp-badge', alt: '登顶CP' },
+        { path: '520灯牌【5】/登顶CP/信息/Group 427319823/Rectangle 34624666', x: 150, y: 802, width: 206, height: 42, z: 9, className: 'cp-name-pill cp-name-pill-left', alt: '左名牌' },
+        { path: '520灯牌【5】/登顶CP/信息/Group 427319822/Rectangle 34624666', x: 394, y: 802, width: 206, height: 42, z: 9, className: 'cp-name-pill cp-name-pill-right', alt: '右名牌' },
+        { path: '520灯牌【5】/标题分割', z: 6, className: 'title-block', alt: '标题区域' },
+        { path: '520灯牌【5】/Group 427319936/Frame 1000004919/Frame 1000004917', z: 9, className: 'milestone milestone-1', alt: '里程碑1' },
+        { path: '520灯牌【5】/Group 427319936/Frame 1000004919/Frame 1000004918', z: 9, className: 'milestone milestone-2', alt: '里程碑2' },
+        { path: '520灯牌【5】/Group 427319936/Frame 1000004919/Frame 1000004919', z: 9, className: 'milestone milestone-3', alt: '里程碑3' },
+        { path: '520灯牌【5】/Group 427319936/1314金币礼物', z: 10, className: 'ultimate-reward', alt: '1314金币礼物' },
+        { path: '520灯牌【5】/Group 427319936/解锁', z: 11, className: 'ultimate-lock', alt: '终级奖励' },
+        { path: '520灯牌【5】/5字背景', z: 2, className: 'board-background', alt: '棋盘背景' },
+        { path: '520灯牌【5】/Group 427319971', z: 10, className: 'board-tab board-tab-left', alt: '我的记录' },
+        { path: '520灯牌【5】/Group 427319979', z: 10, className: 'board-tab board-tab-right', alt: '切换密友' },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004922', z: 8, className: 'board-tile tile-1' },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004923', z: 8, className: 'board-tile tile-2' },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004924', z: 8, className: 'board-tile tile-3' },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004925', z: 8, className: 'board-tile tile-4', index: 0 },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004926', z: 8, className: 'board-tile tile-5', index: 0 },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004921', z: 8, className: 'board-tile tile-6', index: 0 },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004929/Frame 1000004927', z: 8, className: 'board-tile tile-7' },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004931', z: 8, className: 'board-tile tile-8', index: 0 },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004929/Frame 1000004928', z: 8, className: 'board-tile tile-9' },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004931/Frame 1000004928', z: 8, className: 'board-tile tile-10' },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004928', z: 8, className: 'board-tile tile-11', index: 0 },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004930', z: 8, className: 'board-tile tile-12', index: 0 },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004929/Frame 1000004929', z: 8, className: 'board-tile tile-13' },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004928', z: 8, className: 'board-tile tile-14', index: 1 },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004930', z: 8, className: 'board-tile tile-15', index: 1 },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004926', z: 8, className: 'board-tile tile-16', index: 1 },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004925', z: 8, className: 'board-tile tile-17', index: 1 },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004929', z: 8, className: 'board-tile tile-18', index: 0 },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004928', z: 8, className: 'board-tile tile-19', index: 2 },
+        { path: '520灯牌【5】/Group 427319939/Frame 1000004927', z: 8, className: 'board-tile tile-20', index: 1 },
+        { path: '520灯牌【5】/Frame 1000004945', z: 9, className: 'board-finish', alt: '终点' },
+        { path: '520灯牌【5】/位图', z: 6, className: 'board-decor board-decor-primary', index: 0 },
+        { path: '520灯牌【5】/位图', z: 6, className: 'board-decor board-decor-secondary', index: 1 },
+        { path: '520灯牌【5】/编组 31/数字背景', z: 9, className: 'dice-count-bg', alt: '骰子次数' },
+        { path: '520灯牌【5】/Group 427319950', z: 8, className: 'dice-button dice-button-left', alt: '掷骰子按钮左' },
+        { path: '520灯牌【5】/Group 427319951', z: 8, className: 'dice-button dice-button-right', alt: '掷骰子按钮右' },
+        { path: '520灯牌【5】/规则说明', z: 2, className: 'rules-background', alt: '规则说明背景' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004952/Group 427319964', z: 6, className: 'rules-flow', alt: '操作指引' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/编组 44', z: 6, className: 'rules-table', alt: '停留格子说明' }
+      ],
+      visibleTextSpecs: [
+        { path: '520灯牌【5】/导航栏/心动告白', color: '#1f1637', fontWeight: '600', className: 'nav-title' },
+        { path: '520灯牌【5】/登顶CP/信息/Group 427319823/最爱旺仔奶茶', color: '#ffffff', fontWeight: '500', className: 'cp-name cp-name-left' },
+        { path: '520灯牌【5】/登顶CP/信息/Group 427319822/最爱旺仔奶茶', color: '#ffffff', fontWeight: '500', className: 'cp-name cp-name-right' },
+        { path: '520灯牌【5】/Group 427319971/我的记录', color: '#ffffff', fontWeight: '500', className: 'tab-text' },
+        { path: '520灯牌【5】/Group 427319979/切换密友', color: '#ffffff', fontWeight: '500', className: 'tab-text' },
+        { path: '520灯牌【5】/Frame 1000004945/Group 427319944/终点', color: '#ffffff', fontWeight: '500', className: 'finish-text' },
+        { path: '520灯牌【5】/编组 31/10', color: '#ffffff', fontWeight: '700', className: 'dice-count' },
+        { path: '520灯牌【5】/Frame 1000004953/1.活动时间：2024/8/6 12:0', text: '1.活动时间：05/15 10:00-05/21 24:00', color: '#6e55c8', className: 'rule-copy' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004952/2.操作指引：', text: '2.操作指引：', color: '#6e55c8', className: 'rule-copy' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/3.详细说明：', text: '3.活动说明：', color: '#6e55c8', className: 'rule-copy' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Frame 1000004954/① 每收到/送出一个指定礼物“七夕快乐”', text: '① 每收到/送出一个指定礼物“告白气球”，双方掷色子次数各加一', color: '#6e55c8', className: 'rule-copy' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Frame 1000004954/② 掷色子点数为1-6，掷出点数为前进步', text: '② 掷色子点数为1-6，掷出点数为前进步数', color: '#6e55c8', className: 'rule-copy' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Frame 1000004954/③ 每次停留的格子都有对应的奖励和任务', text: '③ 每次停留的格子都有对应的奖励和任务', color: '#6e55c8', className: 'rule-copy' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/停留格子', color: '#6e55c8', fontWeight: '500', className: 'rule-table-head' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/说明', color: '#6e55c8', fontWeight: '500', className: 'rule-table-head' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/发消息', color: '#6e55c8', className: 'rule-table-cell' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/完成发消息任务，才可前进', text: '完成发消息任务，才可前进', color: '#6e55c8', className: 'rule-table-cell rule-table-cell-right' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/铭牌', color: '#6e55c8', className: 'rule-table-cell' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/获得 铭牌*1', text: '获得 铭牌*1', color: '#6e55c8', className: 'rule-table-cell rule-table-cell-right' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/进2格', color: '#6e55c8', className: 'rule-table-cell' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/在当前格子前进2步', text: '在当前格子前进2步', color: '#6e55c8', className: 'rule-table-cell rule-table-cell-right' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/返回起点', color: '#6e55c8', className: 'rule-table-cell' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/返回起点，重重开始游戏', text: '返回本地图起点，重重开始游戏', color: '#6e55c8', className: 'rule-table-cell rule-table-cell-right' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/空白格', color: '#6e55c8', className: 'rule-table-cell' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/无', color: '#6e55c8', className: 'rule-table-cell rule-table-cell-right' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/礼物', color: '#6e55c8', className: 'rule-table-cell' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/可在礼物背包中查看', text: '可在礼物背包中查看（有效期7天）', color: '#6e55c8', className: 'rule-table-cell rule-table-cell-right' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/头像框', color: '#6e55c8', className: 'rule-table-cell' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/获得头像框1*天', text: '获得头像框1*天', color: '#6e55c8', className: 'rule-table-cell rule-table-cell-right' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/退3格', color: '#6e55c8', className: 'rule-table-cell' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/在当前格子后退3步', text: '在当前格子后退3步', color: '#6e55c8', className: 'rule-table-cell rule-table-cell-right' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/钻石', text: '金币', color: '#6e55c8', className: 'rule-table-cell' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/获得随机钻石', text: '获得随机金币', color: '#6e55c8', className: 'rule-table-cell rule-table-cell-right' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004949/4.终极奖励', text: '4.终极奖励', color: '#6e55c8', className: 'rule-copy reward-title' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004949/Frame 1000004948/① 双方均到达终点，可依次点亮 鹊-桥-', text: '【5】字地图双方均达到终点，可点亮【5】字灯牌，50%的概率解锁【2】字灯牌地图，若解锁【2】字灯牌失败则【5】字灯牌熄灭需要重新点亮【5】字灯牌，解锁【2】字地图，获得520灯牌铭牌1天；', color: '#6e55c8', className: 'rule-copy reward-copy' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004949/Frame 1000004948/② 双方每点亮 鹊-桥-相-会 4个灯牌', text: '【2】字地图双方均达到终点，可点亮【2】字灯牌，50%的概率解锁【0】字灯牌地图，若解锁【0】字灯牌失败则【2】字灯牌熄灭需要重新点亮【2】字灯牌，解锁【0】字地图，获得520灯牌头像框1天；', color: '#6e55c8', className: 'rule-copy reward-copy' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004949/Frame 1000004948/③ 双方每点亮 鹊-桥-相-会 4个灯牌', text: '【0】字地图双方均达到终点，可点亮0字灯牌，获得最终大奖：520灯牌礼物*1（1314金币）（礼物进入用户背包，有效期7天）', color: '#6e55c8', className: 'rule-copy reward-copy' },
+        { path: '520灯牌【5】/Frame 1000004953/Frame 1000004949/Frame 1000004948/③ 双方每点亮 鹊-桥-相-会 4个灯牌', text: '520灯牌全部点亮后，可重置重新开始游戏。', y: 5053, height: 45, color: '#6e55c8', className: 'rule-copy reward-tail' }
+      ],
+      hiddenTextSpecs: [
+        { path: '520灯牌【5】/标题分割/标题/日期/5/15 - 5/21', hidden: true, text: '5/15 - 5/21', y: 850, className: 'copy-date' },
+        { path: '520灯牌【5】/标题分割/双方成功到达终点，可依次点亮：鹊-桥-相', hidden: true, text: '双方成功到达终点，可依次点亮5-2-0三个灯牌，并获得相应奖励', y: 1073, className: 'copy-summary' },
+        { path: '520灯牌【5】/标题分割/双方成功到达终点，可依次点亮：鹊-桥-相', hidden: true, text: '灯牌全部点亮后即可获得最终大奖「520灯牌礼物」', x: 94, y: 1115, width: 563, className: 'copy-summary' },
+        { path: '520灯牌【5】/5字背景/每收到/送出一个指定礼物“告白气球” 双方掷色子次数各加一', hidden: true, text: '每收到/送出一个指定礼物“告白气球”，双方掷色子次数各加一', className: 'copy-board-tip' }
+      ],
+      coverCropSpecs: Array.isArray(fixedCanvas.coverCrops) ? fixedCanvas.coverCrops : defaultCoverCrops,
+      avatarFillSpecs: [
+        { x: 196, y: 661, width: 118, height: 118, z: 7, className: 'avatar-fill avatar-fill-left' },
+        { x: 438, y: 661, width: 118, height: 118, z: 7, className: 'avatar-fill avatar-fill-right' }
+      ]
+    };
+  }
+
+  buildFixedCanvasGeneratedPreviewHtml(design, layerContext, recipe = this.getStructuredGeneratedPreviewRecipe(design), fixedCanvasConfig = this.getStructuredGeneratedPreviewFixedCanvasConfig(design, recipe)) {
+    const layers = Array.isArray(layerContext?.layers) ? layerContext.layers : [];
+    if (!layers.length || !fixedCanvasConfig || typeof fixedCanvasConfig !== 'object') {
+      return '';
+    }
+
+    const designCoverUrl = this.getProxiedImageUrl(design?.previewUrl || design?.preview_url || '');
+    const canvasSize = fixedCanvasConfig?.canvasSize && typeof fixedCanvasConfig.canvasSize === 'object'
+      ? fixedCanvasConfig.canvasSize
+      : {};
+    const coverWidth = Math.max(1, Math.round(Number(canvasSize.width) || 750));
+    const coverHeight = Math.max(1, Math.round(Number(canvasSize.height) || 5240));
+    const comparePosition = (left, right) => (
+      (Number(left?.y) || 0) - (Number(right?.y) || 0) ||
+      (Number(left?.x) || 0) - (Number(right?.x) || 0)
+    );
+    const findLayers = (path, type = '', index = 0) => {
+      const queries = this.getStructuredGeneratedPreviewLayerQueries(path, design, recipe, index);
+      for (const query of queries) {
+        const matchedLayers = layers
+          .filter((layer) => String(layer?.path || '') === query.path && (!type || String(layer?.type || '') === type))
+          .sort(comparePosition);
+        if (matchedLayers.length) {
+          return {
+            layers: matchedLayers,
+            query
+          };
+        }
+      }
+      return {
+        layers: [],
+        query: null
+      };
+    };
+    const findLayer = (path, type = '', index = 0) => {
+      const matchedResult = findLayers(path, type, index);
+      const queryIndex = Number(matchedResult.query?.index) || 0;
+      return matchedResult.layers[queryIndex] || matchedResult.layers[index] || matchedResult.layers[0] || null;
+    };
+    const createAsset = (path, {
+      x,
+      y,
+      width,
+      height,
+      z = 1,
+      alt = '',
+      className = '',
+      index = 0
+    } = {}) => {
+      const layer = findLayer(path, '', index);
+      if (!layer) return null;
+      const useCoverCrop = !layer.image && Boolean(designCoverUrl) && (Number(layer.width) || 0) > 0 && (Number(layer.height) || 0) > 0;
+      if (!layer.image && !useCoverCrop) return null;
+      return {
+        x: Math.round(Number(x) || Number(layer.x) || 0),
+        y: Math.round(Number(y) || Number(layer.y) || 0),
+        width: Math.round(Number(width) || Number(layer.width) || 0),
+        height: Math.round(Number(height) || Number(layer.height) || 0),
+        z,
+        className,
+        alt: alt || String(layer.name || '').trim() || 'asset',
+        url: useCoverCrop ? designCoverUrl : this.getProxiedImageUrl(layer.image),
+        isCoverCrop: useCoverCrop,
+        cropX: Math.round(Number(layer.x) || 0),
+        cropY: Math.round(Number(layer.y) || 0),
+        cropWidth: Math.round(Number(layer.width) || 0),
+        cropHeight: Math.round(Number(layer.height) || 0)
+      };
+    };
+    const createText = ({
+      path = '',
+      text = '',
+      x,
+      y,
+      width,
+      height,
+      z = 10,
+      className = '',
+      hidden = false,
+      color = '',
+      fontSize,
+      lineHeight,
+      letterSpacing,
+      fontWeight,
+      textAlign,
+      fontFamily
+    } = {}) => {
+      const layer = path ? findLayer(path, 'textLayer') : null;
+      const mergedStyles = layer ? this.getMergedLayerStylesForHtml(layer) : {};
+      const resolvedText = String(text || this.resolveLayerText(layer) || '').trim();
+      if (!resolvedText) return null;
+      return {
+        text: resolvedText,
+        x: Math.round(Number(x) || Number(layer?.x) || 0),
+        y: Math.round(Number(y) || Number(layer?.y) || 0),
+        width: Math.round(Number(width) || Number(layer?.width) || 0),
+        height: Math.round(Number(height) || Number(layer?.height) || 0),
+        z,
+        className,
+        hidden,
+        color: color || this.sanitizeColor(mergedStyles.color) || '',
+        fontSize: Number(fontSize) || Number(mergedStyles.fontSize) || 24,
+        lineHeight: Number(lineHeight) || Number(mergedStyles.lineHeight) || 36,
+        letterSpacing: Number.isFinite(Number(letterSpacing)) ? Number(letterSpacing) : Number(mergedStyles.letterSpacing) || 0,
+        fontWeight: fontWeight || this.sanitizeFontWeight(mergedStyles.fontWeight) || '500',
+        textAlign: textAlign || this.sanitizeTextAlign(mergedStyles.textAlign) || 'left',
+        fontFamily: fontFamily || this.sanitizeFontFamily(mergedStyles.fontFamily) || ''
+      };
+    };
+    const renderCoverCrop = ({
+      cropX = 0,
+      cropY = 0,
+      cropWidth = 0,
+      cropHeight = 0,
+      x = 0,
+      y = 0,
+      width = 0,
+      height = 0,
+      z = 1,
+      className = '',
+      alt = ''
+    } = {}) => {
+      if (!designCoverUrl || cropWidth <= 0 || cropHeight <= 0 || width <= 0 || height <= 0) return '';
+      const scaleX = width / cropWidth;
+      const scaleY = height / cropHeight;
+      const frameStyle = [
+        `left:${x}px`,
+        `top:${y}px`,
+        `width:${width}px`,
+        `height:${height}px`,
+        `z-index:${z}`
+      ].join(';');
+      const imageStyle = [
+        `left:${Math.round(-cropX * scaleX)}px`,
+        `top:${Math.round(-cropY * scaleY)}px`,
+        `width:${Math.round(coverWidth * scaleX)}px`,
+        `height:${Math.round(coverHeight * scaleY)}px`
+      ].join(';');
+      return `<div class="pp-cover-crop ${this.escapeAttr(className || '')}" style="${frameStyle}"><img class="pp-cover-crop-image" style="${imageStyle}" src="${this.escapeAttr(designCoverUrl)}" alt="${this.escapeAttr(alt || 'cover crop')}" loading="eager" /></div>`;
+    };
+    const renderAsset = (asset) => {
+      if (!asset?.url || asset.width <= 0 || asset.height <= 0) return '';
+      if (asset.isCoverCrop) {
+        return renderCoverCrop({
+          cropX: asset.cropX,
+          cropY: asset.cropY,
+          cropWidth: asset.cropWidth,
+          cropHeight: asset.cropHeight,
+          x: asset.x,
+          y: asset.y,
+          width: asset.width,
+          height: asset.height,
+          z: asset.z,
+          className: asset.className,
+          alt: asset.alt
+        });
+      }
+      const style = [
+        `left:${asset.x}px`,
+        `top:${asset.y}px`,
+        `width:${asset.width}px`,
+        `height:${asset.height}px`,
+        `z-index:${asset.z}`
+      ].join(';');
+      return `<img class="pp-asset ${this.escapeAttr(asset.className || '')}" style="${style}" src="${this.escapeAttr(asset.url)}" alt="${this.escapeAttr(asset.alt)}" loading="eager" />`;
+    };
+    const renderText = (spec) => {
+      if (!spec?.text) return '';
+      const styles = [
+        `left:${spec.x}px`,
+        `top:${spec.y}px`,
+        spec.width > 0 ? `width:${spec.width}px` : '',
+        spec.height > 0 ? `min-height:${spec.height}px` : '',
+        `z-index:${spec.z}`,
+        `font-size:${Math.max(1, Math.round(spec.fontSize))}px`,
+        `line-height:${Math.max(1, Math.round(spec.lineHeight || spec.fontSize * 1.4))}px`,
+        `letter-spacing:${spec.letterSpacing}px`,
+        `font-weight:${spec.fontWeight}`,
+        `text-align:${spec.textAlign}`,
+        spec.fontFamily ? `font-family:${spec.fontFamily}` : '',
+        spec.hidden
+          ? 'color:transparent;-webkit-text-fill-color:transparent;text-shadow:none'
+          : `color:${spec.color || fixedCanvasConfig.baseTextColor || '#6e53bf'}`
+      ].filter(Boolean).join(';');
+      return `<div class="pp-text ${this.escapeAttr(spec.className || '')}${spec.hidden ? ' pp-copy-text' : ''}" style="${styles}">${this.escapeHtml(spec.text).replace(/\n/g, '<br />')}</div>`;
+    };
+    const renderAvatarFill = (item) => `<div class="${this.escapeAttr(item.className)}" style="left:${item.x}px;top:${item.y}px;width:${item.width}px;height:${item.height}px;z-index:${item.z};"></div>`;
+
+    const assets = (Array.isArray(fixedCanvasConfig.assetSpecs) ? fixedCanvasConfig.assetSpecs : [])
+      .map((spec) => spec && typeof spec === 'object' ? createAsset(spec.path, spec) : null)
+      .filter(Boolean);
+    const visibleTexts = (Array.isArray(fixedCanvasConfig.visibleTextSpecs) ? fixedCanvasConfig.visibleTextSpecs : [])
+      .map((spec) => spec && typeof spec === 'object' ? createText(spec) : null)
+      .filter(Boolean);
+    const hiddenCopyTexts = (Array.isArray(fixedCanvasConfig.hiddenTextSpecs) ? fixedCanvasConfig.hiddenTextSpecs : [])
+      .map((spec) => spec && typeof spec === 'object' ? createText({ ...spec, hidden: spec.hidden !== false }) : null)
+      .filter(Boolean);
+    const coverCropSpecs = Array.isArray(fixedCanvasConfig.coverCropSpecs) ? fixedCanvasConfig.coverCropSpecs : [];
+    const coverCrops = coverCropSpecs
+      .map((item) => item && typeof item === 'object' ? item : null)
+      .filter(Boolean)
+      .filter((item) => designCoverUrl || !String(item.className || '').includes('avatar-crop'));
+    const avatarFillSpecs = Array.isArray(fixedCanvasConfig.avatarFillSpecs) ? fixedCanvasConfig.avatarFillSpecs : [];
+    const avatarFills = designCoverUrl ? [] : avatarFillSpecs;
+    const designName = this.escapeHtml(design?.name || '当前设计图');
+    const pageWidth = Math.max(1, Math.round(Number(canvasSize.width) || 750));
+    const pageHeight = Math.max(1, Math.round(Number(canvasSize.height) || 1334));
+    const bodyBackground = String(fixedCanvasConfig.bodyBackground || '#f5ebff');
+    const pageBackground = String(fixedCanvasConfig.pageBackground || '#ffffff');
+    const baseTextColor = String(fixedCanvasConfig.baseTextColor || '#6e55c8');
+    const fontFamily = String(fixedCanvasConfig.fontFamily || '"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif');
+    const extraCss = String(fixedCanvasConfig.extraCss || '').trim();
+
+    return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=${pageWidth}, initial-scale=1.0" />
+  <title>${designName}</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: ${bodyBackground}; }
+    body {
+      min-width: ${pageWidth}px;
+      display: flex;
+      justify-content: center;
+      color: ${baseTextColor};
+      font-family: ${fontFamily};
+    }
+    .pp-page {
+      position: relative;
+      width: ${pageWidth}px;
+      height: ${pageHeight}px;
+      overflow: hidden;
+      background: ${pageBackground};
+    }
+    .pp-topbar {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: ${pageWidth}px;
+      height: 176px;
+      z-index: 1;
+      background: #ffffff;
+    }
+    .pp-statusbar {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: ${pageWidth}px;
+      height: 88px;
+      z-index: 30;
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      padding: 0 36px 14px 48px;
+      color: #111111;
+      font-size: 28px;
+      line-height: 1;
+      font-weight: 600;
+      letter-spacing: 0.2px;
+    }
+    .pp-status-icons {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .pp-status-signal,
+    .pp-status-wifi {
+      position: relative;
+      display: inline-block;
+      width: 26px;
+      height: 18px;
+    }
+    .pp-status-signal::before,
+    .pp-status-wifi::before,
+    .pp-status-battery,
+    .pp-status-battery::after,
+    .pp-status-battery-level {
+      content: "";
+      display: block;
+    }
+    .pp-status-signal::before {
+      position: absolute;
+      inset: 0;
+      background:
+        linear-gradient(90deg, transparent 0 2px, #111 2px 6px, transparent 6px 8px, #111 8px 12px, transparent 12px 14px, #111 14px 18px, transparent 18px 20px, #111 20px 24px);
+      clip-path: polygon(0 100%, 0 68%, 25% 68%, 25% 46%, 50% 46%, 50% 26%, 75% 26%, 75% 0, 100% 0, 100% 100%);
+      border-radius: 2px;
+    }
+    .pp-status-wifi::before {
+      position: absolute;
+      left: 1px;
+      top: 1px;
+      width: 24px;
+      height: 16px;
+      border: 3px solid #111;
+      border-color: #111 transparent transparent transparent;
+      border-radius: 50% 50% 0 0 / 100% 100% 0 0;
+      transform: scaleY(1.1);
+    }
+    .pp-status-battery {
+      position: relative;
+      width: 40px;
+      height: 20px;
+      border: 2px solid #111;
+      border-radius: 5px;
+    }
+    .pp-status-battery::after {
+      position: absolute;
+      right: -5px;
+      top: 5px;
+      width: 3px;
+      height: 8px;
+      border-radius: 2px;
+      background: #111;
+    }
+    .pp-status-battery-level {
+      position: absolute;
+      left: 2px;
+      top: 2px;
+      width: 28px;
+      height: 12px;
+      border-radius: 3px;
+      background: #111;
+    }
+    .pp-asset {
+      position: absolute;
+      display: block;
+      object-fit: fill;
+      user-select: none;
+      -webkit-user-drag: none;
+    }
+    .pp-text {
+      position: absolute;
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .pp-copy-text {
+      user-select: text;
+    }
+    .pp-cover-crop {
+      position: absolute;
+      overflow: hidden;
+      pointer-events: none;
+    }
+    .pp-cover-crop-image {
+      position: absolute;
+      display: block;
+      max-width: none;
+      user-select: none;
+      -webkit-user-drag: none;
+    }
+${extraCss}
+  </style>
+</head>
+<body>
+  <main class="pp-page">
+    <div class="pp-topbar"></div>
+    <div class="pp-statusbar" aria-hidden="true">
+      <span>9:41</span>
+      <div class="pp-status-icons">
+        <span class="pp-status-signal"></span>
+        <span class="pp-status-wifi"></span>
+        <span class="pp-status-battery"><span class="pp-status-battery-level"></span></span>
+      </div>
+    </div>
+    ${assets.map((asset) => renderAsset(asset)).join('\n    ')}
+    ${coverCrops.map((item) => renderCoverCrop(item)).join('\n    ')}
+    ${avatarFills.map((item) => renderAvatarFill(item)).join('\n    ')}
+    ${visibleTexts.map((item) => renderText(item)).join('\n    ')}
+    ${hiddenCopyTexts.map((item) => renderText(item)).join('\n    ')}
+  </main>
+</body>
+</html>`;
+  }
+
+  build520LampStructuredGeneratedPreviewHtml(design, layerContext, recipe = this.getStructuredGeneratedPreviewRecipe(design)) {
+    const layers = Array.isArray(layerContext?.layers) ? layerContext.layers : [];
+    if (!layers.length) {
+      return '';
+    }
+
+    const toAsset = (layer) => {
+      if (!layer?.image) return null;
+      return {
+        url: this.getProxiedImageUrl(layer.image),
+        width: Math.max(1, Math.round(Number(layer.width) || 0)),
+        height: Math.max(1, Math.round(Number(layer.height) || 0))
+      };
+    };
+    const comparePosition = (left, right) => (
+      (Number(left?.y) || 0) - (Number(right?.y) || 0) ||
+      (Number(left?.x) || 0) - (Number(right?.x) || 0)
+    );
+    const getMatchedLayers = (path, type = '', index = 0) => {
+      const queries = this.getStructuredGeneratedPreviewLayerQueries(path, design, recipe, index);
+      for (const query of queries) {
+        const matchedLayers = layers
+          .filter((layer) => String(layer.path || '') === query.path && (!type || String(layer.type || '') === type))
+          .sort(comparePosition);
+        if (matchedLayers.length) {
+          return {
+            layers: matchedLayers,
+            query
+          };
+        }
+      }
+      return {
+        layers: [],
+        query: null
+      };
+    };
+    const findImageAsset = (path) => {
+      const matchedLayers = getMatchedLayers(path).layers;
+      return toAsset(matchedLayers.find((layer) => layer?.has_image));
+    };
+    const findImageAssets = (path) => getMatchedLayers(path).layers
+      .filter((layer) => layer?.has_image)
+      .map((layer) => toAsset(layer))
+      .filter(Boolean);
+    const findNthImageAsset = (path, index = 0) => {
+      const matchedResult = getMatchedLayers(path, '', index);
+      const matchedAssets = matchedResult.layers
+        .filter((layer) => layer?.has_image)
+        .map((layer) => toAsset(layer))
+        .filter(Boolean);
+      const queryIndex = Number(matchedResult.query?.index) || 0;
+      return matchedAssets[queryIndex] || matchedAssets[index] || matchedAssets[0] || null;
+    };
+    const findTextValue = (path) => {
+      const matchedResult = getMatchedLayers(path, 'textLayer');
+      const matched = matchedResult.layers[Number(matchedResult.query?.index) || 0] || matchedResult.layers[0] || null;
+      return String(this.resolveLayerText(matched) || matched?.name || '').trim();
+    };
+    const renderImage = (asset, className, alt, attrs = '') => {
+      if (!asset?.url) return '';
+      const aspectRatio = asset.width > 0 && asset.height > 0 ? ` style="aspect-ratio:${asset.width} / ${asset.height};"` : '';
+      return `<img class="${className}" src="${this.escapeAttr(asset.url)}" alt="${this.escapeAttr(alt || '')}" loading="lazy"${aspectRatio}${attrs} />`;
+    };
+    const designName = this.escapeHtml(design?.name || '520灯牌');
+
+    const assets = {
+      backIcon: findImageAsset('520灯牌【5】/导航栏/白色-返回键'),
+      hero: findImageAsset('520灯牌【5】/头图'),
+      confessEntry: findImageAsset('520灯牌【5】/我要告白'),
+      mailboxEntry: findImageAsset('520灯牌【5】/告白信箱'),
+      ruleEntry: findImageAsset('520灯牌【5】/Group 427319821'),
+      cpBackground: findImageAsset('520灯牌【5】/登顶CP/登顶CP背景'),
+      cpBadge: findImageAsset('520灯牌【5】/登顶CP/信息/Group 427319820'),
+      avatarFrames: findImageAssets('520灯牌【5】/登顶CP/信息/头像/头像框'),
+      namePills: [
+        findImageAsset('520灯牌【5】/登顶CP/信息/Group 427319823/Rectangle 34624666'),
+        findImageAsset('520灯牌【5】/登顶CP/信息/Group 427319822/Rectangle 34624666')
+      ],
+      milestones: [
+        findImageAsset('520灯牌【5】/Group 427319936/Frame 1000004919/Frame 1000004917'),
+        findImageAsset('520灯牌【5】/Group 427319936/Frame 1000004919/Frame 1000004918'),
+        findImageAsset('520灯牌【5】/Group 427319936/Frame 1000004919/Frame 1000004919')
+      ],
+      reward: findImageAsset('520灯牌【5】/Group 427319936/1314金币礼物'),
+      rewardLock: findImageAsset('520灯牌【5】/Group 427319936/解锁'),
+      boardTabs: [
+        findImageAsset('520灯牌【5】/Group 427319971'),
+        findImageAsset('520灯牌【5】/Group 427319979')
+      ],
+      finishTile: findImageAsset('520灯牌【5】/Frame 1000004945'),
+      boardDecor: layers
+        .filter((layer) => layer?.has_image && String(layer.path || '') === this.remapStructuredGeneratedPreviewPath('520灯牌【5】/位图', design, recipe))
+        .sort(comparePosition)
+        .map((layer) => toAsset(layer))
+        .filter(Boolean),
+      rulesBackground: findImageAsset('520灯牌【5】/规则说明')
+    };
+
+    const boardTiles = [
+      { asset: findNthImageAsset('520灯牌【5】/Group 427319939/Frame 1000004922', 0), label: '礼物', row: 1, col: 1 },
+      { asset: findNthImageAsset('520灯牌【5】/Group 427319939/Frame 1000004923', 0), label: '礼物', row: 1, col: 2 },
+      { asset: findNthImageAsset('520灯牌【5】/Group 427319939/Frame 1000004924', 0), label: '礼物', row: 1, col: 3 },
+      { asset: findNthImageAsset('520灯牌【5】/Group 427319939/Frame 1000004925', 0), label: '礼物', row: 1, col: 4 },
+      { asset: findNthImageAsset('520灯牌【5】/Group 427319939/Frame 1000004926', 0), label: '礼物', row: 1, col: 5 },
+      { asset: findNthImageAsset('520灯牌【5】/Group 427319939/Frame 1000004921', 0), label: '起点', row: 1, col: 6 },
+      { asset: findImageAsset('520灯牌【5】/Group 427319939/Frame 1000004929/Frame 1000004927'), label: '礼物', row: 2, col: 1 },
+      { asset: findNthImageAsset('520灯牌【5】/Group 427319939/Frame 1000004931', 0), label: '礼物', row: 2, col: 6 },
+      { asset: findImageAsset('520灯牌【5】/Group 427319939/Frame 1000004929/Frame 1000004928'), label: '礼物', row: 3, col: 1 },
+      { asset: findImageAsset('520灯牌【5】/Group 427319939/Frame 1000004931/Frame 1000004928'), label: '礼物', row: 3, col: 2 },
+      { asset: findNthImageAsset('520灯牌【5】/Group 427319939/Frame 1000004928', 0), label: '礼物', row: 3, col: 5 },
+      { asset: findNthImageAsset('520灯牌【5】/Group 427319939/Frame 1000004930', 0), label: '礼物', row: 3, col: 6 },
+      { asset: findImageAsset('520灯牌【5】/Group 427319939/Frame 1000004929/Frame 1000004929'), label: '礼物', row: 4, col: 1 },
+      { asset: findNthImageAsset('520灯牌【5】/Group 427319939/Frame 1000004928', 1), label: '礼物', row: 4, col: 6 },
+      { asset: findNthImageAsset('520灯牌【5】/Group 427319939/Frame 1000004930', 1), label: '起点', row: 5, col: 1 },
+      { asset: findNthImageAsset('520灯牌【5】/Group 427319939/Frame 1000004926', 1), label: '礼物', row: 5, col: 2 },
+      { asset: findNthImageAsset('520灯牌【5】/Group 427319939/Frame 1000004925', 1), label: '礼物', row: 5, col: 3 },
+      { asset: findNthImageAsset('520灯牌【5】/Group 427319939/Frame 1000004929', 0), label: '礼物', row: 5, col: 4 },
+      { asset: findNthImageAsset('520灯牌【5】/Group 427319939/Frame 1000004928', 2), label: '礼物', row: 5, col: 5 },
+      { asset: findNthImageAsset('520灯牌【5】/Group 427319939/Frame 1000004927', 1), label: '礼物', row: 5, col: 6 }
+    ].filter((item) => item.asset?.url);
+
+    const leftName = this.escapeHtml(findTextValue('520灯牌【5】/登顶CP/信息/Group 427319823/最爱旺仔奶茶') || '最爱旺仔奶茶');
+    const rightName = this.escapeHtml(findTextValue('520灯牌【5】/登顶CP/信息/Group 427319822/最爱旺仔奶茶') || '最爱旺仔奶茶');
+    const navTitle = this.escapeHtml(findTextValue('520灯牌【5】/导航栏/心动告白') || '心动告白');
+    const activityDate = this.escapeHtml(findTextValue('520灯牌【5】/标题分割/标题/日期/5/15 - 5/21') || '5/15 - 5/21');
+    const boardTip = this.escapeHtml(findTextValue('520灯牌【5】/5字背景/每收到/送出一个指定礼物“告白气球” 双方掷色子次数各加一') || '每收到/送出一个指定礼物“告白气球”，双方掷色子次数各加一');
+    const recordLabel = this.escapeHtml(findTextValue('520灯牌【5】/Group 427319971/我的记录') || '我的记录');
+    const switchLabel = this.escapeHtml(findTextValue('520灯牌【5】/Group 427319979/切换密友') || '切换密友');
+    const summaryLead = '双方成功到达终点，可依次点亮 5-2-0 三个灯牌，并获得相应奖励。';
+    const summaryFollow = '灯牌全部点亮后即可获得最终大奖「520灯牌礼物」。';
+
+    const milestoneHtml = assets.milestones.map((asset, index) => {
+      const fallbackLabel = index === 0 ? '点亮 5' : '待解锁';
+      return `
+        <div class="milestone-card">
+          ${renderImage(asset, 'milestone-art', fallbackLabel)}
+          <span class="milestone-label">${fallbackLabel}</span>
+        </div>
+      `;
+    }).join('');
+
+    const boardTileHtml = boardTiles.map((tile) => `
+      <div class="board-tile" style="grid-column:${tile.col};grid-row:${tile.row};">
+        ${renderImage(tile.asset, 'board-tile-image', tile.label)}
+      </div>
+    `).join('');
+
+    const boardDecorPrimary = assets.boardDecor[0] ? `
+      <div class="board-decor board-decor--primary">
+        ${renderImage(assets.boardDecor[0], 'board-decor-image', '')}
+      </div>
+    ` : '';
+    const boardDecorSecondary = assets.boardDecor[1] ? `
+      <div class="board-decor board-decor--secondary">
+        ${renderImage(assets.boardDecor[1], 'board-decor-image', '')}
+      </div>
+    ` : '';
+
+    return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>${designName}</title>
+  <style>
+    :root {
+      --page-bg: linear-gradient(180deg, #f8eeff 0%, #efe0ff 36%, #f7f2ff 100%);
+      --card-bg: rgba(255, 255, 255, 0.82);
+      --card-border: rgba(255, 255, 255, 0.7);
+      --text-main: #4b2b84;
+      --text-soft: #8159ba;
+      --accent-pink: #ff7ac7;
+      --accent-violet: #7a63ff;
+      --accent-gold: #ffce7d;
+      --shadow-soft: 0 18px 36px rgba(124, 84, 198, 0.16);
+      --shadow-strong: 0 24px 48px rgba(116, 87, 192, 0.22);
+    }
+    * {
+      box-sizing: border-box;
+    }
+    html, body {
+      margin: 0;
+      min-height: 100%;
+    }
+    body {
+      background: var(--page-bg);
+      color: var(--text-main);
+      font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      display: flex;
+      justify-content: center;
+      padding: 18px 14px 36px;
+    }
+    img {
+      display: block;
+      max-width: 100%;
+    }
+    .activity-phone {
+      position: relative;
+      width: min(100%, 375px);
+      border-radius: 34px;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 50% 0%, rgba(180, 168, 255, 0.72), transparent 34%),
+        linear-gradient(180deg, rgba(255, 255, 255, 0.96) 0%, rgba(243, 232, 255, 0.96) 100%);
+      box-shadow: 0 24px 60px rgba(104, 78, 171, 0.22);
+      border: 1px solid rgba(255, 255, 255, 0.7);
+    }
+    .activity-main {
+      position: relative;
+      padding: calc(env(safe-area-inset-top) + 10px) 12px calc(env(safe-area-inset-bottom) + 30px);
+    }
+    .nav-bar {
+      display: grid;
+      grid-template-columns: 40px 1fr 40px;
+      align-items: center;
+      min-height: 56px;
+      padding: 4px 6px 12px;
+    }
+    .nav-back {
+      width: 36px;
+      height: 36px;
+      border: 0;
+      background: transparent;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .nav-back-fallback {
+      font-size: 28px;
+      line-height: 1;
+      color: #4f3c88;
+    }
+    .nav-title {
+      margin: 0;
+      text-align: center;
+      font-size: 20px;
+      font-weight: 600;
+      color: #251148;
+      letter-spacing: 0.4px;
+    }
+    .hero {
+      position: relative;
+      margin-top: 4px;
+      padding-bottom: 116px;
+    }
+    .hero-visual {
+      border-radius: 28px;
+      overflow: hidden;
+      box-shadow: var(--shadow-strong);
+      background: linear-gradient(180deg, #efe1ff 0%, #d8c5ff 100%);
+    }
+    .hero-main-art {
+      width: 100%;
+      height: auto;
+    }
+    .hero-entry {
+      position: absolute;
+      left: -6px;
+      width: 72px;
+      filter: drop-shadow(0 8px 14px rgba(122, 90, 208, 0.25));
+    }
+    .hero-entry--confess {
+      top: 122px;
+    }
+    .hero-entry--mailbox {
+      top: 186px;
+    }
+    .hero-entry--rule {
+      left: auto;
+      right: -2px;
+      top: 150px;
+      width: 38px;
+    }
+    .cp-stage {
+      position: absolute;
+      left: 6px;
+      right: 6px;
+      bottom: 6px;
+      min-height: 180px;
+    }
+    .cp-stage-bg {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      border-radius: 24px;
+    }
+    .cp-stage-content {
+      position: relative;
+      min-height: 180px;
+      padding: 22px 18px 12px;
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      align-items: end;
+      gap: 10px;
+    }
+    .cp-card {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+    }
+    .cp-frame {
+      position: relative;
+      width: 94px;
+      height: 94px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .cp-frame-art {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+    .cp-avatar-fill {
+      width: 56px;
+      height: 56px;
+      border-radius: 50%;
+      background: radial-gradient(circle at 35% 30%, rgba(255, 255, 255, 0.95), rgba(255, 194, 229, 0.86) 38%, rgba(170, 141, 255, 0.95) 100%);
+      box-shadow: inset 0 0 0 4px rgba(255, 255, 255, 0.68);
+    }
+    .cp-name {
+      position: relative;
+      min-width: 112px;
+      min-height: 24px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 14px;
+      font-size: 12px;
+      line-height: 1;
+      color: #fff;
+      text-shadow: 0 1px 3px rgba(109, 66, 188, 0.45);
+    }
+    .cp-name-art {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: fill;
+    }
+    .cp-name-text {
+      position: relative;
+      z-index: 1;
+      white-space: nowrap;
+    }
+    .cp-badge {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 18px;
+      width: 96px;
+      height: 100px;
+      border-radius: 28px;
+      background: linear-gradient(180deg, rgba(255, 242, 255, 0.88) 0%, rgba(252, 214, 255, 0.76) 100%);
+      box-shadow: 0 12px 24px rgba(133, 90, 219, 0.18);
+      font-size: 18px;
+      font-weight: 700;
+      color: #8c5cf5;
+      text-align: center;
+      line-height: 1.15;
+    }
+    .cp-badge-art {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+    .summary-card,
+    .board-card,
+    .rules-card {
+      position: relative;
+      overflow: hidden;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 28px;
+      box-shadow: var(--shadow-soft);
+      backdrop-filter: blur(10px);
+    }
+    .summary-card {
+      margin-top: 18px;
+      padding: 22px 18px 20px;
+      background:
+        radial-gradient(circle at 82% 16%, rgba(255, 225, 164, 0.34), transparent 20%),
+        linear-gradient(180deg, rgba(243, 225, 255, 0.88) 0%, rgba(255, 255, 255, 0.9) 100%);
+    }
+    .summary-head {
+      position: relative;
+      padding-right: 96px;
+    }
+    .summary-kicker {
+      margin: 0;
+      font-size: 14px;
+      letter-spacing: 3px;
+      text-transform: uppercase;
+      color: #b176e6;
+      opacity: 0.8;
+    }
+    .summary-title {
+      margin: 8px 0 0;
+      font-size: 44px;
+      line-height: 1;
+      font-weight: 800;
+      letter-spacing: 1px;
+      background: linear-gradient(180deg, #ffffff 0%, #c5a4ff 34%, #7b5ef3 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+      text-shadow: 0 10px 18px rgba(139, 92, 246, 0.16);
+    }
+    .summary-date {
+      position: absolute;
+      top: 2px;
+      right: 0;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, rgba(255, 239, 181, 0.96), rgba(255, 178, 116, 0.96));
+      color: #8c4d1d;
+      font-size: 12px;
+      font-weight: 700;
+      box-shadow: 0 8px 16px rgba(255, 178, 116, 0.22);
+    }
+    .summary-copy {
+      margin: 14px 0 0;
+      display: grid;
+      gap: 8px;
+      color: var(--text-soft);
+      font-size: 14px;
+      line-height: 1.7;
+    }
+    .summary-copy strong {
+      color: #ff6197;
+      font-weight: 700;
+    }
+    .milestone-row {
+      margin-top: 18px;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      align-items: stretch;
+    }
+    .milestone-card,
+    .reward-card {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 12px 8px;
+      border-radius: 24px;
+      background: linear-gradient(180deg, rgba(255, 255, 255, 0.74), rgba(232, 220, 255, 0.9));
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+      min-height: 114px;
+    }
+    .milestone-art {
+      width: 70px;
+      object-fit: contain;
+    }
+    .milestone-label,
+    .reward-label {
+      font-size: 12px;
+      line-height: 1.4;
+      color: var(--text-soft);
+      text-align: center;
+    }
+    .reward-art {
+      width: 84px;
+      object-fit: contain;
+    }
+    .reward-lock {
+      width: 50px;
+      object-fit: contain;
+    }
+    .reward-chip {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 22px;
+      padding: 0 10px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.72);
+      color: #ff7e82;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .board-card {
+      margin-top: 18px;
+      padding: 18px 14px 24px;
+      background:
+        radial-gradient(circle at 50% 0%, rgba(198, 167, 255, 0.42), transparent 30%),
+        linear-gradient(180deg, rgba(228, 212, 255, 0.92) 0%, rgba(250, 246, 255, 0.96) 100%);
+    }
+    .board-topbar {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .board-tab {
+      position: relative;
+      min-width: 108px;
+      min-height: 42px;
+      padding: 0 16px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: #fff;
+      font-size: 13px;
+      font-weight: 700;
+      text-shadow: 0 1px 3px rgba(113, 73, 196, 0.4);
+    }
+    .board-tab-art {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: fill;
+    }
+    .board-tab-text {
+      position: relative;
+      z-index: 1;
+    }
+    .board-tip {
+      margin: 14px auto 0;
+      max-width: 286px;
+      font-size: 13px;
+      line-height: 1.65;
+      color: #6e4ac0;
+      text-align: center;
+    }
+    .board-grid-wrap {
+      position: relative;
+      margin-top: 18px;
+      padding: 18px 12px 12px;
+      border-radius: 28px;
+      background:
+        linear-gradient(180deg, rgba(135, 98, 224, 0.92) 0%, rgba(170, 122, 245, 0.8) 100%);
+      box-shadow: inset 0 2px 12px rgba(255, 255, 255, 0.22);
+      overflow: hidden;
+    }
+    .board-grid {
+      position: relative;
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      grid-auto-rows: minmax(52px, auto);
+      gap: 8px;
+      align-items: center;
+    }
+    .board-tile {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 52px;
+    }
+    .board-tile-image {
+      width: 100%;
+      object-fit: contain;
+      filter: drop-shadow(0 6px 8px rgba(54, 29, 123, 0.18));
+    }
+    .board-finish {
+      grid-column: 3 / span 2;
+      grid-row: 3 / span 2;
+      align-self: center;
+      justify-self: center;
+      width: min(100%, 132px);
+      z-index: 1;
+      filter: drop-shadow(0 10px 18px rgba(76, 45, 160, 0.28));
+    }
+    .board-decor {
+      position: absolute;
+      pointer-events: none;
+      opacity: 0.92;
+    }
+    .board-decor--primary {
+      right: 78px;
+      bottom: 94px;
+      width: 70px;
+    }
+    .board-decor--secondary {
+      left: 58px;
+      bottom: 52px;
+      width: 52px;
+    }
+    .board-decor-image {
+      width: 100%;
+      object-fit: contain;
+    }
+    .board-legend {
+      margin-top: 16px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: center;
+    }
+    .board-legend-pill {
+      padding: 7px 12px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.72);
+      color: #7249c7;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .rules-card {
+      margin-top: 18px;
+      padding: 20px 16px 22px;
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.92) 0%, rgba(242, 232, 255, 0.98) 100%);
+    }
+    .rules-bg {
+      position: absolute;
+      right: -24px;
+      bottom: -12px;
+      width: 180px;
+      opacity: 0.12;
+      pointer-events: none;
+      filter: saturate(1.1);
+    }
+    .rules-head {
+      position: relative;
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .rules-title {
+      margin: 0;
+      font-size: 28px;
+      line-height: 1.05;
+      color: #6a48bb;
+    }
+    .rules-subtitle {
+      margin: 6px 0 0;
+      color: #a47adb;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .rules-tag {
+      flex-shrink: 0;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, rgba(255, 233, 186, 0.96), rgba(255, 194, 120, 0.94));
+      color: #8c531a;
+      font-size: 12px;
+      font-weight: 700;
+      box-shadow: 0 8px 16px rgba(255, 196, 122, 0.22);
+    }
+    .rules-grid {
+      position: relative;
+      margin-top: 18px;
+      display: grid;
+      gap: 12px;
+    }
+    .rule-block {
+      padding: 16px 16px 14px;
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.72);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+    }
+    .rule-block-title {
+      margin: 0;
+      font-size: 16px;
+      color: #643eb7;
+    }
+    .rule-text,
+    .rule-list {
+      margin: 10px 0 0;
+      font-size: 14px;
+      line-height: 1.7;
+      color: var(--text-soft);
+    }
+    .rule-list {
+      padding-left: 18px;
+    }
+    .rule-list li + li {
+      margin-top: 8px;
+    }
+    .rule-steps {
+      margin: 10px 0 0;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .rule-step {
+      padding: 12px 6px;
+      border-radius: 18px;
+      background: linear-gradient(180deg, rgba(247, 239, 255, 0.96), rgba(232, 220, 255, 0.96));
+      color: #7248c6;
+      text-align: center;
+      font-size: 12px;
+      line-height: 1.5;
+      font-weight: 700;
+    }
+    @media (max-width: 359px) {
+      body {
+        padding-inline: 8px;
+      }
+      .activity-main {
+        padding-inline: 10px;
+      }
+      .summary-title {
+        font-size: 38px;
+      }
+      .milestone-row {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .rule-steps {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="activity-phone">
+    <div class="activity-main">
+      <header class="nav-bar">
+        <button class="nav-back" aria-label="返回">
+          ${assets.backIcon ? renderImage(assets.backIcon, 'nav-back-art', '返回') : '<span class="nav-back-fallback">‹</span>'}
+        </button>
+        <h1 class="nav-title">${navTitle}</h1>
+        <div aria-hidden="true"></div>
+      </header>
+
+      <section class="hero">
+        <div class="hero-visual">
+          ${renderImage(assets.hero, 'hero-main-art', `${designName} 主视觉`)}
+        </div>
+        ${assets.confessEntry ? renderImage(assets.confessEntry, 'hero-entry hero-entry--confess', '我要告白') : ''}
+        ${assets.mailboxEntry ? renderImage(assets.mailboxEntry, 'hero-entry hero-entry--mailbox', '告白信箱') : ''}
+        ${assets.ruleEntry ? renderImage(assets.ruleEntry, 'hero-entry hero-entry--rule', '奖励规则') : ''}
+        <div class="cp-stage">
+          ${assets.cpBackground ? renderImage(assets.cpBackground, 'cp-stage-bg', '') : ''}
+          <div class="cp-stage-content">
+            <article class="cp-card">
+              <div class="cp-frame">
+                ${renderImage(assets.avatarFrames[0] || assets.avatarFrames[1], 'cp-frame-art', '')}
+                <div class="cp-avatar-fill"></div>
+              </div>
+              <div class="cp-name">
+                ${renderImage(assets.namePills[0], 'cp-name-art', '')}
+                <span class="cp-name-text">${leftName}</span>
+              </div>
+            </article>
+            <div class="cp-badge">
+              ${assets.cpBadge ? renderImage(assets.cpBadge, 'cp-badge-art', '登顶CP') : '登顶<br/>CP'}
+            </div>
+            <article class="cp-card">
+              <div class="cp-frame">
+                ${renderImage(assets.avatarFrames[1] || assets.avatarFrames[0], 'cp-frame-art', '')}
+                <div class="cp-avatar-fill"></div>
+              </div>
+              <div class="cp-name">
+                ${renderImage(assets.namePills[1], 'cp-name-art', '')}
+                <span class="cp-name-text">${rightName}</span>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="summary-card">
+        <div class="summary-head">
+          <p class="summary-kicker">Confession Of Love</p>
+          <h2 class="summary-title">心动告白</h2>
+          <div class="summary-date">${activityDate}</div>
+        </div>
+        <div class="summary-copy">
+          <p>${summaryLead}</p>
+          <p>${summaryFollow}</p>
+        </div>
+        <div class="milestone-row">
+          ${milestoneHtml}
+          <div class="reward-card">
+            ${renderImage(assets.reward, 'reward-art', '1314金币礼物')}
+            ${assets.rewardLock ? renderImage(assets.rewardLock, 'reward-lock', '') : ''}
+            <span class="reward-chip">${this.escapeHtml(findTextValue('520灯牌【5】/Group 427319936/解锁/终级奖励') || '终级奖励')}</span>
+            <span class="reward-label">${this.escapeHtml(findTextValue('520灯牌【5】/Group 427319936/1314金币礼物/Group 427319934/Mask group/1314金币') || '1314金币')}</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="board-card">
+        <div class="board-topbar">
+          <div class="board-tab">
+            ${renderImage(assets.boardTabs[0], 'board-tab-art', '')}
+            <span class="board-tab-text">${recordLabel}</span>
+          </div>
+          <div class="board-tab">
+            ${renderImage(assets.boardTabs[1], 'board-tab-art', '')}
+            <span class="board-tab-text">${switchLabel}</span>
+          </div>
+        </div>
+        <p class="board-tip">${boardTip}</p>
+        <div class="board-grid-wrap">
+          <div class="board-grid">
+            ${boardTileHtml}
+            ${assets.finishTile ? renderImage(assets.finishTile, 'board-finish', '终点') : '<div class="board-finish"></div>'}
+          </div>
+          ${boardDecorPrimary}
+          ${boardDecorSecondary}
+        </div>
+        <div class="board-legend">
+          <span class="board-legend-pill">发消息</span>
+          <span class="board-legend-pill">铭牌</span>
+          <span class="board-legend-pill">进2格</span>
+          <span class="board-legend-pill">头像框</span>
+          <span class="board-legend-pill">退3格</span>
+          <span class="board-legend-pill">终点奖励</span>
+        </div>
+      </section>
+
+      <section class="rules-card">
+        ${assets.rulesBackground ? renderImage(assets.rulesBackground, 'rules-bg', '') : ''}
+        <div class="rules-head">
+          <div>
+            <h3 class="rules-title">规则说明</h3>
+            <p class="rules-subtitle">把视觉块拆回真正的 DOM，核心文案可以直接复制。</p>
+          </div>
+          <span class="rules-tag">${activityDate}</span>
+        </div>
+        <div class="rules-grid">
+          <div class="rule-block">
+            <h4 class="rule-block-title">活动时间</h4>
+            <p class="rule-text">${activityDate}</p>
+          </div>
+          <div class="rule-block">
+            <h4 class="rule-block-title">操作指引</h4>
+            <div class="rule-steps">
+              <div class="rule-step">收送礼物</div>
+              <div class="rule-step">投掷骰子</div>
+              <div class="rule-step">抵达终点</div>
+              <div class="rule-step">获得奖励</div>
+            </div>
+          </div>
+          <div class="rule-block">
+            <h4 class="rule-block-title">详细说明</h4>
+            <ol class="rule-list">
+              <li>每收到或送出一个指定礼物“告白气球”，双方掷骰子次数各加一。</li>
+              <li>掷色子点数为 1-6，掷出点数即前进步数。</li>
+              <li>每次停留的格子都有对应奖励或任务，请按格子提示继续游戏。</li>
+              <li>发消息格需要完成发消息任务后才能继续前进。</li>
+              <li>进 2 格会在当前格子基础上直接前进两步，退 3 格会在当前格子后退三步。</li>
+              <li>返回起点会重置当前路线，礼物和头像框奖励可在背包或装扮页查看。</li>
+            </ol>
+          </div>
+          <div class="rule-block">
+            <h4 class="rule-block-title">终极奖励</h4>
+            <ul class="rule-list">
+              <li>双方均到达终点后，可依次点亮 5-2-0 三个灯牌。</li>
+              <li>每点亮一枚灯牌即可领取对应奖励。</li>
+              <li>灯牌全部点亮后，可获得最终大奖“520灯牌礼物”。</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+</body>
+</html>`;
+  }
+
+  build520LampPixelPerfectGeneratedPreviewHtml(design, layerContext, recipe = this.getStructuredGeneratedPreviewRecipe(design)) {
+    const fixedCanvasConfig = this.getStructuredGeneratedPreviewFixedCanvasConfig(design, recipe);
+    if (fixedCanvasConfig) {
+      return this.buildFixedCanvasGeneratedPreviewHtml(design, layerContext, recipe, fixedCanvasConfig);
+    }
+
+    const layers = Array.isArray(layerContext?.layers) ? layerContext.layers : [];
+    if (!layers.length) {
+      return '';
+    }
+
+    const designCoverUrl = this.getProxiedImageUrl(design?.previewUrl || design?.preview_url || '');
+    const recipeOptions = recipe?.options && typeof recipe.options === 'object' ? recipe.options : {};
+    const canvasSize = recipeOptions?.canvasSize && typeof recipeOptions.canvasSize === 'object'
+      ? recipeOptions.canvasSize
+      : {};
+    const coverWidth = Math.max(1, Math.round(Number(canvasSize.width) || 750));
+    const coverHeight = Math.max(1, Math.round(Number(canvasSize.height) || 5240));
+
+    const comparePosition = (left, right) => (
+      (Number(left?.y) || 0) - (Number(right?.y) || 0) ||
+      (Number(left?.x) || 0) - (Number(right?.x) || 0)
+    );
+    const findLayers = (path, type = '', index = 0) => {
+      const queries = this.getStructuredGeneratedPreviewLayerQueries(path, design, recipe, index);
+      for (const query of queries) {
+        const matchedLayers = layers
+          .filter((layer) => String(layer?.path || '') === query.path && (!type || String(layer?.type || '') === type))
+          .sort(comparePosition);
+        if (matchedLayers.length) {
+          return {
+            layers: matchedLayers,
+            query
+          };
+        }
+      }
+      return {
+        layers: [],
+        query: null
+      };
+    };
+    const findLayer = (path, type = '', index = 0) => {
+      const matchedResult = findLayers(path, type, index);
+      const queryIndex = Number(matchedResult.query?.index) || 0;
+      return matchedResult.layers[queryIndex] || matchedResult.layers[index] || matchedResult.layers[0] || null;
+    };
+    const createAsset = (path, {
+      x,
+      y,
+      width,
+      height,
+      z = 1,
+      alt = '',
+      className = '',
+      index = 0
+    } = {}) => {
+      const layer = findLayer(path, '', index);
+      if (!layer) return null;
+      const useCoverCrop = !layer.image && Boolean(designCoverUrl) && (Number(layer.width) || 0) > 0 && (Number(layer.height) || 0) > 0;
+      if (!layer.image && !useCoverCrop) return null;
+      return {
+        x: Math.round(Number(x) || Number(layer.x) || 0),
+        y: Math.round(Number(y) || Number(layer.y) || 0),
+        width: Math.round(Number(width) || Number(layer.width) || 0),
+        height: Math.round(Number(height) || Number(layer.height) || 0),
+        z,
+        className,
+        alt: alt || String(layer.name || '').trim() || 'asset',
+        url: useCoverCrop ? designCoverUrl : this.getProxiedImageUrl(layer.image),
+        isCoverCrop: useCoverCrop,
+        cropX: Math.round(Number(layer.x) || 0),
+        cropY: Math.round(Number(layer.y) || 0),
+        cropWidth: Math.round(Number(layer.width) || 0),
+        cropHeight: Math.round(Number(layer.height) || 0)
+      };
+    };
+    const createText = ({
+      path = '',
+      text = '',
+      x,
+      y,
+      width,
+      height,
+      z = 10,
+      className = '',
+      hidden = false,
+      color = '',
+      fontSize,
+      lineHeight,
+      letterSpacing,
+      fontWeight,
+      textAlign,
+      fontFamily
+    } = {}) => {
+      const layer = path ? findLayer(path, 'textLayer') : null;
+      const mergedStyles = layer ? this.getMergedLayerStylesForHtml(layer) : {};
+      const resolvedText = String(text || this.resolveLayerText(layer) || '').trim();
+      if (!resolvedText) return null;
+      return {
+        text: resolvedText,
+        x: Math.round(Number(x) || Number(layer?.x) || 0),
+        y: Math.round(Number(y) || Number(layer?.y) || 0),
+        width: Math.round(Number(width) || Number(layer?.width) || 0),
+        height: Math.round(Number(height) || Number(layer?.height) || 0),
+        z,
+        className,
+        hidden,
+        color: color || this.sanitizeColor(mergedStyles.color) || '',
+        fontSize: Number(fontSize) || Number(mergedStyles.fontSize) || 24,
+        lineHeight: Number(lineHeight) || Number(mergedStyles.lineHeight) || 36,
+        letterSpacing: Number.isFinite(Number(letterSpacing)) ? Number(letterSpacing) : Number(mergedStyles.letterSpacing) || 0,
+        fontWeight: fontWeight || this.sanitizeFontWeight(mergedStyles.fontWeight) || '500',
+        textAlign: textAlign || this.sanitizeTextAlign(mergedStyles.textAlign) || 'left',
+        fontFamily: fontFamily || this.sanitizeFontFamily(mergedStyles.fontFamily) || ''
+      };
+    };
+    const renderAsset = (asset) => {
+      if (!asset?.url || asset.width <= 0 || asset.height <= 0) return '';
+      if (asset.isCoverCrop) {
+        return renderCoverCrop({
+          cropX: asset.cropX,
+          cropY: asset.cropY,
+          cropWidth: asset.cropWidth,
+          cropHeight: asset.cropHeight,
+          x: asset.x,
+          y: asset.y,
+          width: asset.width,
+          height: asset.height,
+          z: asset.z,
+          className: asset.className,
+          alt: asset.alt
+        });
+      }
+      const style = [
+        `left:${asset.x}px`,
+        `top:${asset.y}px`,
+        `width:${asset.width}px`,
+        `height:${asset.height}px`,
+        `z-index:${asset.z}`
+      ].join(';');
+      return `<img class="pp-asset ${this.escapeAttr(asset.className || '')}" style="${style}" src="${this.escapeAttr(asset.url)}" alt="${this.escapeAttr(asset.alt)}" loading="eager" />`;
+    };
+    const renderText = (spec) => {
+      if (!spec?.text) return '';
+      const styles = [
+        `left:${spec.x}px`,
+        `top:${spec.y}px`,
+        spec.width > 0 ? `width:${spec.width}px` : '',
+        spec.height > 0 ? `min-height:${spec.height}px` : '',
+        `z-index:${spec.z}`,
+        `font-size:${Math.max(1, Math.round(spec.fontSize))}px`,
+        `line-height:${Math.max(1, Math.round(spec.lineHeight || spec.fontSize * 1.4))}px`,
+        `letter-spacing:${spec.letterSpacing}px`,
+        `font-weight:${spec.fontWeight}`,
+        `text-align:${spec.textAlign}`,
+        spec.fontFamily ? `font-family:${spec.fontFamily}` : '',
+        spec.hidden
+          ? 'color:transparent;-webkit-text-fill-color:transparent;text-shadow:none'
+          : `color:${spec.color || '#6e53bf'}`
+      ].filter(Boolean).join(';');
+      return `<div class="pp-text ${this.escapeAttr(spec.className || '')}${spec.hidden ? ' pp-copy-text' : ''}" style="${styles}">${this.escapeHtml(spec.text).replace(/\n/g, '<br />')}</div>`;
+    };
+    const renderCoverCrop = ({
+      cropX = 0,
+      cropY = 0,
+      cropWidth = 0,
+      cropHeight = 0,
+      x = 0,
+      y = 0,
+      width = 0,
+      height = 0,
+      z = 1,
+      className = '',
+      alt = ''
+    } = {}) => {
+      if (!designCoverUrl || cropWidth <= 0 || cropHeight <= 0 || width <= 0 || height <= 0) return '';
+      const scaleX = width / cropWidth;
+      const scaleY = height / cropHeight;
+      const frameStyle = [
+        `left:${x}px`,
+        `top:${y}px`,
+        `width:${width}px`,
+        `height:${height}px`,
+        `z-index:${z}`
+      ].join(';');
+      const imageStyle = [
+        `left:${Math.round(-cropX * scaleX)}px`,
+        `top:${Math.round(-cropY * scaleY)}px`,
+        `width:${Math.round(coverWidth * scaleX)}px`,
+        `height:${Math.round(coverHeight * scaleY)}px`
+      ].join(';');
+      return `<div class="pp-cover-crop ${this.escapeAttr(className || '')}" style="${frameStyle}"><img class="pp-cover-crop-image" style="${imageStyle}" src="${this.escapeAttr(designCoverUrl)}" alt="${this.escapeAttr(alt || 'cover crop')}" loading="eager" /></div>`;
+    };
+
+    const assets = [
+      createAsset('520灯牌【5】/导航栏/白色-返回键', { z: 20, className: 'nav-back', alt: '返回' }),
+      createAsset('520灯牌【5】/头图', { z: 2, className: 'hero-art', alt: '主视觉' }),
+      createAsset('520灯牌【5】/我要告白', { z: 12, className: 'entry entry-confess', alt: '我要告白' }),
+      createAsset('520灯牌【5】/告白信箱', { z: 12, className: 'entry entry-mailbox', alt: '告白信箱' }),
+      createAsset('520灯牌【5】/Group 427319821', { z: 12, className: 'entry entry-rule', alt: '奖励规则' }),
+      createAsset('520灯牌【5】/登顶CP/登顶CP背景', { z: 4, className: 'cp-background', alt: '登顶CP背景' }),
+      createAsset('520灯牌【5】/登顶CP/信息/头像/头像框', { x: 169, y: 634, width: 172, height: 172, z: 10, className: 'cp-frame cp-frame-left', alt: '左头像框', index: 0 }),
+      createAsset('520灯牌【5】/登顶CP/信息/头像/头像框', { x: 411, y: 634, width: 172, height: 172, z: 10, className: 'cp-frame cp-frame-right', alt: '右头像框', index: 1 }),
+      createAsset('520灯牌【5】/登顶CP/信息/Group 427319820', { z: 11, className: 'cp-badge', alt: '登顶CP' }),
+      createAsset('520灯牌【5】/登顶CP/信息/Group 427319823/Rectangle 34624666', { x: 150, y: 802, width: 206, height: 42, z: 9, className: 'cp-name-pill cp-name-pill-left', alt: '左名牌' }),
+      createAsset('520灯牌【5】/登顶CP/信息/Group 427319822/Rectangle 34624666', { x: 394, y: 802, width: 206, height: 42, z: 9, className: 'cp-name-pill cp-name-pill-right', alt: '右名牌' }),
+      createAsset('520灯牌【5】/标题分割', { z: 6, className: 'title-block', alt: '标题区域' }),
+      createAsset('520灯牌【5】/Group 427319936/Frame 1000004919/Frame 1000004917', { z: 9, className: 'milestone milestone-1', alt: '里程碑1' }),
+      createAsset('520灯牌【5】/Group 427319936/Frame 1000004919/Frame 1000004918', { z: 9, className: 'milestone milestone-2', alt: '里程碑2' }),
+      createAsset('520灯牌【5】/Group 427319936/Frame 1000004919/Frame 1000004919', { z: 9, className: 'milestone milestone-3', alt: '里程碑3' }),
+      createAsset('520灯牌【5】/Group 427319936/1314金币礼物', { z: 10, className: 'ultimate-reward', alt: '1314金币礼物' }),
+      createAsset('520灯牌【5】/Group 427319936/解锁', { z: 11, className: 'ultimate-lock', alt: '终级奖励' }),
+      createAsset('520灯牌【5】/5字背景', { z: 2, className: 'board-background', alt: '棋盘背景' }),
+      createAsset('520灯牌【5】/Group 427319971', { z: 10, className: 'board-tab board-tab-left', alt: '我的记录' }),
+      createAsset('520灯牌【5】/Group 427319979', { z: 10, className: 'board-tab board-tab-right', alt: '切换密友' }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004922', { z: 8, className: 'board-tile tile-1' }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004923', { z: 8, className: 'board-tile tile-2' }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004924', { z: 8, className: 'board-tile tile-3' }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004925', { z: 8, className: 'board-tile tile-4', index: 0 }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004926', { z: 8, className: 'board-tile tile-5', index: 0 }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004921', { z: 8, className: 'board-tile tile-6', index: 0 }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004929/Frame 1000004927', { z: 8, className: 'board-tile tile-7' }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004931', { z: 8, className: 'board-tile tile-8', index: 0 }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004929/Frame 1000004928', { z: 8, className: 'board-tile tile-9' }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004931/Frame 1000004928', { z: 8, className: 'board-tile tile-10' }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004928', { z: 8, className: 'board-tile tile-11', index: 0 }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004930', { z: 8, className: 'board-tile tile-12', index: 0 }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004929/Frame 1000004929', { z: 8, className: 'board-tile tile-13' }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004928', { z: 8, className: 'board-tile tile-14', index: 1 }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004930', { z: 8, className: 'board-tile tile-15', index: 1 }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004926', { z: 8, className: 'board-tile tile-16', index: 1 }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004925', { z: 8, className: 'board-tile tile-17', index: 1 }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004929', { z: 8, className: 'board-tile tile-18', index: 0 }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004928', { z: 8, className: 'board-tile tile-19', index: 2 }),
+      createAsset('520灯牌【5】/Group 427319939/Frame 1000004927', { z: 8, className: 'board-tile tile-20', index: 1 }),
+      createAsset('520灯牌【5】/Frame 1000004945', { z: 9, className: 'board-finish', alt: '终点' }),
+      createAsset('520灯牌【5】/位图', { z: 6, className: 'board-decor board-decor-primary', index: 0 }),
+      createAsset('520灯牌【5】/位图', { z: 6, className: 'board-decor board-decor-secondary', index: 1 }),
+      createAsset('520灯牌【5】/编组 31/数字背景', { z: 9, className: 'dice-count-bg', alt: '骰子次数' }),
+      createAsset('520灯牌【5】/Group 427319950', { z: 8, className: 'dice-button dice-button-left', alt: '掷骰子按钮左' }),
+      createAsset('520灯牌【5】/Group 427319951', { z: 8, className: 'dice-button dice-button-right', alt: '掷骰子按钮右' }),
+      createAsset('520灯牌【5】/规则说明', { z: 2, className: 'rules-background', alt: '规则说明背景' }),
+      createAsset('520灯牌【5】/Frame 1000004953/Frame 1000004952/Group 427319964', { z: 6, className: 'rules-flow', alt: '操作指引' }),
+      createAsset('520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/编组 44', { z: 6, className: 'rules-table', alt: '停留格子说明' })
+    ].filter(Boolean);
+
+    const visibleTexts = [
+      createText({
+        path: '520灯牌【5】/导航栏/心动告白',
+        color: '#1f1637',
+        fontWeight: '600',
+        className: 'nav-title'
+      }),
+      createText({
+        path: '520灯牌【5】/登顶CP/信息/Group 427319823/最爱旺仔奶茶',
+        color: '#ffffff',
+        fontWeight: '500',
+        className: 'cp-name cp-name-left'
+      }),
+      createText({
+        path: '520灯牌【5】/登顶CP/信息/Group 427319822/最爱旺仔奶茶',
+        color: '#ffffff',
+        fontWeight: '500',
+        className: 'cp-name cp-name-right'
+      }),
+      createText({
+        path: '520灯牌【5】/Group 427319971/我的记录',
+        color: '#ffffff',
+        fontWeight: '500',
+        className: 'tab-text'
+      }),
+      createText({
+        path: '520灯牌【5】/Group 427319979/切换密友',
+        color: '#ffffff',
+        fontWeight: '500',
+        className: 'tab-text'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004945/Group 427319944/终点',
+        color: '#ffffff',
+        fontWeight: '500',
+        className: 'finish-text'
+      }),
+      createText({
+        path: '520灯牌【5】/编组 31/10',
+        color: '#ffffff',
+        fontWeight: '700',
+        className: 'dice-count'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/1.活动时间：2024/8/6 12:0',
+        text: '1.活动时间：05/15 10:00-05/21 24:00',
+        color: '#6e55c8',
+        className: 'rule-copy'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004952/2.操作指引：',
+        text: '2.操作指引：',
+        color: '#6e55c8',
+        className: 'rule-copy'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/3.详细说明：',
+        text: '3.活动说明：',
+        color: '#6e55c8',
+        className: 'rule-copy'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Frame 1000004954/① 每收到/送出一个指定礼物“七夕快乐”',
+        text: '① 每收到/送出一个指定礼物“告白气球”，双方掷色子次数各加一',
+        color: '#6e55c8',
+        className: 'rule-copy'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Frame 1000004954/② 掷色子点数为1-6，掷出点数为前进步',
+        text: '② 掷色子点数为1-6，掷出点数为前进步数',
+        color: '#6e55c8',
+        className: 'rule-copy'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Frame 1000004954/③ 每次停留的格子都有对应的奖励和任务',
+        text: '③ 每次停留的格子都有对应的奖励和任务',
+        color: '#6e55c8',
+        className: 'rule-copy'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/停留格子',
+        color: '#6e55c8',
+        fontWeight: '500',
+        className: 'rule-table-head'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/说明',
+        color: '#6e55c8',
+        fontWeight: '500',
+        className: 'rule-table-head'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/发消息',
+        color: '#6e55c8',
+        className: 'rule-table-cell'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/完成发消息任务，才可前进',
+        text: '完成发消息任务，才可前进',
+        color: '#6e55c8',
+        className: 'rule-table-cell rule-table-cell-right'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/铭牌',
+        color: '#6e55c8',
+        className: 'rule-table-cell'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/获得 铭牌*1',
+        text: '获得 铭牌*1',
+        color: '#6e55c8',
+        className: 'rule-table-cell rule-table-cell-right'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/进2格',
+        color: '#6e55c8',
+        className: 'rule-table-cell'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/在当前格子前进2步',
+        text: '在当前格子前进2步',
+        color: '#6e55c8',
+        className: 'rule-table-cell rule-table-cell-right'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/返回起点',
+        color: '#6e55c8',
+        className: 'rule-table-cell'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/返回起点，重重开始游戏',
+        text: '返回本地图起点，重重开始游戏',
+        color: '#6e55c8',
+        className: 'rule-table-cell rule-table-cell-right'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/空白格',
+        color: '#6e55c8',
+        className: 'rule-table-cell'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/无',
+        color: '#6e55c8',
+        className: 'rule-table-cell rule-table-cell-right'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/礼物',
+        color: '#6e55c8',
+        className: 'rule-table-cell'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/可在礼物背包中查看',
+        text: '可在礼物背包中查看（有效期7天）',
+        color: '#6e55c8',
+        className: 'rule-table-cell rule-table-cell-right'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/头像框',
+        color: '#6e55c8',
+        className: 'rule-table-cell'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/获得头像框1*天',
+        text: '获得头像框1*天',
+        color: '#6e55c8',
+        className: 'rule-table-cell rule-table-cell-right'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/退3格',
+        color: '#6e55c8',
+        className: 'rule-table-cell'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/在当前格子后退3步',
+        text: '在当前格子后退3步',
+        color: '#6e55c8',
+        className: 'rule-table-cell rule-table-cell-right'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/钻石',
+        text: '金币',
+        color: '#6e55c8',
+        className: 'rule-table-cell'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004951/Frame 1000004950/Group 427319965/获得随机钻石',
+        text: '获得随机金币',
+        color: '#6e55c8',
+        className: 'rule-table-cell rule-table-cell-right'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004949/4.终极奖励',
+        text: '4.终极奖励',
+        color: '#6e55c8',
+        className: 'rule-copy reward-title'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004949/Frame 1000004948/① 双方均到达终点，可依次点亮 鹊-桥-',
+        text: '【5】字地图双方均达到终点，可点亮【5】字灯牌，50%的概率解锁【2】字灯牌地图，若解锁【2】字灯牌失败则【5】字灯牌熄灭需要重新点亮【5】字灯牌，解锁【2】字地图，获得520灯牌铭牌1天；',
+        color: '#6e55c8',
+        className: 'rule-copy reward-copy'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004949/Frame 1000004948/② 双方每点亮 鹊-桥-相-会 4个灯牌',
+        text: '【2】字地图双方均达到终点，可点亮【2】字灯牌，50%的概率解锁【0】字灯牌地图，若解锁【0】字灯牌失败则【2】字灯牌熄灭需要重新点亮【2】字灯牌，解锁【0】字地图，获得520灯牌头像框1天；',
+        color: '#6e55c8',
+        className: 'rule-copy reward-copy'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004949/Frame 1000004948/③ 双方每点亮 鹊-桥-相-会 4个灯牌',
+        text: '【0】字地图双方均达到终点，可点亮0字灯牌，获得最终大奖：520灯牌礼物*1（1314金币）（礼物进入用户背包，有效期7天）',
+        color: '#6e55c8',
+        className: 'rule-copy reward-copy'
+      }),
+      createText({
+        path: '520灯牌【5】/Frame 1000004953/Frame 1000004949/Frame 1000004948/③ 双方每点亮 鹊-桥-相-会 4个灯牌',
+        text: '520灯牌全部点亮后，可重置重新开始游戏。',
+        y: 5053,
+        height: 45,
+        color: '#6e55c8',
+        className: 'rule-copy reward-tail'
+      })
+    ].filter(Boolean);
+
+    const hiddenCopyTexts = [
+      createText({
+        path: '520灯牌【5】/标题分割/标题/日期/5/15 - 5/21',
+        hidden: true,
+        text: '5/15 - 5/21',
+        y: 850,
+        className: 'copy-date'
+      }),
+      createText({
+        path: '520灯牌【5】/标题分割/双方成功到达终点，可依次点亮：鹊-桥-相',
+        hidden: true,
+        text: '双方成功到达终点，可依次点亮5-2-0三个灯牌，并获得相应奖励',
+        y: 1073,
+        className: 'copy-summary'
+      }),
+      createText({
+        path: '520灯牌【5】/标题分割/双方成功到达终点，可依次点亮：鹊-桥-相',
+        hidden: true,
+        text: '灯牌全部点亮后即可获得最终大奖「520灯牌礼物」',
+        x: 94,
+        y: 1115,
+        width: 563,
+        className: 'copy-summary'
+      }),
+      createText({
+        path: '520灯牌【5】/5字背景/每收到/送出一个指定礼物“告白气球” 双方掷色子次数各加一',
+        hidden: true,
+        text: '每收到/送出一个指定礼物“告白气球”，双方掷色子次数各加一',
+        className: 'copy-board-tip'
+      })
+    ].filter(Boolean);
+
+    const coverCropSpecs = Array.isArray(recipeOptions.coverCrops) ? recipeOptions.coverCrops : [];
+    const coverCrops = coverCropSpecs
+      .map((item) => item && typeof item === 'object' ? item : null)
+      .filter(Boolean)
+      .filter((item) => designCoverUrl || !String(item.className || '').includes('avatar-crop'));
+    const avatarFills = designCoverUrl
+      ? []
+      : [
+          { x: 196, y: 661, width: 118, height: 118, z: 7, className: 'avatar-fill avatar-fill-left' },
+          { x: 438, y: 661, width: 118, height: 118, z: 7, className: 'avatar-fill avatar-fill-right' }
+        ];
+    const renderAvatarFill = (item) => `<div class="${this.escapeAttr(item.className)}" style="left:${item.x}px;top:${item.y}px;width:${item.width}px;height:${item.height}px;z-index:${item.z};"></div>`;
+
+    const designName = this.escapeHtml(design?.name || '520灯牌');
+    return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=750, initial-scale=1.0" />
+  <title>${designName}</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: #f5ebff; }
+    body {
+      min-width: 750px;
+      display: flex;
+      justify-content: center;
+      color: #6e55c8;
+      font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    }
+    .pp-page {
+      position: relative;
+      width: 750px;
+      height: 5240px;
+      overflow: hidden;
+      background:
+        linear-gradient(180deg, #ffffff 0 176px, #f4e9ff 176px 100%);
+    }
+    .pp-topbar {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 750px;
+      height: 176px;
+      z-index: 1;
+      background: #ffffff;
+    }
+    .pp-statusbar {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 750px;
+      height: 88px;
+      z-index: 30;
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      padding: 0 36px 14px 48px;
+      color: #111111;
+      font-size: 28px;
+      line-height: 1;
+      font-weight: 600;
+      letter-spacing: 0.2px;
+    }
+    .pp-status-icons {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .pp-status-signal,
+    .pp-status-wifi {
+      position: relative;
+      display: inline-block;
+      width: 26px;
+      height: 18px;
+    }
+    .pp-status-signal::before,
+    .pp-status-wifi::before,
+    .pp-status-battery,
+    .pp-status-battery::after,
+    .pp-status-battery-level {
+      content: "";
+      display: block;
+    }
+    .pp-status-signal::before {
+      position: absolute;
+      inset: 0;
+      background:
+        linear-gradient(90deg, transparent 0 2px, #111 2px 6px, transparent 6px 8px, #111 8px 12px, transparent 12px 14px, #111 14px 18px, transparent 18px 20px, #111 20px 24px);
+      clip-path: polygon(0 100%, 0 68%, 25% 68%, 25% 46%, 50% 46%, 50% 26%, 75% 26%, 75% 0, 100% 0, 100% 100%);
+      border-radius: 2px;
+    }
+    .pp-status-wifi::before {
+      position: absolute;
+      left: 1px;
+      top: 1px;
+      width: 24px;
+      height: 16px;
+      border: 3px solid #111;
+      border-color: #111 transparent transparent transparent;
+      border-radius: 50% 50% 0 0 / 100% 100% 0 0;
+      transform: scaleY(1.1);
+    }
+    .pp-status-battery {
+      position: relative;
+      width: 40px;
+      height: 20px;
+      border: 2px solid #111;
+      border-radius: 5px;
+    }
+    .pp-status-battery::after {
+      position: absolute;
+      right: -5px;
+      top: 5px;
+      width: 3px;
+      height: 8px;
+      border-radius: 2px;
+      background: #111;
+    }
+    .pp-status-battery-level {
+      position: absolute;
+      left: 2px;
+      top: 2px;
+      width: 28px;
+      height: 12px;
+      border-radius: 3px;
+      background: #111;
+    }
+    .pp-asset {
+      position: absolute;
+      display: block;
+      object-fit: fill;
+      user-select: none;
+      -webkit-user-drag: none;
+    }
+    .pp-text {
+      position: absolute;
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .pp-copy-text {
+      user-select: text;
+    }
+    .pp-cover-crop {
+      position: absolute;
+      overflow: hidden;
+      pointer-events: none;
+    }
+    .pp-cover-crop-image {
+      position: absolute;
+      display: block;
+      max-width: none;
+      user-select: none;
+      -webkit-user-drag: none;
+    }
+    .nav-title {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+    }
+    .cp-name {
+      text-shadow: 0 2px 6px rgba(134, 88, 208, 0.32);
+    }
+    .tab-text,
+    .finish-text,
+    .dice-count {
+      text-shadow: 0 2px 6px rgba(112, 74, 198, 0.28);
+    }
+    .rule-copy,
+    .rule-table-cell,
+    .rule-table-head {
+      letter-spacing: 0;
+    }
+    .rule-table-cell-right {
+      text-align: left;
+    }
+    .reward-copy,
+    .reward-tail {
+      line-height: 45px;
+    }
+    .avatar-fill {
+      position: absolute;
+      border-radius: 50%;
+      background:
+        radial-gradient(circle at 40% 28%, rgba(255,255,255,0.98), rgba(255, 218, 236, 0.9) 28%, rgba(217, 177, 255, 0.94) 56%, rgba(148, 112, 255, 0.96) 100%);
+      box-shadow: inset 0 0 0 8px rgba(255,255,255,0.62);
+    }
+    .avatar-crop {
+      border-radius: 50%;
+    }
+  </style>
+</head>
+<body>
+  <main class="pp-page">
+    <div class="pp-topbar"></div>
+    <div class="pp-statusbar" aria-hidden="true">
+      <span>9:41</span>
+      <div class="pp-status-icons">
+        <span class="pp-status-signal"></span>
+        <span class="pp-status-wifi"></span>
+        <span class="pp-status-battery"><span class="pp-status-battery-level"></span></span>
+      </div>
+    </div>
+    ${assets.map((asset) => renderAsset(asset)).join('\n    ')}
+    ${coverCrops.map((item) => renderCoverCrop(item)).join('\n    ')}
+    ${avatarFills.map((item) => renderAvatarFill(item)).join('\n    ')}
+    ${visibleTexts.map((item) => renderText(item)).join('\n    ')}
+    ${hiddenCopyTexts.map((item) => renderText(item)).join('\n    ')}
+  </main>
+</body>
+</html>`;
+  }
+
+  shouldPreferLayerFallbackForRepairReport(repairReport = null) {
+    if (!repairReport?.missingModuleItems?.length) {
+      return false;
+    }
+
+    const missingNames = repairReport.missingModuleItems
+      .map((moduleItem) => String(moduleItem?.pathPrefix || '').split('/').filter(Boolean).slice(-1)[0] || '')
+      .filter(Boolean);
+
+    if (!missingNames.length) {
+      return false;
+    }
+
+    const hasCoreHeroModule = missingNames.some((name) => /^(头图|标题分割|登顶CP)$/i.test(name));
+    const coreHeroCount = missingNames.filter((name) => /^(头图|标题分割|登顶CP)$/i.test(name)).length;
+    const wideMissingCount = repairReport.missingModuleItems.filter((moduleItem) => (
+      (Number(moduleItem?.areaRatio) || 0) >= 0.08 ||
+      (Number(moduleItem?.box?.width) || 0) >= ((this.getGeneratedPreviewFrameMetrics()?.width || 0) * 0.72)
+    )).length;
+
+    return hasCoreHeroModule && (coreHeroCount >= 2 || wideMissingCount >= 2);
+  }
+
   maybeSwitchGeneratedPreviewRepairMode(report = null) {
     if (!this.generatedPreviewHtml || this.getGeneratedPreviewRepairMode() !== 'dds') {
       return false;
@@ -5427,13 +9926,44 @@ class LanhuViewer {
     }
 
     const layerContext = this.getGeneratedPreviewLayerContext(repairReport.design);
-    const modulePlan = this.buildGeneratedPreviewModuleFallbackPlan(repairReport, layerContext);
-    if (modulePlan.length > 0) {
+    const structuredHtml = this.buildStructuredGeneratedPreviewHtml(repairReport.design, layerContext);
+    if (structuredHtml) {
+      this.generatedPreviewRepairState = {
+        mode: 'structured',
+        reason: repairReport.summary,
+        missingModules: repairReport.missingModules,
+        overlayModules: [],
+        previewHtml: structuredHtml,
+        outputFiles: [{ name: 'index.html', content: structuredHtml }],
+        updatedAt: Date.now()
+      };
+      this.log(`检测到 DDS 预览缺失关键模块，已切换 HTML 重建预览: ${repairReport.summary}`, 'warn');
+      this.showToast('检测到生成页缺失关键模块，已切换 HTML 重建预览');
+      this.showHtmlPreview({ revealCodePanel: this.isCodePanelVisible });
+      return true;
+    }
+
+    if (!this.getStructuredGeneratedPreviewRecipe(repairReport.design)) {
+      void this.generateStructuredPreviewRecipeDraft({
+        design: repairReport.design,
+        autoApply: true,
+        silent: true,
+        trigger: 'auto'
+      });
+    }
+
+    const shouldPreferLayerFallback = this.shouldPreferLayerFallbackForRepairReport(repairReport);
+    const modulePlan = shouldPreferLayerFallback
+      ? []
+      : this.buildGeneratedPreviewModuleFallbackPlan(repairReport, layerContext);
+    if (!shouldPreferLayerFallback && modulePlan.length > 0) {
       this.generatedPreviewRepairState = {
         mode: 'module',
         reason: repairReport.summary,
         missingModules: repairReport.missingModules,
         overlayModules: modulePlan,
+        previewHtml: '',
+        outputFiles: [],
         updatedAt: Date.now()
       };
       this.log(`检测到 DDS 预览缺失关键模块，已切换 HTML 模块修复预览: ${repairReport.summary}`, 'warn');
@@ -5452,6 +9982,8 @@ class LanhuViewer {
       reason: repairReport.summary,
       missingModules: repairReport.missingModules,
       overlayModules: [],
+      previewHtml: '',
+      outputFiles: [],
       updatedAt: Date.now()
     };
     this.log(`检测到 DDS 预览缺失关键模块，已切换图层兜底预览: ${repairReport.summary}`, 'warn');
@@ -5461,7 +9993,8 @@ class LanhuViewer {
   }
 
   updateGeneratedCodeMeta() {
-    const fileCount = Array.isArray(this.generatedCodeFiles) ? this.generatedCodeFiles.length : 0;
+    const displayedFiles = this.getDisplayedGeneratedCodeFiles();
+    const fileCount = displayedFiles.length;
     const currentFile = this.getSelectedGeneratedFile();
     const designName = this.getSelectedDesignDisplayName();
     const task = this.generatedCodeTask || this.createInitialGeneratedCodeTaskState();
@@ -5471,7 +10004,17 @@ class LanhuViewer {
     const repairMode = this.getGeneratedPreviewRepairMode();
     const isLayerFallback = repairMode === 'layer';
     const isModuleFallback = repairMode === 'module';
+    const isStructuredFallback = repairMode === 'structured';
+    const recipeDraftType = String(this.generatedPreviewRepairState?.draftType || '').trim();
+    const recipeDraftProvider = String(this.generatedPreviewRepairState?.draftProvider || '').trim().toLowerCase();
+    const recipeDraftProviderLabel = recipeDraftProvider === 'claude' ? 'Claude' : recipeDraftProvider ? recipeDraftProvider : 'AI';
+    const isRecipeDraft = /-recipe-draft$/i.test(recipeDraftType) && fileCount > 0;
+    const isRecipeDraftApplied = Boolean(this.generatedPreviewRepairState?.draftApplied);
+    const recipeDraftStrategy = String(this.generatedPreviewRepairState?.draftStrategy || '').trim();
+    const recipeDraftFamilyName = String(this.generatedPreviewRepairState?.draftFamilyName || '').trim();
+    const recipeDraftDurationMs = Math.max(0, Math.round(Number(this.generatedPreviewRepairState?.draftDurationMs) || 0));
     const primaryAction = this.getGeneratedCodePrimaryActionState();
+    const hasRenderablePreview = this.hasRenderableGeneratedPreview();
 
     this.updateDesignPreviewFrameLabel(designName);
 
@@ -5480,6 +10023,10 @@ class LanhuViewer {
         ? `生成中 ${Math.max(0, Number(task.currentStep) || 0)}/${task.totalSteps || 6}`
         : isFailed
           ? '生成失败'
+          : isRecipeDraft && isRecipeDraftApplied
+            ? '已应用'
+          : isRecipeDraft
+            ? `${recipeDraftProviderLabel} 草稿`
           : fileCount
             ? '已生成'
             : '未加载';
@@ -5490,6 +10037,10 @@ class LanhuViewer {
         ? `${task.stepLabel || '正在生成'} · ${task.currentAction || '请稍候'}`
         : isFailed
           ? `失败于 ${task.stepLabel || '未知步骤'}：${task.errorMessage || task.currentAction || '未知错误'}`
+          : isRecipeDraft && isRecipeDraftApplied
+            ? `本地 ${recipeDraftProviderLabel} 已生成并自动应用 recipe 草稿${recipeDraftFamilyName ? `，建议家族：${recipeDraftFamilyName}` : ''}${recipeDraftStrategy ? `，策略：${recipeDraftStrategy}` : ''}${recipeDraftDurationMs ? `，耗时 ${(recipeDraftDurationMs / 1000).toFixed(1)}s` : ''}。当前预览已切换到基于草稿的 HTML 重建结果。`
+          : isRecipeDraft
+            ? `本地 ${recipeDraftProviderLabel} 已生成 recipe 草稿${recipeDraftFamilyName ? `，建议家族：${recipeDraftFamilyName}` : ''}${recipeDraftStrategy ? `，策略：${recipeDraftStrategy}` : ''}${recipeDraftDurationMs ? `，耗时 ${(recipeDraftDurationMs / 1000).toFixed(1)}s` : ''}。`
           : isModuleFallback
             ? `已切换为 HTML 模块修复预览，原始 ${frameworkLabel} 代码仍保留在代码面板。`
           : isLayerFallback
@@ -5512,27 +10063,39 @@ class LanhuViewer {
     }
 
     if (this.generatedPreviewFrameLabel) {
-      this.generatedPreviewFrameLabel.textContent = fileCount && this.generatedPreviewHtml
-        ? `${designName} · ${isLayerFallback ? '图层兜底预览' : isModuleFallback ? `${frameworkLabel} 修复预览` : `${frameworkLabel} 页面`}`
+      this.generatedPreviewFrameLabel.textContent = fileCount && hasRenderablePreview
+        ? `${designName} · ${isLayerFallback ? '图层兜底预览' : isStructuredFallback ? `${frameworkLabel} 重建预览` : isModuleFallback ? `${frameworkLabel} 修复预览` : `${frameworkLabel} 页面`}`
         : isGenerating
           ? `${designName} · ${frameworkLabel} 生成中`
+          : isRecipeDraft
+            ? `${designName} · ${recipeDraftProviderLabel} Recipe 草稿`
           : fileCount
             ? `${designName} · ${frameworkLabel} 代码`
             : '实时页面预览';
     }
 
     if (this.openHtmlInNewTabBtn) {
-      this.openHtmlInNewTabBtn.disabled = !this.generatedPreviewHtml;
-      this.openHtmlInNewTabBtn.title = this.generatedPreviewHtml
+      this.openHtmlInNewTabBtn.disabled = !hasRenderablePreview;
+      this.openHtmlInNewTabBtn.title = hasRenderablePreview
         ? '在新标签页打开当前生成页面'
         : `${frameworkLabel} 当前没有可直接预览的页面`;
     }
 
     if (this.generatedCodePrimaryBtn) {
-      this.generatedCodePrimaryBtn.hidden = !primaryAction.visible;
+      const primaryLabel = String(primaryAction.label || '').trim();
+      this.generatedCodePrimaryBtn.hidden = !primaryAction.visible || !primaryLabel;
       this.generatedCodePrimaryBtn.disabled = primaryAction.disabled;
-      this.generatedCodePrimaryBtn.textContent = primaryAction.label;
+      this.generatedCodePrimaryBtn.textContent = primaryLabel;
       this.generatedCodePrimaryBtn.title = primaryAction.title;
+    }
+
+    if (this.draftRecipeBtn) {
+      this.draftRecipeBtn.disabled = this.isGeneratingStructuredRecipeDraft;
+      this.draftRecipeBtn.title = designName ? `为 ${designName} 生成本地 Claude recipe 草稿并自动应用到当前预览` : '生成本地 Claude recipe 草稿并自动应用到当前预览';
+    }
+    if (this.generatedCodeDraftBtn) {
+      this.generatedCodeDraftBtn.disabled = this.isGeneratingStructuredRecipeDraft;
+      this.generatedCodeDraftBtn.title = designName ? `为 ${designName} 生成本地 Claude recipe 草稿并自动应用到当前预览` : '生成本地 Claude recipe 草稿并自动应用到当前预览';
     }
 
     this.renderGeneratedPreviewDiagnostics();
@@ -5550,6 +10113,7 @@ class LanhuViewer {
 
     if (!design) {
       return {
+        action: 'select-design',
         visible: true,
         disabled: true,
         label: '请选择设计图',
@@ -5559,6 +10123,7 @@ class LanhuViewer {
 
     if (this.isGeneratingHtmlPreview || ['queued', 'running'].includes(taskStatus)) {
       return {
+        action: 'loading',
         visible: true,
         disabled: true,
         label: '生成中...',
@@ -5568,15 +10133,17 @@ class LanhuViewer {
 
     if (hasLoadedCode) {
       return {
-        visible: false,
+        action: 'regenerate',
+        visible: true,
         disabled: false,
-        label: '',
-        title: ''
+        label: `重新生成${frameworkLabel}代码`,
+        title: `重新读取蓝湖 ${frameworkLabel} 代码`
       };
     }
 
     if (hasCachedCode) {
       return {
+        action: 'restore-cache',
         visible: true,
         disabled: false,
         label: `打开已缓存${frameworkLabel}代码`,
@@ -5586,6 +10153,7 @@ class LanhuViewer {
 
     if (resumableJob && resumableJob.task?.status !== 'error') {
       return {
+        action: 'resume-job',
         visible: true,
         disabled: false,
         label: `继续同步${frameworkLabel}进度`,
@@ -5595,6 +10163,7 @@ class LanhuViewer {
 
     if (taskStatus === 'error') {
       return {
+        action: 'retry',
         visible: true,
         disabled: false,
         label: `重新生成${frameworkLabel}代码`,
@@ -5603,6 +10172,7 @@ class LanhuViewer {
     }
 
     return {
+      action: 'start',
       visible: true,
       disabled: false,
       label: `开始生成${frameworkLabel}代码`,
@@ -5615,33 +10185,264 @@ class LanhuViewer {
     if (actionState.disabled) {
       return;
     }
-    this.generateHtmlPreview();
+    const action = String(actionState.action || '').trim();
+    const design = this.getSelectedDesign();
+    const framework = this.getSelectedGeneratedFramework();
+    if (action === 'resume-job' && design) {
+      const restored = this.restoreGeneratedCodeJob(design, {
+        autoShow: true,
+        silent: false,
+        framework
+      });
+      if (restored) {
+        return;
+      }
+    }
+    const forceReload = action === 'regenerate' || action === 'retry';
+    this.generateHtmlPreview({ forceReload });
+  }
+
+  buildStructuredPreviewDraftOutputFiles(structuredHtml = '', files = []) {
+    const outputFiles = [];
+    const seenNames = new Set();
+    const appendFile = (file) => {
+      if (!file || typeof file.name !== 'string' || typeof file.content !== 'string') {
+        return;
+      }
+      const fileName = String(file.name || '').trim();
+      if (!fileName || seenNames.has(fileName)) {
+        return;
+      }
+      seenNames.add(fileName);
+      outputFiles.push({
+        name: fileName,
+        content: file.content,
+        kind: file.kind || ''
+      });
+    };
+
+    if (structuredHtml) {
+      appendFile({
+        name: 'index.html',
+        content: structuredHtml,
+        kind: 'structured-preview'
+      });
+    }
+
+    (Array.isArray(files) ? files : []).forEach((file) => appendFile(file));
+    return outputFiles;
+  }
+
+  applyStructuredPreviewRecipeDraftResponse(data = {}, {
+    design = this.getSelectedDesign(),
+    layerContext = this.getGeneratedPreviewLayerContext(design),
+    autoApply = true
+  } = {}) {
+    const resolvedDesign = this.resolveDesignEntity(design);
+    const runtimeRecipe = this.persistStructuredPreviewRuntimeRecipe(data?.draft?.recipe, {
+      design: resolvedDesign,
+      provider: data?.provider,
+      familyName: data?.familyName,
+      strategy: data?.strategy
+    });
+
+    const resolvedLayerContext = layerContext || this.getGeneratedPreviewLayerContext(resolvedDesign);
+    const structuredHtml = autoApply && runtimeRecipe && resolvedLayerContext?.layers?.length
+      ? this.buildStructuredGeneratedPreviewHtml(resolvedDesign, resolvedLayerContext)
+      : '';
+    const outputFiles = this.buildStructuredPreviewDraftOutputFiles(structuredHtml, data?.files);
+    const previousRepairState = this.generatedPreviewRepairState && typeof this.generatedPreviewRepairState === 'object'
+      ? this.generatedPreviewRepairState
+      : this.createInitialGeneratedPreviewRepairState();
+
+    this.generatedPreviewRepairState = {
+      ...previousRepairState,
+      mode: structuredHtml ? 'structured' : previousRepairState.mode,
+      reason: String(data?.summary || previousRepairState.reason || '').trim(),
+      draftType: 'claude-recipe-draft',
+      draftProvider: String(data?.provider || 'claude').trim(),
+      draftStrategy: String(data?.strategy || '').trim(),
+      draftFamilyName: String(data?.familyName || '').trim(),
+      draftDurationMs: Math.max(0, Math.round(Number(data?.durationMs) || 0)),
+      draftRecipeId: String(runtimeRecipe?.id || '').trim(),
+      draftApplied: Boolean(structuredHtml),
+      previewHtml: structuredHtml || previousRepairState.previewHtml || '',
+      outputFiles,
+      updatedAt: Date.now()
+    };
+
+    if (outputFiles.length > 0) {
+      this.generatedCodeFileName = structuredHtml ? 'index.html' : (outputFiles[0]?.name || this.generatedCodeFileName);
+    }
+
+    this.refreshGeneratedCodeOutput();
+    this.renderGeneratedCodeTask();
+    if (structuredHtml) {
+      this.showHtmlPreview({ revealCodePanel: true });
+    }
+
+    return {
+      recipe: runtimeRecipe,
+      structuredHtml,
+      applied: Boolean(structuredHtml),
+      outputFiles
+    };
+  }
+
+  async generateStructuredPreviewRecipeDraft({
+    design = this.getSelectedDesign(),
+    autoApply = true,
+    silent = false,
+    trigger = 'manual'
+  } = {}) {
+    const resolvedDesign = this.resolveDesignEntity(design);
+    if (!resolvedDesign?.id || !this.currentTeamId || !this.currentProjectId || !this.sessionId) {
+      if (!silent) {
+        this.showToast('请先选择设计图并保持登录状态', 'error');
+      }
+      return null;
+    }
+
+    const requestKey = String(resolvedDesign.id || '').trim();
+    if (!requestKey) {
+      return null;
+    }
+    if (this.structuredRecipeDraftRequests.has(requestKey)) {
+      return this.structuredRecipeDraftRequests.get(requestKey);
+    }
+
+    const headerDraftLabel = this.draftRecipeBtn?.textContent || 'Claude草稿';
+    const taskDraftLabel = this.generatedCodeDraftBtn?.textContent || 'Claude草稿';
+    this.isGeneratingStructuredRecipeDraft = true;
+    if (this.draftRecipeBtn) {
+      this.draftRecipeBtn.disabled = true;
+      this.draftRecipeBtn.textContent = '草稿生成中...';
+    }
+    if (this.generatedCodeDraftBtn) {
+      this.generatedCodeDraftBtn.disabled = true;
+      this.generatedCodeDraftBtn.textContent = '草稿生成中...';
+    }
+    if (silent && trigger === 'auto') {
+      this.log(`检测到 ${resolvedDesign.name} 缺少适配 recipe，正在调用本地 Claude 自动生成草稿...`, 'info');
+    }
+
+    const requestPromise = (async () => {
+      let layerContext = this.getGeneratedPreviewLayerContext(resolvedDesign);
+      if (!layerContext) {
+        layerContext = await this.ensureGeneratedPreviewLayerContext(resolvedDesign).catch(() => null);
+      }
+      const draftLayers = Array.isArray(layerContext?.layers) ? layerContext.layers : [];
+
+      const response = await fetch('/api/structured-preview/recipe-draft', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Session-Id': this.sessionId
+        },
+        body: JSON.stringify({
+          teamId: this.currentTeamId,
+          projectId: this.currentProjectId,
+          imageId: resolvedDesign.id,
+          designName: resolvedDesign.name,
+          previewUrl: resolvedDesign.url || resolvedDesign.previewUrl || resolvedDesign.preview_url || '',
+          layers: draftLayers
+        })
+      });
+
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data?.success === false) {
+        throw new Error(data?.message || '本地 Claude recipe 草稿生成失败');
+      }
+
+      const applyResult = this.applyStructuredPreviewRecipeDraftResponse(data, {
+        design: resolvedDesign,
+        layerContext,
+        autoApply
+      });
+
+      const durationSeconds = this.generatedPreviewRepairState.draftDurationMs > 0
+        ? (this.generatedPreviewRepairState.draftDurationMs / 1000).toFixed(1)
+        : '';
+      const layerSourceLabelMap = {
+        'client-cache': '前端缓存图层',
+        'lanhu-mcp': 'lanhu-mcp 图层',
+        'lanhu-local': '本地图层拉取'
+      };
+      const layerSourceLabel = layerSourceLabelMap[String(data?.layerSource || '').trim()] || '';
+      const layerCountText = Number(data?.layerCount) > 0 ? `，${data.layerCount} 个图层` : '';
+      const actionLabel = applyResult.applied ? '生成并应用' : '生成';
+      this.log(`本地 Claude 已为 ${resolvedDesign.name} ${actionLabel} recipe 草稿`, 'success');
+      if (!silent || trigger === 'manual' || applyResult.applied) {
+        this.showToast(
+          durationSeconds
+            ? `本地 Claude 草稿已${applyResult.applied ? '生成并应用' : '生成'}（${durationSeconds}s${layerSourceLabel ? `，${layerSourceLabel}` : ''}${layerCountText}）`
+            : `本地 Claude 草稿已${applyResult.applied ? '生成并应用' : '生成'}${layerSourceLabel ? `（${layerSourceLabel}${layerCountText}）` : ''}`
+        );
+      }
+      return {
+        ...applyResult,
+        data
+      };
+    })().catch((error) => {
+      if (!silent) {
+        this.showToast(error.message || '本地 Claude 草稿生成失败', 'error');
+      }
+      this.log(`本地 Claude recipe 草稿生成失败: ${error.message || '未知错误'}`, silent ? 'warn' : 'error');
+      return null;
+    }).finally(() => {
+      this.structuredRecipeDraftRequests.delete(requestKey);
+      this.isGeneratingStructuredRecipeDraft = this.structuredRecipeDraftRequests.size > 0;
+      if (this.draftRecipeBtn) {
+        this.draftRecipeBtn.disabled = false;
+        this.draftRecipeBtn.textContent = headerDraftLabel;
+      }
+      if (this.generatedCodeDraftBtn) {
+        this.generatedCodeDraftBtn.disabled = false;
+        this.generatedCodeDraftBtn.textContent = taskDraftLabel;
+      }
+      this.updateGeneratedCodeMeta();
+    });
+
+    this.structuredRecipeDraftRequests.set(requestKey, requestPromise);
+    return requestPromise;
   }
 
   getSelectedGeneratedFile() {
-    if (!Array.isArray(this.generatedCodeFiles) || this.generatedCodeFiles.length === 0) {
+    const files = this.getDisplayedGeneratedCodeFiles();
+    if (!files.length) {
       return null;
     }
 
     const preferredName = String(this.generatedCodeFileName || '').trim();
     if (preferredName) {
-      const matched = this.generatedCodeFiles.find((file) => file.name === preferredName);
+      const matched = files.find((file) => file.name === preferredName);
       if (matched) return matched;
     }
 
-    return this.generatedCodeFiles[0];
+    return files[0];
+  }
+
+  getDisplayedGeneratedCodeFiles() {
+    const repairedFiles = Array.isArray(this.generatedPreviewRepairState?.outputFiles)
+      ? this.generatedPreviewRepairState.outputFiles.filter((file) => file && typeof file.name === 'string')
+      : [];
+    if (repairedFiles.length > 0) {
+      return repairedFiles;
+    }
+    return Array.isArray(this.generatedCodeFiles) ? this.generatedCodeFiles : [];
   }
 
   refreshGeneratedCodeOutput() {
+    const files = this.getDisplayedGeneratedCodeFiles();
     const currentFile = this.getSelectedGeneratedFile();
     this.generatedHtmlCode = currentFile?.content || '';
 
     if (this.generatedCodeFileSelect) {
-      this.generatedCodeFileSelect.innerHTML = this.generatedCodeFiles.map((file) => {
+      this.generatedCodeFileSelect.innerHTML = files.map((file) => {
         const selected = file.name === currentFile?.name ? ' selected' : '';
         return `<option value="${this.escapeAttr(file.name)}"${selected}>${this.escapeHtml(file.name)}</option>`;
       }).join('');
-      this.generatedCodeFileSelect.disabled = this.generatedCodeFiles.length <= 1;
+      this.generatedCodeFileSelect.disabled = files.length <= 1;
     }
 
     if (this.htmlCodeOutput) {
@@ -5780,7 +10581,20 @@ class LanhuViewer {
     // scale the rendered surface. DDS pages rely heavily on absolute positioning,
     // fixed elements, and viewport units, so shrinking the internal viewport
     // itself causes false layout regressions.
-    const scale = Math.min(1, stageRect.width / metrics.width);
+    //
+    // Structured rebuild pages are fixed-height long screens. In side-by-side
+    // compare mode we should fit them by width and let the stage scroll
+    // vertically; fitting by height collapses them into a tiny full-page
+    // thumbnail, which is impossible to compare 1:1 against the design draft.
+    const repairMode = this.getGeneratedPreviewRepairMode();
+    const shouldFitByWidthOnly = repairMode === 'structured';
+    const scale = shouldFitByWidthOnly
+      ? Math.min(1, stageRect.width / metrics.width)
+      : Math.min(
+          1,
+          stageRect.width / metrics.width,
+          stageRect.height / metrics.height
+        );
     const safeScale = Number.isFinite(scale) && scale > 0 ? scale : 1;
     const scaledWidth = Math.max(1, Math.round(metrics.width * safeScale));
     const scaledHeight = Math.max(1, Math.round(metrics.height * safeScale));
@@ -6860,38 +11674,6 @@ body {
     if (right <= left || bottom <= top) return 0;
     return (right - left) * (bottom - top);
   };
-  const shouldSuppressNodeForModule = (node, rootRect, moduleBox) => {
-    if (!(node instanceof HTMLElement)) return false;
-    if (node.hasAttribute(MODULE_OVERLAY_ATTR)) return false;
-    if (node.closest(\`[\${MODULE_OVERLAY_ATTR}]\`)) return false;
-    if (node.tagName === 'SCRIPT' || node.tagName === 'STYLE' || node.tagName === 'LINK') return false;
-
-    const rect = node.getBoundingClientRect();
-    if (rect.width <= 1 || rect.height <= 1) return false;
-
-    const computed = window.getComputedStyle(node);
-    if (!computed || computed.display === 'none' || computed.visibility === 'hidden') return false;
-
-    const hasVisual = node.tagName === 'IMG' || (computed.backgroundImage && computed.backgroundImage !== 'none');
-    if (!hasVisual) return false;
-
-    const nodeBox = buildNodeBox(rect, rootRect);
-    const overlapArea = getOverlapArea(nodeBox, moduleBox);
-    if (overlapArea <= 0) return false;
-
-    const nodeArea = Math.max(1, nodeBox.width * nodeBox.height);
-    const overlapRatio = overlapArea / nodeArea;
-    const centerX = nodeBox.left + nodeBox.width / 2;
-    const centerY = nodeBox.top + nodeBox.height / 2;
-    const centerInside = (
-      centerX >= moduleBox.left &&
-      centerX <= moduleBox.left + moduleBox.width &&
-      centerY >= moduleBox.top &&
-      centerY <= moduleBox.top + moduleBox.height
-    );
-
-    return overlapRatio >= 0.58 || (centerInside && nodeArea <= moduleBox.width * moduleBox.height * 1.8);
-  };
   const applyModuleFallbackOverlays = (root, rootRect) => {
     removeModuleOverlays(root);
     clearModuleSuppressedNodes(root);
@@ -6900,19 +11682,11 @@ body {
       return;
     }
 
-    const nodes = Array.from(root.querySelectorAll('*')).filter((node) => node instanceof HTMLElement);
-
     MODULE_FALLBACK_PLAN.forEach((moduleItem, index) => {
       const box = moduleItem && typeof moduleItem.box === 'object' ? moduleItem.box : null;
       if (!box || (Number(box.width) || 0) <= 1 || (Number(box.height) || 0) <= 1) {
         return;
       }
-
-      nodes.forEach((node) => {
-        if (shouldSuppressNodeForModule(node, rootRect, box)) {
-          node.setAttribute(MODULE_SUPPRESSED_ATTR, '1');
-        }
-      });
 
       const overlay = document.createElement('div');
       overlay.setAttribute(MODULE_OVERLAY_ATTR, moduleItem.pathPrefix || moduleItem.moduleId || 'module-' + index);
@@ -7405,8 +12179,26 @@ body {
     });
   }
 
+  hasRenderableGeneratedPreview() {
+    if (this.generatedPreviewHtml) {
+      return true;
+    }
+
+    if (this.getGeneratedPreviewRepairMode() === 'structured') {
+      return Boolean(String(this.generatedPreviewRepairState?.previewHtml || '').trim());
+    }
+
+    if (this.getGeneratedPreviewRepairMode() === 'layer') {
+      return Boolean(this.getGeneratedPreviewLayerContext());
+    }
+
+    return false;
+  }
+
   buildGeneratedPreviewFrameDocument({ includeDiagnostics = true } = {}) {
-    if (!this.generatedPreviewHtml) {
+    const repairMode = this.getGeneratedPreviewRepairMode();
+    const structuredHtml = String(this.generatedPreviewRepairState?.previewHtml || '').trim();
+    if (!this.generatedPreviewHtml && !(repairMode === 'structured' && structuredHtml) && !(repairMode === 'layer' && this.getGeneratedPreviewLayerContext())) {
       if (includeDiagnostics) {
         this.generatedPreviewDiagnostics = this.createInitialGeneratedPreviewDiagnostics();
         this.renderGeneratedPreviewDiagnostics();
@@ -7414,10 +12206,20 @@ body {
       return '';
     }
 
-    if (this.getGeneratedPreviewRepairMode() === 'layer') {
+    if (repairMode === 'layer') {
       const fallbackHtml = this.buildLayerFallbackPreviewHtml();
       if (fallbackHtml) {
         return this.buildEmbeddedGeneratedPreviewHtml(fallbackHtml, {
+          includeDiagnostics,
+          includePreviewPatch: false,
+          baseHref: ''
+        });
+      }
+    }
+
+    if (repairMode === 'structured') {
+      if (structuredHtml) {
+        return this.buildEmbeddedGeneratedPreviewHtml(structuredHtml, {
           includeDiagnostics,
           includePreviewPatch: false,
           baseHref: ''
@@ -7437,7 +12239,7 @@ body {
 
   showHtmlPreview({ revealCodePanel } = {}) {
     if (!this.previewBody) return;
-    const hasPreview = Boolean(this.generatedPreviewHtml);
+    const hasPreview = this.hasRenderableGeneratedPreview();
     const isAlreadyVisible = this.previewBody.classList.contains('html-preview-visible') && hasPreview;
 
     const shouldShowCodePanel = typeof revealCodePanel === 'boolean'
@@ -7461,6 +12263,9 @@ body {
         : '';
       if (hasPreview) {
         this.scheduleGeneratedPreviewRefitSequence();
+        if (this.generatedPreviewHtml && this.getGeneratedPreviewRepairMode() === 'dds' && !this.getGeneratedPreviewLayerContext()) {
+          void this.primeGeneratedPreviewRepairContext();
+        }
       } else {
         this.clearGeneratedPreviewFitTimers();
       }
@@ -7616,7 +12421,7 @@ body {
   }
 
   openGeneratedHtmlInNewTab() {
-    if (!this.generatedPreviewHtml) {
+    if (!this.hasRenderableGeneratedPreview()) {
       this.showToast(`${this.getGeneratedFrameworkLabel(this.generatedCodeFramework || this.getSelectedGeneratedFramework())} 当前没有可直接预览的页面`, 'error');
       return;
     }
@@ -7635,8 +12440,11 @@ body {
 
   updateAnnotationPreviewButton() {
     if (!this.annotatePreviewBtn) return;
-    this.annotatePreviewBtn.classList.toggle('active', this.isAnnotationPreview);
-    this.annotatePreviewBtn.textContent = this.isAnnotationPreview ? '查看原图' : '标注图';
+    const multiPreview = this.isMultiPreviewMode();
+    this.annotatePreviewBtn.classList.toggle('active', !multiPreview && this.isAnnotationPreview);
+    this.annotatePreviewBtn.textContent = (!multiPreview && this.isAnnotationPreview) ? '查看原图' : '标注图';
+    this.annotatePreviewBtn.disabled = multiPreview;
+    this.annotatePreviewBtn.title = multiPreview ? '多选预览时不可用，请先单选一张设计图' : '通过 lanhu-mcp 生成图层标注图';
   }
 
   revokeAnnotationObjectUrl() {
@@ -7657,6 +12465,10 @@ body {
   }
 
   async toggleAnnotationPreview() {
+    if (this.isMultiPreviewMode()) {
+      this.showToast('多选预览下暂不支持标注图，请先单选一张设计图', 'error');
+      return;
+    }
     if (!this.selectedDesignId || !this.currentTeamId || !this.currentProjectId) {
       this.showToast('请先选择设计图', 'error');
       return;
@@ -7676,10 +12488,7 @@ body {
 
     if (this.isLayerMode) {
       this.isLayerMode = false;
-      if (this.layerModeBtn) {
-        this.layerModeBtn.classList.remove('active');
-        this.layerModeBtn.textContent = '图层解析';
-      }
+      this.syncLayerModeButton();
       this.hideLayerAnnotations();
     }
 
@@ -7728,30 +12537,48 @@ body {
     canvasInfo = this.canvasInfo,
     slices = null,
     preferredWidth = 0,
-    preferredHeight = 0
+    preferredHeight = 0,
+    enableInspector = true,
+    recipe = null
   } = {}) {
     const resolvedLayers = Array.isArray(layers) ? layers : [];
     const resolvedSlices = Array.isArray(slices) ? slices : this.getAvailableSlicesForHtml();
-    const preferredCanvasWidth = Math.max(1, Math.round(
-      Number(preferredWidth) ||
+    const explicitCanvasWidth = Math.max(0, Math.round(Number(preferredWidth) || 0));
+    const explicitCanvasHeight = Math.max(0, Math.round(Number(preferredHeight) || 0));
+    const canvasWidthHint = Math.max(0, Math.round(
       (Number(canvasInfo?.width) >= 320 ? Number(canvasInfo?.width) : 0) ||
       (Number(design?.width) >= 320 ? Number(design?.width) : 0) ||
       Number(this.previewImage?.naturalWidth) ||
-      1
+      0
     ));
-    const preferredCanvasHeight = Math.max(1, Math.round(
-      Number(preferredHeight) ||
+    const canvasHeightHint = Math.max(0, Math.round(
       Number(canvasInfo?.height) ||
       Number(design?.height) ||
       Number(this.previewImage?.naturalHeight) ||
-      1
+      0
     ));
     const backgroundImageUrl = design?.url ? this.getProxiedImageUrl(design.url) : '';
-    const normalized = this.buildRenderableModuleLayers(resolvedLayers, {
+    const sceneProfile = this.buildStructuredPreviewSceneProfile(design, {
+      layers: resolvedLayers,
+      canvasInfo,
       slices: resolvedSlices,
-      targetWidth: preferredCanvasWidth,
-      targetHeight: preferredCanvasHeight,
-      useDirectLayerImages: true
+      preferredWidth: explicitCanvasWidth,
+      preferredHeight: explicitCanvasHeight,
+      widthHint: canvasWidthHint,
+      heightHint: canvasHeightHint,
+      recipe
+    });
+    const normalizedScene = this.normalizeStructuredPreviewSceneLayers(resolvedLayers, sceneProfile);
+    const normalized = this.buildRenderableModuleLayers(normalizedScene.layers, {
+      slices: resolvedSlices,
+      targetWidth: explicitCanvasWidth || Number(sceneProfile?.canvasWidth) || canvasWidthHint,
+      targetHeight: explicitCanvasHeight || Number(sceneProfile?.canvasHeight) || canvasHeightHint,
+      originX: Number(sceneProfile?.frameLeft),
+      originY: Number(sceneProfile?.frameTop),
+      sourceWidth: Number(sceneProfile?.frameWidth),
+      sourceHeight: Number(sceneProfile?.frameHeight),
+      useDirectLayerImages: sceneProfile.preferDirectLayerImages,
+      sceneProfile
     });
     const layerHtml = normalized.layers
       .map((layer, index) => this.renderLayerToHtml(layer, index))
@@ -7807,7 +12634,7 @@ body {
       z-index: 1;
       white-space: pre-wrap;
       word-break: break-word;
-      cursor: pointer;
+      cursor: ${enableInspector ? 'pointer' : 'default'};
     }
     .lh-image {
       white-space: normal;
@@ -7838,6 +12665,7 @@ body {
       pointer-events: none;
       z-index: 2147483647;
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      display: ${enableInspector ? 'block' : 'none'};
     }
     .lh-inspector-title {
       font-weight: 700;
@@ -7857,6 +12685,7 @@ body {
     ${backgroundLayer}
     ${layerHtml}
   </div>
+  ${enableInspector ? `
   <div class="lh-inspector" id="lhInspector">
     <div class="lh-inspector-title">图层检查</div>
     <div class="lh-inspector-empty" id="lhInspectorEmpty">点击图层可选中；同一位置重复点击可切换重叠图层</div>
@@ -7864,6 +12693,8 @@ body {
     <div class="lh-inspector-row" id="lhInspectorPath" style="display:none;"></div>
     <div class="lh-inspector-row" id="lhInspectorMeta" style="display:none;"></div>
   </div>
+  ` : ''}
+  ${enableInspector ? `
   <script>
     (() => {
       const canvas = document.querySelector('.lh-canvas');
@@ -7944,8 +12775,520 @@ body {
       });
     })();
   </script>
+  ` : ''}
 </body>
 </html>`;
+  }
+
+  buildStructuredPreviewSceneProfile(design, {
+    layers = [],
+    canvasInfo = null,
+    slices = [],
+    preferredWidth = 0,
+    preferredHeight = 0,
+    widthHint = 0,
+    heightHint = 0,
+    recipe = null
+  } = {}) {
+    const resolvedLayers = Array.isArray(layers) ? layers.filter((layer) => layer && typeof layer === 'object') : [];
+    const visibleLayers = resolvedLayers.filter((layer) => layer.visible !== false);
+    const minX = visibleLayers.length ? Math.min(...visibleLayers.map((layer) => Number(layer.x) || 0)) : 0;
+    const minY = visibleLayers.length ? Math.min(...visibleLayers.map((layer) => Number(layer.y) || 0)) : 0;
+    const maxRight = visibleLayers.length ? Math.max(...visibleLayers.map((layer) => (Number(layer.x) || 0) + (Number(layer.width) || 0))) : 0;
+    const maxBottom = visibleLayers.length ? Math.max(...visibleLayers.map((layer) => (Number(layer.y) || 0) + (Number(layer.height) || 0))) : 0;
+    const estimatedWidth = Math.max(1, Math.round(maxRight - minX));
+    const estimatedHeight = Math.max(1, Math.round(maxBottom - minY));
+    const explicitCanvasWidth = Math.round(Number(preferredWidth) || 0);
+    const explicitCanvasHeight = Math.round(Number(preferredHeight) || 0);
+    const canvasInfoWidth = Math.round(Number(canvasInfo?.width) || 0);
+    const canvasInfoHeight = Math.round(Number(canvasInfo?.height) || 0);
+    const designWidth = Math.round(Number(design?.width) || 0);
+    const designHeight = Math.round(Number(design?.height) || 0);
+    const hintedCanvasWidth = Math.max(0, Math.round(
+      Number(widthHint) ||
+      (canvasInfoWidth >= 320 ? canvasInfoWidth : 0) ||
+      (designWidth >= 320 ? designWidth : 0) ||
+      0
+    ));
+    const hintedCanvasHeight = Math.max(0, Math.round(
+      Number(heightHint) ||
+      canvasInfoHeight ||
+      designHeight ||
+      0
+    ));
+    const boundedWidthCandidates = visibleLayers
+      .map((layer) => Math.round(Number(layer?.width) || 0))
+      .filter((width) => width >= 320 && width <= 960);
+    const dominantLayerWidth = boundedWidthCandidates.length ? Math.max(...boundedWidthCandidates) : 0;
+    const mainFrame = this.buildStructuredPreviewMainContentFrame(visibleLayers, {
+      widthHint: hintedCanvasWidth,
+      heightHint: hintedCanvasHeight
+    });
+    const trustedCanvasWidth = (
+      hintedCanvasWidth >= 320 &&
+      (
+        !mainFrame ||
+        Math.abs(hintedCanvasWidth - Number(mainFrame.width || 0)) <= Math.max(48, Math.round(Number(mainFrame.width || 0) * 0.18))
+      )
+    ) ? hintedCanvasWidth : 0;
+    const trustedCanvasHeight = (
+      hintedCanvasHeight >= 640 &&
+      (
+        !mainFrame ||
+        hintedCanvasHeight >= Math.round(Number(mainFrame.height || 0) * 0.72)
+      )
+    ) ? hintedCanvasHeight : 0;
+    const canvasWidth = Math.max(
+      1,
+      explicitCanvasWidth > 1
+        ? explicitCanvasWidth
+        : Number(mainFrame?.width) > 1
+          ? Math.round(Number(mainFrame.width))
+          : trustedCanvasWidth > 0
+            ? trustedCanvasWidth
+            : dominantLayerWidth >= 320
+              ? dominantLayerWidth
+              : designWidth >= 320
+                ? designWidth
+                : estimatedWidth
+    );
+    const canvasHeight = Math.max(
+      1,
+      explicitCanvasHeight > 1
+        ? explicitCanvasHeight
+        : Number(mainFrame?.height) > 1
+          ? Math.round(Number(mainFrame.height))
+          : trustedCanvasHeight > 0
+            ? trustedCanvasHeight
+            : designHeight >= 640
+              ? designHeight
+              : estimatedHeight
+    );
+    const aspectRatio = canvasHeight / Math.max(1, canvasWidth);
+    const textLayers = visibleLayers.filter((layer) => this.resolveLayerText(layer).trim().length > 0);
+    const imageLayers = visibleLayers.filter((layer) => layer.has_image && layer.image);
+    const keywordSource = [
+      String(design?.name || ''),
+      ...visibleLayers.slice(0, 160).map((layer) => `${String(layer?.name || '')} ${String(layer?.path || '')}`)
+    ].join(' ');
+    const rankingKeywordCount = (keywordSource.match(/榜单|排行|日榜|总榜|TOP|排名|距离上一名/gi) || []).length;
+    const boardKeywordCount = (keywordSource.match(/棋盘|格子|起点|终点|骰子|进\d+格|退\d+格|灯牌/gi) || []).length;
+    const repeatedNameCounts = new Map();
+    visibleLayers.forEach((layer) => {
+      const key = String(layer?.name || '').trim() || String(layer?.path || '').trim().split('/').slice(-1)[0] || '';
+      if (!key) return;
+      repeatedNameCounts.set(key, (repeatedNameCounts.get(key) || 0) + 1);
+    });
+    const repeatedClusterCount = Array.from(repeatedNameCounts.values()).filter((count) => count >= 4).length;
+    const options = recipe?.options && typeof recipe.options === 'object' ? recipe.options : {};
+    const componentPreset = String(options.componentPreset || '').trim().toLowerCase();
+    const componentKeys = Array.isArray(options.componentKeys) ? options.componentKeys.map((item) => String(item || '').trim()) : [];
+
+    let kind = 'poster';
+    if (
+      aspectRatio >= 3.2 && (
+        rankingKeywordCount >= 2 ||
+        componentPreset.includes('rank') ||
+        componentKeys.some((item) => /rank|tab/i.test(item)) ||
+        repeatedClusterCount >= 6 ||
+        (visibleLayers.length >= 240 && textLayers.length >= 24)
+      )
+    ) {
+      kind = 'list';
+    } else if (
+      aspectRatio >= 4 &&
+      (boardKeywordCount >= 2 || /灯牌/.test(String(design?.name || '')))
+    ) {
+      kind = 'board';
+    }
+
+    return {
+      kind,
+      canvasWidth,
+      canvasHeight,
+      frameLeft: Math.round(Number(mainFrame?.left) || 0),
+      frameTop: Math.max(0, Math.round(Number(mainFrame?.top) || 0)),
+      frameWidth: Math.max(1, Math.round(Number(mainFrame?.width) || canvasWidth)),
+      frameHeight: Math.max(1, Math.round(Number(mainFrame?.height) || canvasHeight)),
+      frameConfidence: Number(mainFrame?.confidence) || 0,
+      frameAnchorCount: Number(mainFrame?.anchorCount) || 0,
+      estimatedWidth,
+      estimatedHeight,
+      aspectRatio,
+      totalLayers: visibleLayers.length,
+      textLayerCount: textLayers.length,
+      imageLayerCount: imageLayers.length,
+      sliceCount: Array.isArray(slices) ? slices.length : 0,
+      repeatedClusterCount,
+      rankingKeywordCount,
+      boardKeywordCount,
+      preferDirectLayerImages: true,
+      suppressImageBackedText: true,
+      textCoverageThreshold: kind === 'list' ? 0.24 : kind === 'board' ? 0.5 : 0.8,
+      preserveOnlyStructuralText: kind === 'list',
+      allowOffCanvasOverflowRatio: kind === 'list' ? 0.6 : kind === 'board' ? 0.4 : 0.25
+    };
+  }
+
+  buildStructuredPreviewMainContentFrame(layers = [], {
+    widthHint = 0,
+    heightHint = 0
+  } = {}) {
+    const validLayers = Array.isArray(layers)
+      ? layers.filter((layer) => {
+          if (!layer || layer.visible === false) return false;
+          const width = Number(layer.width) || 0;
+          const height = Number(layer.height) || 0;
+          return width > 8 && height > 8;
+        })
+      : [];
+    if (!validLayers.length) {
+      return null;
+    }
+
+    const bucketValue = (value, step = 10) => Math.round((Number(value) || 0) / step) * step;
+    const sectionBounds = new Map();
+    validLayers.forEach((layer) => {
+      const prefix = this.getLayerModulePrefix(layer.path || '');
+      if (!prefix) return;
+      const current = sectionBounds.get(prefix) || {
+        minX: Infinity,
+        minY: Infinity,
+        maxRight: -Infinity,
+        maxBottom: -Infinity,
+        count: 0
+      };
+      const x = Number(layer.x) || 0;
+      const y = Number(layer.y) || 0;
+      const width = Number(layer.width) || 0;
+      const height = Number(layer.height) || 0;
+      current.minX = Math.min(current.minX, x);
+      current.minY = Math.min(current.minY, y);
+      current.maxRight = Math.max(current.maxRight, x + width);
+      current.maxBottom = Math.max(current.maxBottom, y + height);
+      current.count += 1;
+      sectionBounds.set(prefix, current);
+    });
+
+    const widthScores = new Map();
+    validLayers.forEach((layer) => {
+      const width = Math.round(Number(layer.width) || 0);
+      const height = Math.round(Number(layer.height) || 0);
+      if (width < 560 || width > 960) return;
+      const bucket = bucketValue(width, 10);
+      const widthWeight = Math.max(0.8, Math.min(1.8, width / 680));
+      const heightWeight = Math.max(1, Math.min(height, 640));
+      widthScores.set(bucket, (widthScores.get(bucket) || 0) + (widthWeight * heightWeight));
+    });
+    sectionBounds.forEach((section, prefix) => {
+      if (!String(prefix || '').includes('/')) return;
+      const width = Math.round(section.maxRight - section.minX);
+      const height = Math.round(section.maxBottom - section.minY);
+      if (width < 560 || width > 960) return;
+      if (section.count < 2 && height < 160) return;
+      const bucket = bucketValue(width, 10);
+      const widthWeight = Math.max(1.1, Math.min(2.1, width / 680));
+      const heightWeight = Math.max(80, Math.min(height, 1600));
+      const sectionWeight = heightWeight * widthWeight * (section.count >= 3 ? 2.4 : 1.6);
+      widthScores.set(bucket, (widthScores.get(bucket) || 0) + sectionWeight);
+    });
+    if (widthHint >= 560 && widthHint <= 960) {
+      const bucket = bucketValue(widthHint, 10);
+      widthScores.set(bucket, (widthScores.get(bucket) || 0) + 1200);
+    }
+
+    const widthCandidates = Array.from(widthScores.entries())
+      .sort((a, b) => b[1] - a[1] || b[0] - a[0])
+      .slice(0, 6)
+      .map(([width]) => width);
+    if (!widthCandidates.length) {
+      return null;
+    }
+
+    let best = null;
+    widthCandidates.forEach((candidateWidth) => {
+      const leftScores = new Map();
+      validLayers.forEach((layer) => {
+        const width = Number(layer.width) || 0;
+        if (Math.abs(width - candidateWidth) > Math.max(36, candidateWidth * 0.14)) {
+          return;
+        }
+        const bucket = bucketValue(Number(layer.x) || 0, 10);
+        const closeness = 1 - Math.min(1, Math.abs(width - candidateWidth) / Math.max(1, candidateWidth * 0.14));
+        const heightWeight = Math.max(1, Math.min(Number(layer.height) || 0, 720));
+        leftScores.set(bucket, (leftScores.get(bucket) || 0) + (heightWeight * (1 + closeness)));
+      });
+      sectionBounds.forEach((section, prefix) => {
+        if (!String(prefix || '').includes('/')) return;
+        const width = Number(section.maxRight - section.minX) || 0;
+        const height = Number(section.maxBottom - section.minY) || 0;
+        if (Math.abs(width - candidateWidth) > Math.max(32, candidateWidth * 0.1)) {
+          return;
+        }
+        const bucket = bucketValue(section.minX, 10);
+        const sectionWeight = Math.max(120, Math.min(height, 1800)) * (section.count >= 3 ? 2.2 : 1.3);
+        leftScores.set(bucket, (leftScores.get(bucket) || 0) + sectionWeight);
+      });
+
+      const leftCandidates = Array.from(leftScores.entries())
+        .sort((a, b) => b[1] - a[1] || a[0] - b[0])
+        .slice(0, 8)
+        .map(([left]) => left);
+      if (!leftCandidates.length) {
+        leftCandidates.push(0);
+      }
+
+      leftCandidates.forEach((candidateLeft) => {
+        const frameRect = { left: candidateLeft, width: candidateWidth };
+        const segments = [];
+        let score = 0;
+        let anchorCount = 0;
+        let minTop = Infinity;
+        let maxBottom = -Infinity;
+
+        validLayers.forEach((layer) => {
+          const overlapRatio = this.getStructuredPreviewHorizontalOverlapRatio(layer, frameRect);
+          if (overlapRatio < 0.32) {
+            return;
+          }
+
+          const layerWidth = Number(layer.width) || 0;
+          const layerHeight = Number(layer.height) || 0;
+          if (layerWidth > candidateWidth * 2.6 && !layer.has_image) {
+            return;
+          }
+
+          const x = Number(layer.x) || 0;
+          const y = Number(layer.y) || 0;
+          const centered = (
+            x >= candidateLeft - candidateWidth * 0.18 &&
+            x + layerWidth <= candidateLeft + candidateWidth * 1.18
+          );
+          const widthWeight = Math.max(0.45, Math.min(1.35, layerWidth / Math.max(1, candidateWidth)));
+          const heightWeight = Math.max(1, Math.min(layerHeight, 480));
+          score += heightWeight * widthWeight * (centered ? 1.15 : 1);
+          segments.push([y, y + layerHeight]);
+          minTop = Math.min(minTop, y);
+          maxBottom = Math.max(maxBottom, y + layerHeight);
+
+          if (Math.abs(layerWidth - candidateWidth) <= Math.max(24, candidateWidth * 0.08)) {
+            anchorCount += 1;
+          }
+        });
+
+        if (!segments.length) {
+          return;
+        }
+
+        const verticalCoverage = this.getStructuredPreviewMergedIntervalLength(segments);
+        const hintBonus = widthHint > 0
+          ? Math.max(0, 600 - Math.abs(candidateWidth - widthHint) * 8)
+          : 0;
+        const sectionBonus = Array.from(sectionBounds.entries()).reduce((total, [prefix, section]) => {
+          if (!String(prefix || '').includes('/')) {
+            return total;
+          }
+          const sectionWidth = Number(section.maxRight - section.minX) || 0;
+          const sectionHeight = Number(section.maxBottom - section.minY) || 0;
+          if (sectionWidth <= 0 || sectionHeight <= 0) {
+            return total;
+          }
+          const overlapRatio = this.getStructuredPreviewHorizontalOverlapRatio(
+            { x: section.minX, width: sectionWidth },
+            frameRect
+          );
+          if (overlapRatio < 0.45) {
+            return total;
+          }
+          return total + Math.max(40, Math.min(sectionHeight, 1200)) * (section.count >= 3 ? 1.25 : 0.75);
+        }, 0);
+        const totalScore = (verticalCoverage * 4) + score + (anchorCount * 40) + hintBonus + sectionBonus;
+        const candidate = {
+          left: candidateLeft,
+          top: Math.max(0, Math.round(minTop)),
+          width: Math.round(candidateWidth),
+          height: Math.max(1, Math.round(maxBottom - Math.max(0, minTop))),
+          score: totalScore,
+          anchorCount,
+          verticalCoverage
+        };
+
+        if (
+          !best ||
+          candidate.score > best.score ||
+          (candidate.score === best.score && candidate.anchorCount > best.anchorCount) ||
+          (candidate.score === best.score && candidate.anchorCount === best.anchorCount && candidate.width > best.width)
+        ) {
+          best = candidate;
+        }
+      });
+    });
+
+    if (!best) {
+      return null;
+    }
+
+    const snappedSection = Array.from(sectionBounds.entries())
+      .filter(([prefix, section]) => {
+        if (!String(prefix || '').includes('/')) return false;
+        const width = Number(section.maxRight - section.minX) || 0;
+        const height = Number(section.maxBottom - section.minY) || 0;
+        if (width < Math.max(560, best.width) || width > 960) return false;
+        if (width > best.width * 1.22) return false;
+        if (Math.abs((Number(section.minX) || 0) - best.left) > 48) return false;
+        return height >= 72 || section.count >= 3;
+      })
+      .sort((leftEntry, rightEntry) => {
+        const leftSection = leftEntry[1];
+        const rightSection = rightEntry[1];
+        const leftWidth = Number(leftSection.maxRight - leftSection.minX) || 0;
+        const rightWidth = Number(rightSection.maxRight - rightSection.minX) || 0;
+        const leftHeight = Number(leftSection.maxBottom - leftSection.minY) || 0;
+        const rightHeight = Number(rightSection.maxBottom - rightSection.minY) || 0;
+        return rightWidth - leftWidth || rightHeight - leftHeight;
+      })[0] || null;
+
+    if (snappedSection) {
+      const section = snappedSection[1];
+      const snappedWidth = Math.round(Number(section.maxRight - section.minX) || best.width);
+      const snappedLeft = Number.isFinite(Number(section.minX))
+        ? Math.round(Number(section.minX))
+        : best.left;
+      if (snappedWidth > best.width) {
+        best = {
+          ...best,
+          left: snappedLeft,
+          width: snappedWidth,
+          height: Math.max(best.height, Math.round((Number(section.maxBottom) || 0) - best.top))
+        };
+      }
+    }
+
+    const hintedHeight = Math.round(Number(heightHint) || 0);
+    const finalHeight = (
+      hintedHeight >= Math.round(best.height * 0.72)
+        ? Math.max(best.height, hintedHeight)
+        : best.height
+    );
+
+    return {
+      left: best.left,
+      top: best.top,
+      width: best.width,
+      height: finalHeight,
+      confidence: Math.max(0, Math.min(1, (
+        (Math.min(best.anchorCount, 12) / 12) * 0.45 +
+        (Math.min(best.verticalCoverage, finalHeight) / Math.max(1, finalHeight)) * 0.55
+      ))),
+      anchorCount: best.anchorCount
+    };
+  }
+
+  getStructuredPreviewHorizontalOverlapRatio(layer, frameRect = {}) {
+    if (!layer || !frameRect) return 0;
+    const x = Number(layer.x) || 0;
+    const width = Number(layer.width) || 0;
+    const frameLeft = Number(frameRect.left) || 0;
+    const frameWidth = Number(frameRect.width) || 0;
+    if (width <= 0 || frameWidth <= 0) {
+      return 0;
+    }
+
+    const overlap = Math.max(0, Math.min(x + width, frameLeft + frameWidth) - Math.max(x, frameLeft));
+    if (overlap <= 0) {
+      return 0;
+    }
+
+    return overlap / Math.max(1, Math.min(width, frameWidth));
+  }
+
+  getStructuredPreviewMergedIntervalLength(intervals = []) {
+    if (!Array.isArray(intervals) || intervals.length === 0) {
+      return 0;
+    }
+
+    const normalized = intervals
+      .map((entry) => [
+        Math.round(Number(entry?.[0]) || 0),
+        Math.round(Number(entry?.[1]) || 0)
+      ])
+      .filter(([start, end]) => end > start)
+      .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    if (!normalized.length) {
+      return 0;
+    }
+
+    let total = 0;
+    let [currentStart, currentEnd] = normalized[0];
+    for (let index = 1; index < normalized.length; index += 1) {
+      const [start, end] = normalized[index];
+      if (start <= currentEnd) {
+        currentEnd = Math.max(currentEnd, end);
+        continue;
+      }
+      total += currentEnd - currentStart;
+      currentStart = start;
+      currentEnd = end;
+    }
+    total += currentEnd - currentStart;
+    return total;
+  }
+
+  normalizeStructuredPreviewSceneLayers(layers, sceneProfile = null) {
+    const resolvedLayers = Array.isArray(layers) ? layers.filter((layer) => layer && typeof layer === 'object') : [];
+    if (!sceneProfile || !resolvedLayers.length) {
+      return { layers: resolvedLayers };
+    }
+
+    const frameLeft = Number(sceneProfile.frameLeft) || 0;
+    const frameTop = Number(sceneProfile.frameTop) || 0;
+    const canvasWidth = Math.max(1, Number(sceneProfile.frameWidth) || Number(sceneProfile.canvasWidth) || 1);
+    const canvasHeight = Math.max(1, Number(sceneProfile.frameHeight) || Number(sceneProfile.canvasHeight) || 1);
+    const overflowRatio = Math.max(0.05, Number(sceneProfile.allowOffCanvasOverflowRatio) || 0.25);
+    const minX = frameLeft - canvasWidth * overflowRatio;
+    const maxX = frameLeft + canvasWidth * (1 + overflowRatio);
+    const minY = frameTop - canvasHeight * 0.08;
+    const maxY = frameTop + canvasHeight * 1.08;
+
+    const visibleLayers = resolvedLayers.filter((layer) => {
+      if (layer.visible === false) return false;
+      const width = Number(layer.width) || 0;
+      const height = Number(layer.height) || 0;
+      if (width <= 1 || height <= 1) return false;
+      const x = Number(layer.x) || 0;
+      const y = Number(layer.y) || 0;
+      return (
+        x + width > minX &&
+        x < maxX &&
+        y + height > minY &&
+        y < maxY
+      );
+    });
+
+    const deduped = [];
+    const seen = new Set();
+    visibleLayers.forEach((layer) => {
+      const x = Math.round(Number(layer.x) || 0);
+      const y = Math.round(Number(layer.y) || 0);
+      const width = Math.round(Number(layer.width) || 0);
+      const height = Math.round(Number(layer.height) || 0);
+      const text = this.resolveLayerText(layer).trim();
+      const fingerprint = [
+        x,
+        y,
+        width,
+        height,
+        text,
+        layer.has_image ? 'img' : 'plain'
+      ].join('__');
+      if (seen.has(fingerprint)) {
+        return;
+      }
+      seen.add(fingerprint);
+      deduped.push(layer);
+    });
+
+    return { layers: deduped };
   }
 
   getAvailableSlicesForHtml() {
@@ -7963,7 +13306,10 @@ body {
     return [];
   }
 
-  getRenderableLayersForHtml(layers, slices = [], { useDirectLayerImages = false } = {}) {
+  getRenderableLayersForHtml(layers, slices = [], {
+    useDirectLayerImages = false,
+    sceneProfile = null
+  } = {}) {
     const textDedup = new Set();
     const textLayers = layers
       .filter((layer) => {
@@ -7998,11 +13344,86 @@ body {
     const imageLayers = useDirectLayerImages
       ? this.buildRenderableDirectImageLayers(layers)
       : this.buildRenderableSliceLayers(layers, slices);
-    const visibleTextLayers = useDirectLayerImages
-      ? dedupedTextLayers
-      : this.filterTextLayersCoveredBySlices(dedupedTextLayers, imageLayers);
+    const textLayersWithoutDirectImageDupes = dedupedTextLayers.filter((layer) => {
+      if (!useDirectLayerImages || !sceneProfile?.suppressImageBackedText) {
+        return true;
+      }
+      return !(layer?.has_image || layer?.image);
+    });
+    const sceneFilteredTextLayers = textLayersWithoutDirectImageDupes.filter((layer) => (
+      this.shouldKeepTextLayerForScene(layer, sceneProfile, imageLayers)
+    ));
+    const visibleTextLayers = this.filterTextLayersCoveredBySlices(
+      sceneFilteredTextLayers,
+      imageLayers,
+      { maxCoverRatio: Number(sceneProfile?.textCoverageThreshold) || 0.8 }
+    );
 
     return this.sortRenderableLayersForHtml([...imageLayers, ...visibleTextLayers]);
+  }
+
+  shouldKeepTextLayerForScene(layer, sceneProfile = null, imageLayers = []) {
+    if (!layer) return false;
+
+    const text = this.resolveLayerText(layer).trim();
+    if (!text) return false;
+    if (!sceneProfile?.preserveOnlyStructuralText) {
+      return true;
+    }
+
+    const width = Math.max(0, Number(layer.width) || 0);
+    const height = Math.max(0, Number(layer.height) || 0);
+    const x = Math.max(0, Number(layer.x) || 0);
+    const y = Math.max(0, Number(layer.y) || 0);
+    const canvasWidth = Math.max(1, Number(sceneProfile.canvasWidth) || 1);
+    const canvasHeight = Math.max(1, Number(sceneProfile.canvasHeight) || 1);
+    const lineCount = Math.max(1, text.split(/\n+/).length);
+    const overlapRatio = this.getLayerMaxOverlapRatio(layer, imageLayers);
+
+    if (overlapRatio >= 0.14) {
+      return false;
+    }
+
+    const isHeaderBand = y <= canvasHeight * 0.18 && width >= canvasWidth * 0.24 && height <= 96;
+    const isWideCopy = width >= canvasWidth * 0.44;
+    const isMultiLineCopy = lineCount >= 2 && width >= canvasWidth * 0.26;
+    const isCenteredSectionTitle = x >= canvasWidth * 0.18 && x <= canvasWidth * 0.38 && width >= canvasWidth * 0.28 && height <= 120;
+
+    return isHeaderBand || isWideCopy || isMultiLineCopy || isCenteredSectionTitle;
+  }
+
+  getLayerMaxOverlapRatio(layer, imageLayers = []) {
+    if (!layer || !Array.isArray(imageLayers) || imageLayers.length === 0) {
+      return 0;
+    }
+
+    const x = Number(layer.x) || 0;
+    const y = Number(layer.y) || 0;
+    const width = Number(layer.width) || 0;
+    const height = Number(layer.height) || 0;
+    if (width <= 0 || height <= 0) {
+      return 0;
+    }
+
+    const targetArea = width * height;
+    return imageLayers.reduce((maxRatio, imageLayer) => {
+      const imageX = Number(imageLayer?.x) || 0;
+      const imageY = Number(imageLayer?.y) || 0;
+      const imageWidth = Number(imageLayer?.width) || 0;
+      const imageHeight = Number(imageLayer?.height) || 0;
+      if (imageWidth <= 0 || imageHeight <= 0) {
+        return maxRatio;
+      }
+
+      const overlapWidth = Math.max(0, Math.min(x + width, imageX + imageWidth) - Math.max(x, imageX));
+      const overlapHeight = Math.max(0, Math.min(y + height, imageY + imageHeight) - Math.max(y, imageY));
+      if (overlapWidth <= 0 || overlapHeight <= 0) {
+        return maxRatio;
+      }
+
+      const ratio = (overlapWidth * overlapHeight) / targetArea;
+      return ratio > maxRatio ? ratio : maxRatio;
+    }, 0);
   }
 
   buildRenderableDirectImageLayers(layers) {
@@ -8296,7 +13717,9 @@ body {
     return best;
   }
 
-  filterTextLayersCoveredBySlices(textLayers, sliceLayers) {
+  filterTextLayersCoveredBySlices(textLayers, sliceLayers, {
+    maxCoverRatio = 0.8
+  } = {}) {
     if (!Array.isArray(textLayers) || textLayers.length === 0) return [];
     if (!Array.isArray(sliceLayers) || sliceLayers.length === 0) return textLayers;
 
@@ -8329,7 +13752,7 @@ body {
       }, 0);
 
       // 文本被切图大范围覆盖时，优先保留切图，避免视觉重叠。
-      return maxCoverRatio < 0.8;
+      return maxCoverRatio < Math.max(0, Math.min(1, Number(maxCoverRatio) || 0.8));
     });
   }
 
@@ -8460,7 +13883,12 @@ body {
     return overlapRatio >= 0.75;
   }
 
-  normalizeLayersForCanvas(layers, preferredWidth, preferredHeight) {
+  normalizeLayersForCanvas(layers, preferredWidth, preferredHeight, {
+    originX = null,
+    originY = null,
+    sourceWidth = 0,
+    sourceHeight = 0
+  } = {}) {
     if (!layers.length) {
       return {
         canvasWidth: preferredWidth,
@@ -8474,8 +13902,10 @@ body {
     const maxRight = Math.max(...layers.map(layer => (Number(layer.x) || 0) + (Number(layer.width) || 0)));
     const maxBottom = Math.max(...layers.map(layer => (Number(layer.y) || 0) + (Number(layer.height) || 0)));
 
-    const rawWidth = Math.max(1, maxRight - minX);
-    const rawHeight = Math.max(1, maxBottom - minY);
+    const baseX = Number.isFinite(Number(originX)) ? Number(originX) : minX;
+    const baseY = Number.isFinite(Number(originY)) ? Number(originY) : minY;
+    const rawWidth = Math.max(1, Math.round(Number(sourceWidth) || 0) || Math.max(1, maxRight - baseX));
+    const rawHeight = Math.max(1, Math.round(Number(sourceHeight) || 0) || Math.max(1, maxBottom - baseY));
 
     let canvasWidth = preferredWidth > 1 ? preferredWidth : rawWidth;
     let canvasHeight = preferredHeight > 1 ? preferredHeight : rawHeight;
@@ -8501,8 +13931,8 @@ body {
     }
 
     const normalizedLayers = layers.map((layer) => {
-      const x = ((Number(layer.x) || 0) - minX) * scaleX;
-      const y = ((Number(layer.y) || 0) - minY) * scaleY;
+      const x = ((Number(layer.x) || 0) - baseX) * scaleX;
+      const y = ((Number(layer.y) || 0) - baseY) * scaleY;
       const width = (Number(layer.width) || 0) * scaleX;
       const height = (Number(layer.height) || 0) * scaleY;
       const styleScale = (Math.abs(scaleX - scaleY) < 0.001)
@@ -8897,9 +14327,14 @@ body {
     this.hideHtmlPreview(true);
     this.loading.style.display = 'flex';
     this.errorBox.style.display = 'none';
-    this.contentEmpty.style.display = 'flex';
+    this.contentEmpty.style.display = 'none';
     this.previewSection.style.display = 'none';
     this.sidebarRight.style.display = 'none';
+    this.setPreviewSecondaryDesignMarkup('');
+    this.setPreviewCustomGroupMarkup('');
+    this.setPreviewLowPriorityDesignMarkup('');
+    this.syncPreviewDesignStripLayout();
+    this.syncWorkspaceLayout();
     this.renderHotspots();
   }
 
@@ -8919,6 +14354,12 @@ body {
     this.contentEmpty.style.display = 'none';
     this.previewSection.style.display = 'none';
     this.sidebarRight.style.display = 'none';
+    this.setPreviewSecondaryDesignMarkup('');
+    this.setPreviewCustomGroupMarkup('');
+    this.setPreviewLowPriorityDesignMarkup('');
+    this.syncPreviewDesignStripLayout();
+    this.finishBootRestore();
+    this.syncWorkspaceLayout();
     this.renderHotspots();
   }
 
@@ -9007,7 +14448,13 @@ body {
 
   // 应用变换
   applyTransform() {
-    if (this.panzoom) {
+    if (this.isMultiPreviewMode() && this.previewGallery) {
+      this.previewGallery.style.transform = `translate(${this.panX * this.zoomLevel}px, ${this.panY * this.zoomLevel}px) scale(${this.zoomLevel})`;
+    } else if (this.previewGallery) {
+      this.previewGallery.style.transform = '';
+    }
+
+    if (!this.isMultiPreviewMode() && this.panzoom) {
       this.panzoom.zoom(this.zoomLevel, { animate: false, force: true, silent: true });
       this.panzoom.pan(this.panX, this.panY, { animate: false, force: true, silent: true });
     } else if (this.previewImage) {
@@ -9063,12 +14510,13 @@ body {
     if (this.isMarkMode || this.isNoteMode) return;
     if (this.isPinching) return;
     if (!this.isPrimaryPointerEvent(e)) return;
-    if (this.zoomLevel <= 1) return; // 只有放大时才允许拖动
+    if (!this.isMultiPreviewMode() && this.zoomLevel <= 1) return; // 单图模式只有放大时才允许拖动
 
     const point = this.getPointerClientPoint(e);
     if (!point) return;
 
     this.isDragging = true;
+    this.previewDragMoved = false;
     this.dragStartX = point.clientX - this.panX * this.zoomLevel;
     this.dragStartY = point.clientY - this.panY * this.zoomLevel;
     this.setPreviewInteractionActive();
@@ -9080,8 +14528,13 @@ body {
     const point = this.getPointerClientPoint(e);
     if (!point) return;
 
-    this.panX = (point.clientX - this.dragStartX) / this.zoomLevel;
-    this.panY = (point.clientY - this.dragStartY) / this.zoomLevel;
+    const nextPanX = (point.clientX - this.dragStartX) / this.zoomLevel;
+    const nextPanY = (point.clientY - this.dragStartY) / this.zoomLevel;
+    if (Math.abs(nextPanX - this.panX) > 2 || Math.abs(nextPanY - this.panY) > 2) {
+      this.previewDragMoved = true;
+    }
+    this.panX = nextPanX;
+    this.panY = nextPanY;
     this.applyTransform();
   }
 
@@ -9089,6 +14542,9 @@ body {
   endDrag() {
     if (!this.isDragging) return;
     this.isDragging = false;
+    if (this.previewDragMoved) {
+      this.suppressPreviewItemClickUntil = Date.now() + 240;
+    }
     this.setPreviewInteractionActive();
     // 拖动结束后保存状态
     this.saveCurrentDesignState();
@@ -9128,12 +14584,9 @@ body {
 
   // 切换图层显示模式
   async toggleLayerMode() {
+    if (this.isMultiPreviewMode()) return;
     this.isLayerMode = !this.isLayerMode;
-
-    if (this.layerModeBtn) {
-      this.layerModeBtn.classList.toggle('active', this.isLayerMode);
-      this.layerModeBtn.textContent = this.isLayerMode ? '隐藏图层' : '图层解析';
-    }
+    this.syncLayerModeButton();
 
     if (this.isLayerMode) {
       // 检查缓存中是否有当前设计图的图层数据
@@ -9450,3 +14903,4 @@ body {
 
 // 初始化
 const app = new LanhuViewer();
+window.__LANHU_VIEWER_APP__ = app;

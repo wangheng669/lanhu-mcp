@@ -30,6 +30,15 @@
         <nav class="top-nav" aria-label="产品导航">
           <button class="top-nav-item active" type="button">设计</button>
         </nav>
+        <div class="sidebar-panel-head header-sidebar-head">
+          <span class="panel-kicker">全部</span>
+          <div class="sidebar-panel-head-actions">
+            <button class="btn btn-small btn-secondary" id="copyLinkBtn" title="复制当前蓝湖链接">
+              复制链接
+            </button>
+            <span class="sidebar-panel-head-tag" id="designCount">0</span>
+          </div>
+        </div>
       </div>
 
       <div class="header-meta">
@@ -117,19 +126,6 @@
 
       <aside class="sidebar-left">
         <div class="sidebar-left-panel">
-          <div class="sidebar-panel-head">
-            <span class="panel-kicker">全部</span>
-            <div class="sidebar-panel-head-actions">
-              <button class="btn btn-small btn-secondary" id="reparseDesignBtn" title="忽略缓存重新解析当前项目设计图" disabled>
-                重新解析
-              </button>
-              <button class="btn btn-small btn-secondary" id="copyLinkBtn" title="复制当前蓝湖链接">
-                复制链接
-              </button>
-              <span class="sidebar-panel-head-tag" id="designCount">0</span>
-            </div>
-          </div>
-
           <section class="input-section panel-section" id="inputSection">
             <div class="section-headline">
               <h2 class="panel-title">项目链接</h2>
@@ -171,15 +167,6 @@
             <div class="project-meta" id="projectMeta"></div>
           </section>
 
-          <section class="designs-section panel-section" id="designsSection" style="display: none;">
-            <div class="section-header">
-              <div class="section-heading">
-                <h3>设计图列表</h3>
-              </div>
-            </div>
-            <div class="design-list" id="designGrid"></div>
-          </section>
-
           <section class="history-section panel-section" id="historySection">
             <div class="section-header">
               <div class="section-heading">
@@ -219,13 +206,16 @@
         <div class="preview-section" id="previewSection" style="display: none;">
           <div class="preview-toolbar">
             <div class="preview-toolbar-main">
-              <div class="preview-toolbar-copy">
+              <div class="preview-toolbar-copy" hidden>
                 <span class="preview-name" id="previewName"></span>
               </div>
               <div class="preview-toolbar-meta">
                 <span class="preview-size" id="previewSize"></span>
                 <button class="btn btn-small btn-secondary" id="copyDesignLinkBtn" title="复制当前设计图链接" disabled>
                   复制设计图链接
+                </button>
+                <button class="btn btn-small btn-secondary" id="reparseDesignBtn" title="忽略缓存重新解析当前项目设计图" disabled>
+                  重新解析
                 </button>
                 <button class="btn btn-small btn-secondary" id="refreshDesignBtn" title="更新设计图数据" style="display: none;">
                   <span class="btn-icon">↻</span>
@@ -250,12 +240,6 @@
                 <button class="btn btn-small btn-secondary html-generate-btn" id="generateHtmlBtn" title="读取蓝湖生成代码">蓝湖代码</button>
                 <button class="btn btn-small btn-secondary code-panel-toggle-btn" id="toggleCodePanelBtn" title="打开代码弹窗" hidden>代码面板</button>
               </div>
-              <div class="zoom-controls">
-                <button class="zoom-btn" id="zoomOutBtn" title="缩小">-</button>
-                <span class="zoom-level" id="zoomLevel">100%</span>
-                <button class="zoom-btn" id="zoomInBtn" title="放大">+</button>
-                <button class="zoom-btn" id="zoomResetBtn" title="重置">1:1</button>
-              </div>
             </div>
           </div>
 
@@ -263,15 +247,31 @@
             <div class="preview-body-grid">
               <div class="preview-design-site">
                 <section class="preview-stage-panel preview-stage-panel-design">
-                  <div class="preview-stage-header">
-                    <div class="preview-stage-copy">
-                      <span class="preview-stage-kicker">蓝湖设计稿</span>
-                      <span class="preview-stage-name" id="designPreviewFrameLabel">当前设计图</span>
-                    </div>
-                  </div>
                   <div class="preview-container-wrap">
-                    <div class="preview-container" id="previewContainer">
-                      <img class="preview-image-large" id="previewImage" src="" alt="" draggable="false">
+                    <div class="preview-container-shell" id="previewContainerShell">
+                      <section class="designs-section preview-designs-section design-floating-group-slot design-main-group-slot" id="designsSection" data-fixed-group="main" style="display: none;">
+                        <div class="section-header design-floating-group-head design-main-group-head">
+                          <div class="section-heading design-floating-group-copy">
+                            <span class="design-floating-group-kicker">New Group</span>
+                            <h3 class="design-floating-group-title">初始分组</h3>
+                          </div>
+                          <span class="design-floating-group-count design-main-group-count">0</span>
+                        </div>
+                        <div class="design-list design-floating-group-body" id="designGrid"></div>
+                      </section>
+                      <div class="design-secondary-slot" id="designSecondarySlot" hidden></div>
+                      <div class="design-custom-group-layer" id="designCustomGroupLayer" hidden></div>
+                      <div class="design-floating-group-slot design-low-priority-slot" id="designLowPrioritySlot" hidden></div>
+                      <div class="zoom-controls preview-stage-zoom preview-stage-zoom-vertical" id="previewStageZoom" aria-label="预览缩放控制" hidden>
+                        <button class="zoom-btn" id="zoomOutBtn" title="缩小">-</button>
+                        <span class="zoom-level" id="zoomLevel">100%</span>
+                        <button class="zoom-btn" id="zoomInBtn" title="放大">+</button>
+                        <button class="zoom-btn" id="zoomResetBtn" title="重置">1:1</button>
+                      </div>
+                      <div class="preview-container" id="previewContainer">
+                        <div class="preview-gallery" id="previewGallery" hidden></div>
+                        <img class="preview-image-large" id="previewImage" src="" alt="" draggable="false">
+                      </div>
                     </div>
                   </div>
                 </section>
@@ -314,6 +314,7 @@
                   <p class="html-preview-summary" id="generatedCodeSummary">可在当前弹窗直接开始生成，并实时查看进度。</p>
                 </div>
               <div class="html-preview-actions">
+                  <button class="btn btn-small btn-secondary" id="draftRecipeBtn">Claude草稿</button>
                   <button class="btn btn-small btn-secondary" id="runDiagnosticsBtn">重新诊断</button>
                   <button class="btn btn-small btn-secondary" id="openHtmlInNewTabBtn">新标签打开</button>
                   <button class="btn btn-small btn-secondary" id="copyHtmlBtn">复制代码</button>
@@ -334,6 +335,7 @@
                 <p class="generated-task-action" id="generatedCodeCurrentAction">点击下方按钮开始生成。</p>
                 <div class="generated-task-actions">
                   <button class="btn btn-primary generated-task-primary-btn" id="generatedCodePrimaryBtn">开始生成</button>
+                  <button class="btn btn-small btn-secondary generated-task-draft-btn" id="generatedCodeDraftBtn">Claude草稿</button>
                 </div>
                 <div class="generated-task-log-list" id="generatedCodeLogList">
                   <div class="generated-task-log-item placeholder">生成中的关键日志会显示在这里。</div>
@@ -438,6 +440,7 @@
   </div>
 
   <script src="/vendor/panzoom/panzoom.min.js"></script>
+  <script src="structured-preview-recipes.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

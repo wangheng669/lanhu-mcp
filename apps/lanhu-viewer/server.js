@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const LanhuService = require('./services/lanhu');
+const { runLocalClaudeRecipeAssistant } = require('./services/claude-recipe-assistant');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,7 +12,7 @@ const LANHU_MCP_USER_NAME = process.env.LANHU_MCP_USER_NAME || 'lanhu-viewer';
 const LANHU_MCP_USER_ROLE = process.env.LANHU_MCP_USER_ROLE || 'frontend';
 
 // 中间件
-app.use(express.json());
+app.use(express.json({ limit: '20mb' }));
 app.use('/vendor/panzoom', express.static(path.join(__dirname, 'node_modules/@panzoom/panzoom/dist'), {
   setHeaders: (res, filePath) => {
     if (/\.js$/i.test(filePath)) {
@@ -702,6 +703,127 @@ app.post('/api/layers', async (req, res) => {
   }
 });
 
+// 使用本地 Claude 为新页面家族生成 recipe 草稿
+app.post('/api/structured-preview/recipe-draft', async (req, res) => {
+  try {
+    const sessionId = req.headers['x-session-id'];
+    const {
+      teamId,
+      projectId,
+      imageId,
+      designName,
+      previewUrl,
+      model,
+      layers: providedLayers
+    } = req.body || {};
+
+    if (!sessionId || !sessions.has(sessionId)) {
+      return res.status(401).json({
+        success: false,
+        message: '请先登录'
+      });
+    }
+
+    if (!teamId || !projectId || !imageId) {
+      return res.status(400).json({
+        success: false,
+        message: '缺少必要参数'
+      });
+    }
+
+    const session = sessions.get(sessionId);
+    const clientLayers = Array.isArray(providedLayers)
+      ? providedLayers.filter((layer) => layer && typeof layer === 'object')
+      : [];
+
+    let layerSource = clientLayers.length ? 'client-cache' : '';
+    let layerResult = null;
+    let layers = clientLayers;
+
+    if (!layers.length) {
+      try {
+        layerResult = await callLanhuMcpJson('/viewer/layers', {
+          session,
+          body: { teamId, projectId, imageId }
+        });
+        if (Array.isArray(layerResult?.layers) && layerResult.layers.length) {
+          layers = layerResult.layers;
+          layerSource = 'lanhu-mcp';
+        }
+      } catch (mcpError) {
+        console.warn('lanhu-mcp recipe-draft layers fallback:', mcpError.message);
+      }
+    }
+
+    if (!layers.length) {
+      const service = new LanhuService();
+      service.setCookies(session.cookies);
+      layerResult = await service.getLayers(teamId, projectId, imageId);
+      if (Array.isArray(layerResult?.layers) && layerResult.layers.length) {
+        layers = layerResult.layers;
+        layerSource = 'lanhu-local';
+      }
+    }
+
+    if (!layers.length) {
+      return res.status(502).json({
+        success: false,
+        message: '未能获取设计图图层，无法生成 recipe 草稿'
+      });
+    }
+
+    const rootPath = String(layers[0]?.path || '').split('/')[0] || '';
+    const draftDesign = {
+      id: String(imageId),
+      name: String(designName || rootPath || imageId),
+      previewUrl: String(previewUrl || '').trim()
+    };
+
+    const result = await runLocalClaudeRecipeAssistant({
+      cwd: __dirname,
+      design: draftDesign,
+      layers,
+      model
+    });
+
+    return res.json({
+      success: true,
+      design: draftDesign,
+      provider: result.provider || 'claude',
+      layerSource,
+      layerCount: layers.length,
+      durationMs: result.durationMs,
+      summary: result.draft.summary || '',
+      strategy: result.draft.strategy || '',
+      familyName: result.draft.familyName || '',
+      draft: result.draft,
+      files: [
+        {
+          name: 'recipe-draft.md',
+          content: result.markdown,
+          kind: 'recipe-draft'
+        },
+        {
+          name: 'recipe-draft.json',
+          content: JSON.stringify(result.draft.recipe, null, 2),
+          kind: 'recipe-draft'
+        },
+        {
+          name: 'recipe-assessment.json',
+          content: JSON.stringify(result.draft, null, 2),
+          kind: 'recipe-draft'
+        }
+      ]
+    });
+  } catch (error) {
+    console.error('Generate structured preview recipe draft error:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || '生成 recipe 草稿失败'
+    });
+  }
+});
+
 // 获取蓝湖生成代码
 app.post('/api/generated-code', async (req, res) => {
   try {
@@ -869,18 +991,36 @@ app.get('/api/image/preview', async (req, res) => {
     const sessionId = req.headers['x-session-id'] || req.query.sessionId;
     const { url } = req.query;
 
-    if (!sessionId || !sessions.has(sessionId)) {
-      return res.status(401).json({
+    if (!url) {
+      return res.status(400).json({
         success: false,
-        message: '请先登录'
+        message: '缺少图片地址'
       });
     }
 
-    const session = sessions.get(sessionId);
-    const service = new LanhuService();
-    service.setCookies(session.cookies);
+    let buffer = null;
+    let contentType = 'image/png';
 
-    const { buffer, contentType } = await service.downloadImage(url);
+    if (sessionId && sessions.has(sessionId)) {
+      const session = sessions.get(sessionId);
+      const service = new LanhuService();
+      service.setCookies(session.cookies);
+      const downloaded = await service.downloadImage(url);
+      buffer = downloaded.buffer;
+      contentType = downloaded.contentType || contentType;
+    } else {
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`公开图片下载失败: HTTP ${response.status}`);
+      }
+      const arrayBuffer = await response.arrayBuffer();
+      buffer = Buffer.from(arrayBuffer);
+      contentType = response.headers.get('content-type') || contentType;
+    }
+
+    if (!buffer) {
+      throw new Error('图片内容为空');
+    }
 
     res.set('Content-Type', contentType || 'image/png');
     res.set('Cache-Control', 'public, max-age=300');
