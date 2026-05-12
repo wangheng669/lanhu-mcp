@@ -2075,6 +2075,7 @@ class LanhuViewer {
     this.setPreviewLowPriorityDropActive(false);
     this.getAllPreviewDesignCards().forEach((card) => card.classList.remove('is-dragging'));
     this.designCustomGroupLayer?.querySelectorAll('.is-drop-target').forEach((slot) => slot.classList.remove('is-drop-target'));
+    this.designSecondarySlot?.querySelectorAll('.is-drop-target').forEach((slot) => slot.classList.remove('is-drop-target'));
     this.syncPreviewLowPriorityDockVisibility();
   }
 
@@ -2159,6 +2160,60 @@ class LanhuViewer {
     this.clearPreviewDesignDragState();
     this.renderPreviewDesignCards(this.currentProjectData);
     this.showToast('已加入不重要分组', 'success');
+  }
+
+  handlePreviewSecondaryGroupDragOver(event) {
+    if (!this.isPreviewDesignDragging || !this.designSecondarySlot) return;
+    const slot = event.target.closest('.design-secondary-group-slot');
+    if (!slot || !this.designSecondarySlot.contains(slot)) return;
+
+    event.preventDefault();
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = 'move';
+    }
+    slot.classList.add('is-drop-target');
+  }
+
+  handlePreviewSecondaryGroupDragLeave(event) {
+    if (!this.isPreviewDesignDragging || !this.designSecondarySlot) return;
+    const slot = event.target.closest('.design-secondary-group-slot');
+    if (!slot || !this.designSecondarySlot.contains(slot)) return;
+    const relatedTarget = event.relatedTarget;
+    if (relatedTarget && slot.contains(relatedTarget)) return;
+    slot.classList.remove('is-drop-target');
+  }
+
+  handlePreviewSecondaryGroupDrop(event) {
+    if (!this.designSecondarySlot) return;
+    const slot = event.target.closest('.design-secondary-group-slot');
+    if (!slot || !this.designSecondarySlot.contains(slot)) return;
+    event.preventDefault();
+
+    const designId = this.getDraggedPreviewDesignId(event);
+    const design = Array.isArray(this.designs)
+      ? this.designs.find((item) => String(item?.id || '').trim() === designId)
+      : null;
+
+    if (!designId || !design) {
+      this.clearPreviewDesignDragState();
+      return;
+    }
+
+    const designGroupKey = this.getPreviewDesignGroupKey(this.decodeHtmlEntities(design.name) || '');
+    if (!designGroupKey) {
+      this.clearPreviewDesignDragState();
+      return;
+    }
+
+    const nextAssignments = { ...(this.previewDesignGroupAssignments || {}) };
+    delete nextAssignments[designId];
+    this.previewDesignGroupAssignments = nextAssignments;
+    this.persistPreviewDesignGroupAssignments(this.designs);
+
+    slot.classList.remove('is-drop-target');
+    this.clearPreviewDesignDragState();
+    this.renderPreviewDesignCards(this.currentProjectData);
+    this.showToast('已归入已有功能', 'success');
   }
 
   setPreviewSecondaryDesignMarkup(markup = '') {
@@ -4013,6 +4068,9 @@ class LanhuViewer {
       this.designLowPrioritySlot.addEventListener('pointerdown', (event) => this.startPreviewLowPriorityDockInteraction(event));
     }
     if (this.designSecondarySlot) {
+      this.designSecondarySlot.addEventListener('dragover', (event) => this.handlePreviewSecondaryGroupDragOver(event));
+      this.designSecondarySlot.addEventListener('dragleave', (event) => this.handlePreviewSecondaryGroupDragLeave(event));
+      this.designSecondarySlot.addEventListener('drop', (event) => this.handlePreviewSecondaryGroupDrop(event));
       this.designSecondarySlot.addEventListener('pointerdown', (event) => this.startPreviewCustomGroupInteraction(event));
     }
     if (this.designCustomGroupLayer) {
